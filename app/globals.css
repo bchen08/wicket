@@ -1,12 +1,19 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f8f7f3;
-  --foreground: #24251f;
-  --surface: #f0efe9;
-  --muted: #686960;
-  --line: #dcdcd2;
-  --accent: #be431f;
+  --background: #fdfcf9;
+  --foreground: #292e29;
+  --surface: #f4f3ee;
+  --muted-foreground: #73776e;
+  --border: #e6e7df;
+  --primary: #3d6049;
+  --primary-foreground: #ffffff;
+  --accent: #eaf0e6;
+  --accent-foreground: #3d6049;
+  --secondary: #eeeee7;
+  --secondary-foreground: #292e29;
+  --ring: #3d6049;
+  --destructive: #a33328;
   color-scheme: light;
 }
 
@@ -14,43 +21,96 @@
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-surface: var(--surface);
-  --color-muted: var(--muted);
-  --color-line: var(--line);
+  --color-muted: var(--muted-foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-line: var(--border);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
   --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
 html {
   scroll-behavior: smooth;
-  scroll-padding-top: 7rem;
+  scroll-padding-top: 2rem;
 }
-
 body {
   background: var(--background);
   color: var(--foreground);
 }
-
-::selection { background: #be431f; color: #fff; }
-
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
-
-@layer components {
-  .page-shell { @apply mx-auto w-full max-w-6xl px-6 sm:px-10 lg:px-12; }
-  .section-space { @apply py-16 sm:py-20; }
-  .eyebrow { @apply font-mono text-[10px] font-medium uppercase tracking-[0.14em] sm:text-[11px]; }
-  .section-title { @apply text-3xl leading-[1.15] font-medium tracking-[-0.045em] sm:text-4xl; }
-  .primary-button { @apply inline-flex min-h-12 items-center justify-center gap-8 rounded-sm bg-accent px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-foreground; }
-  .nav-link { @apply flex min-h-11 items-center transition-colors hover:text-accent; }
-  .skip-link { @apply fixed top-3 left-3 z-50 -translate-y-24 rounded bg-foreground px-4 py-3 text-background focus:translate-y-0; }
+::selection {
+  background: var(--primary);
+  color: white;
+}
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 5px;
+}
+button:not(:disabled),
+[role="button"]:not(:disabled) {
+  cursor: pointer;
 }
 
-.hero-grid {
-  background-image: linear-gradient(to right, rgb(104 105 96 / 5%) 1px, transparent 1px);
-  background-size: 12.5% 100%;
+@layer components {
+  .page-shell {
+    @apply mx-auto w-full max-w-[1200px] px-6 sm:px-10 lg:px-16;
+  }
+  .section-space {
+    @apply py-16 sm:py-20;
+  }
+  .eyebrow {
+    @apply text-[10px] font-medium uppercase tracking-[0.12em];
+  }
+  .section-title {
+    @apply text-[30px] leading-[1.2] font-medium tracking-[-0.045em] sm:text-[36px];
+  }
+  .nav-link {
+    @apply min-h-11 items-center text-xs text-muted-foreground transition-colors hover:text-primary;
+  }
+  .skip-link {
+    @apply fixed top-3 left-3 z-50 -translate-y-24 rounded bg-foreground px-4 py-3 text-background focus:translate-y-0;
+  }
+  .hero-section {
+    @apply grid items-center gap-12 py-16 md:grid-cols-[1fr_0.9fr] md:gap-10 md:py-20;
+  }
+  .booking-stage {
+    @apply relative mx-auto w-full max-w-[420px] rounded-2xl px-6 pt-7 pb-5 sm:px-9;
+    background: #f0f1e9;
+    background-image: radial-gradient(#d4d9cd 0.7px, transparent 0.7px);
+    background-size: 12px 12px;
+  }
+  .booking-note {
+    @apply mb-5 flex items-center justify-center gap-2 text-[10px] text-primary;
+  }
+  .booking-card {
+    @apply relative rounded-xl border border-border bg-background;
+    box-shadow: 0 8px 25px -12px rgb(34 50 34 / 20%);
+    transform: rotate(-2deg);
+  }
+  .booking-receipt {
+    @apply relative -mt-2 -mr-8 ml-4 flex items-center gap-3 rounded-lg border border-border bg-background px-4 py-3 shadow-sm sm:-mr-12 sm:ml-10;
+    transform: rotate(2deg);
+  }
+  .start-panel {
+    @apply flex flex-col items-start justify-between gap-10 rounded-2xl border border-border bg-accent/35 p-7 sm:p-10 md:flex-row md:items-center;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  html { scroll-behavior: auto; }
-  *, *::before, *::after { transition-duration: 0s !important; }
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0s !important;
+  }
 }
