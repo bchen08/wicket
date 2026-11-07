@@ -1,8 +1,10 @@
-import type { McpServer } from "@modelcontextprotocol/server";
+import { CLIENT_INFO_META_KEY, type McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import type {
   ApiError,
+  BookInput,
+  BookResult,
   GetAvailabilityInput,
   GetAvailabilityResult,
   ListServicesResult,
@@ -10,9 +12,14 @@ import type {
 import { DEFAULT_LIMIT, MAX_LIMIT, MAX_WINDOW_DAYS } from "../engine/availability";
 import { toApiError } from "./errors";
 import {
+  book,
   getAvailability,
   listServices,
+  MAX_CUSTOMER_NAME,
+  parseBookArgs,
   parseGetAvailabilityArgs,
+  UNKNOWN_AGENT,
+  type BookOutcome,
   type FrontDeskDeps,
 } from "./service";
 
@@ -23,10 +30,11 @@ import {
 export const DEFAULT_SHOP_SLUG = "harts";
 
 export const SERVER_INSTRUCTIONS = [
-  "Front Desk lets you check appointment availability at small independent businesses.",
+  "Front Desk lets you book appointments at small independent businesses.",
   "It currently serves one shop: Hart's Barbers, in the America/New_York time zone.",
-  "Call list_services first to get service ids, then get_availability for open start times.",
-  "Booking is not available yet: these tools are read-only and never change anything.",
+  "Call list_services to get service ids, then get_availability for open start times,",
+  "then book with one of those starts and the customer's name.",
+  "book confirms immediately. No deposit is collected yet, and the customer's identity is not verified.",
 ].join(" ");
 
 // ---- Schemas (zod) mirrored from lib/types/frontdesk.ts ----
@@ -103,6 +111,56 @@ const getAvailabilityOutputSchema = z.object({
   truncated: z.boolean().describe("true if more slots exist in the window than were returned."),
 });
 
+const bookInputShape = {
+  service_id: advertise({
+    type: "string",
+    description: 'A service id from list_services, e.g. "haircut".',
+  }),
+  start: advertise({
+    type: "string",
+    format: "date-time",
+    description:
+      "Appointment start. Must be a start returned by get_availability for this service, copied exactly, " +
+      'e.g. "2026-11-14T14:30:00-05:00" (RFC 3339 with a time zone offset). Any other time is refused.',
+  }),
+  customer_name: advertise({
+    type: "string",
+    minLength: 1,
+    maxLength: MAX_CUSTOMER_NAME,
+    description:
+      `The name the booking is under, as the customer wants the shop to see it, e.g. "Maya" or "Maya Lopez". ` +
+      `1–${MAX_CUSTOMER_NAME} characters. Ask the user if you don't know it.`,
+  }),
+} satisfies Record<keyof BookInput, z.ZodType>; // same keys as the contract, no more, no fewer
+
+const BOOK_REQUIRED = ["service_id", "start", "customer_name"] as const;
+
+const bookInputSchema = z.object(bookInputShape).meta({ required: [...BOOK_REQUIRED] });
+
+const bookingSchema = z.object({
+  id: z.string().describe("Booking id (UUID)."),
+  shopSlug: z.string(),
+  serviceId: z.string(),
+  serviceName: z.string(),
+  staffId: z.string(),
+  start: z.string().describe("RFC 3339 with the shop's offset."),
+  end: z.string().describe("RFC 3339 with the shop's offset."),
+  display: z.string().describe('Human-readable start, e.g. "Sat 14 Nov, 2:30 pm EST".'),
+  status: z.enum(["confirmed", "cancelled"]),
+  customer: z.object({
+    displayName: z.string(),
+    verified: z.literal(false).describe("Always false for now: the customer's identity is not checked."),
+  }),
+  agent: z.object({ name: z.string().describe("Best-effort label for the booking agent. Unverified.") }),
+  depositCents: z
+    .number()
+    .int()
+    .describe("Deposit the service requires, in integer US cents. Not collected yet. 0 = none."),
+  createdAt: z.string().describe("RFC 3339."),
+});
+
+const bookOutputSchema = z.object({ booking: bookingSchema });
+
 // Compile-time guards: the schemas must match the contract types exactly (including optional
 // fields), so `tsc` fails if either side drifts.
 type Exact<X, Y> =
@@ -111,7 +169,9 @@ const contractChecks: [
   Exact<z.infer<typeof listServicesOutputSchema>, ListServicesResult>,
   Exact<z.infer<typeof getAvailabilityOutputSchema>, GetAvailabilityResult>,
   Exact<(typeof GET_AVAILABILITY_REQUIRED)[number], RequiredKeys<GetAvailabilityInput>>,
-] = [true, true, true];
+  Exact<z.infer<typeof bookOutputSchema>, BookResult>,
+  Exact<(typeof BOOK_REQUIRED)[number], RequiredKeys<BookInput>>,
+] = [true, true, true, true, true];
 void contractChecks;
 
 // ---- Formatting ----
@@ -143,6 +203,35 @@ function availabilityText(result: GetAvailabilityResult, serviceId: string): str
   return `${result.slots.length} open start time(s) for ${serviceId}:\n${lines.join("\n")}${more}`;
 }
 
+/** "$10" for whole dollars, "$10.50" otherwise. For sentences; lists use formatUsd. */
+function formatUsdShort(cents: number): string {
+  return cents % 100 === 0 ? `$${cents / 100}` : formatUsd(cents);
+}
+
+/** E.g. "Booked Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. A $10 deposit will be required once deposits are enabled." */
+export function bookText({ booking, staffName }: BookOutcome): string {
+  const deposit =
+    booking.depositCents > 0
+      ? `A ${formatUsdShort(booking.depositCents)} deposit will be required once deposits are enabled; nothing was charged.`
+      : "This service needs no deposit.";
+  return [
+    `Booked ${booking.serviceName} with ${staffName}, ${booking.display}, for ${booking.customer.displayName}. ${deposit}`,
+    `Booking id: ${booking.id}. It is confirmed now; don't call book again for it.`,
+  ].join("\n");
+}
+
+/**
+ * The calling agent's name, best effort: the MCP client's self-reported name (clientInfo.name).
+ * On the 2026-07-28 protocol every request carries it in its _meta envelope. Stateless 2025-era
+ * requests don't (it was only sent with initialize), so those get "unknown agent".
+ * TODO(ring-2): a verified agent identity instead of a self-reported label.
+ */
+export function agentNameFrom(ctx: { mcpReq?: { envelope?: unknown } } | undefined): string {
+  const envelope = ctx?.mcpReq?.envelope as Record<string, unknown> | undefined;
+  const info = envelope?.[CLIENT_INFO_META_KEY] as { name?: unknown } | undefined;
+  return typeof info?.name === "string" && info.name.trim() !== "" ? info.name.trim() : UNKNOWN_AGENT;
+}
+
 /**
  * A tool error whose text is the ApiError envelope as JSON.
  *
@@ -171,12 +260,15 @@ const READ_ONLY = {
 /**
  * A web-standard `(Request) => Promise<Response>` MCP handler (Streamable HTTP, stateless)
  * serving Front Desk's tools. Mounted by app/api/mcp/route.ts; also driven directly by tests.
+ * Pass a function to resolve deps lazily, on each tool call (the route does, so a configuration
+ * error becomes a tool error instead of a crash at module load).
  */
 export function createFrontDeskMcpHandler(
-  deps: FrontDeskDeps,
+  deps: FrontDeskDeps | (() => FrontDeskDeps),
 ): (request: Request) => Promise<Response> {
-  return createMcpHandler((server) => registerFrontDeskTools(server, () => deps), {
-    serverInfo: { name: "front-desk", version: "0.1.0" },
+  const getDeps = typeof deps === "function" ? deps : () => deps;
+  return createMcpHandler((server) => registerFrontDeskTools(server, getDeps), {
+    serverInfo: { name: "front-desk", version: "0.2.0" },
     instructions: SERVER_INSTRUCTIONS,
   });
 }
@@ -213,8 +305,6 @@ export function registerFrontDeskTools(
     },
   );
 
-  // TODO(ring-1): book_appointment tool (hold a slot, then confirm it). Until then everything is read-only.
-  // TODO(ring-2): take deposits (Service.depositCents) when a booking is confirmed.
   server.registerTool(
     "get_availability",
     {
@@ -239,6 +329,48 @@ export function registerFrontDeskTools(
         const result = await getAvailability(getDeps(), shopSlug, args);
         return {
           content: [{ type: "text", text: availabilityText(result, args.service_id) }],
+          structuredContent: result,
+        };
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  // Deposits, idempotency and identity are deferred: see the TODOs on book() in service.ts.
+  // TODO(ring-1): cancel and get_booking tools.
+  server.registerTool(
+    "book",
+    {
+      title: "Book an appointment",
+      description:
+        "Book an appointment at Hart's Barbers. The booking is confirmed immediately when this returns: " +
+        "there is no hold or confirm step, so only call it once the user has chosen a time. " +
+        "start must be one of the starts get_availability just returned for the same service_id " +
+        "(RFC 3339 with offset, e.g. 2026-11-14T14:30:00-05:00); any other time is refused. " +
+        `customer_name is the name the booking is under (1–${MAX_CUSTOMER_NAME} characters). ` +
+        "No deposit is collected yet: depositCents says what the service will require once deposits are enabled. " +
+        "The customer's identity is not verified. Not idempotent: don't repeat a call that succeeded. " +
+        "On failure the result has isError: true and its text is JSON: { error: { code, message, next_action, details? } }. " +
+        "code slot_taken means someone else just booked that time: call get_availability again and offer the user another start. " +
+        "code invalid_request means fix the arguments as next_action says.",
+      inputSchema: bookInputSchema,
+      outputSchema: bookOutputSchema,
+      annotations: {
+        title: "Book an appointment",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (rawArgs, ctx) => {
+      try {
+        const args = parseBookArgs(rawArgs);
+        const outcome = await book(getDeps(), shopSlug, args, agentNameFrom(ctx));
+        const result: BookResult = { booking: outcome.booking };
+        return {
+          content: [{ type: "text", text: bookText(outcome) }],
           structuredContent: result,
         };
       } catch (err) {

@@ -1,21 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { fixedClock } from "../clock";
 import type { ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
-import { comingSaturday, createHardcodedCatalog } from "./hardcoded-catalog";
+import { createMemoryStore } from "./memory-store";
 import {
   getAvailability,
   listServices,
   parseGetAvailabilityArgs,
   type FrontDeskDeps,
 } from "./service";
+import { EXAMPLE_BOOKINGS, memoryDeps, SAT } from "./test-support";
 
-// "Now" is Saturday 7 Nov 2026, noon in New York, so the coming Saturday is 14 Nov.
-const NOW = new Date("2026-11-07T12:00:00-05:00");
-const clock = fixedClock(NOW);
-const deps: FrontDeskDeps = { clock, catalog: createHardcodedCatalog(clock) };
-
-const SAT = { from: "2026-11-14T00:00:00-05:00", to: "2026-11-15T00:00:00-05:00" };
+// "Now" is Saturday 7 Nov 2026, noon in New York, so the coming Saturday is 14 Nov. The store holds
+// the two example bookings on that Saturday: 10:00–10:45 and 15:00–15:30.
+const deps: FrontDeskDeps = memoryDeps({ initialBookings: EXAMPLE_BOOKINGS });
 
 async function rejection(promise: Promise<unknown>): Promise<FrontDeskError> {
   try {
@@ -27,29 +24,41 @@ async function rejection(promise: Promise<unknown>): Promise<FrontDeskError> {
   throw new Error("expected a FrontDeskError");
 }
 
-describe("hard-coded catalog", () => {
-  it("picks the first Saturday strictly after today", () => {
-    const zone = "America/New_York";
-    expect(comingSaturday(new Date("2026-11-07T12:00:00-05:00"), zone).toISODate()).toBe("2026-11-14"); // Sat
-    expect(comingSaturday(new Date("2026-11-13T23:59:00-05:00"), zone).toISODate()).toBe("2026-11-14"); // Fri
-    expect(comingSaturday(new Date("2026-11-08T09:00:00-05:00"), zone).toISODate()).toBe("2026-11-14"); // Sun
-    // 03:00 UTC on Sat 14 Nov is still Fri 13 Nov in New York.
-    expect(comingSaturday(new Date("2026-11-14T03:00:00Z"), zone).toISODate()).toBe("2026-11-14");
+describe("in-memory catalog", () => {
+  it("encodes lunch as a gap in dana's hours: 09:00–12:00 and 12:30–17:00, Tue–Sat", async () => {
+    const [dana] = await deps.catalog.getStaffHours("harts");
+    expect(dana.staffId).toBe("dana");
+    expect(dana.staffName).toBe("Dana");
+    expect(dana.weekly).toHaveLength(10);
+    for (const weekday of [2, 3, 4, 5, 6]) {
+      expect(dana.weekly.filter((w) => w.weekday === weekday)).toEqual([
+        { weekday, open: "09:00", close: "12:00" },
+        { weekday, open: "12:30", close: "17:00" },
+      ]);
+    }
   });
 
-  it("returns lunch every open day and the two example bookings on the coming Saturday", async () => {
+  it("returns only confirmed bookings as busy time, never lunch", async () => {
     const busy = await deps.catalog.getBusyIntervals("harts", {
       start: new Date("2026-11-10T00:00:00-05:00"),
       end: new Date("2026-11-15T00:00:00-05:00"),
     });
-    const reasons = busy.map((b) => `${b.start.toISOString()} ${b.reason}`);
-    expect(reasons.filter((r) => r.endsWith("lunch"))).toHaveLength(5); // Tue–Sat
-    expect(reasons.filter((r) => r.includes("booking"))).toHaveLength(2);
+    expect(busy.map((b) => [b.start.toISOString(), b.end.toISOString()])).toEqual([
+      ["2026-11-14T15:00:00.000Z", "2026-11-14T15:45:00.000Z"],
+      ["2026-11-14T20:00:00.000Z", "2026-11-14T20:30:00.000Z"],
+    ]);
     expect(busy.every((b) => b.staffId === "dana")).toBe(true);
   });
 
-  // Contract every ShopCatalog (including the coming Postgres one) must meet: an interval that
-  // began before range.start but is still running overlaps the range and must be returned.
+  it("does not count cancelled bookings as busy", async () => {
+    const store = createMemoryStore({
+      initialBookings: [{ ...EXAMPLE_BOOKINGS[0], status: "cancelled" }],
+    });
+    expect(await store.getBusyIntervals("harts", { start: new Date(SAT.from), end: new Date(SAT.to) })).toEqual([]);
+  });
+
+  // Contract every ShopCatalog (memory and Postgres) must meet: an interval that began before
+  // range.start but is still running overlaps the range and must be returned.
   it("returns busy intervals that started before the range but overlap it", async () => {
     const busy = await deps.catalog.getBusyIntervals("harts", {
       start: new Date("2026-11-14T10:20:00-05:00"),
@@ -62,8 +71,8 @@ describe("hard-coded catalog", () => {
 
   it("does not return intervals that only touch the range edge (half-open)", async () => {
     const busy = await deps.catalog.getBusyIntervals("harts", {
-      start: new Date("2026-11-14T10:45:00-05:00"),
-      end: new Date("2026-11-14T12:00:00-05:00"),
+      start: new Date("2026-11-14T10:45:00-05:00"), // the 10:00–10:45 booking ends here
+      end: new Date("2026-11-14T15:00:00-05:00"), // the 15:00–15:30 booking starts here
     });
     expect(busy).toEqual([]);
   });
@@ -190,7 +199,7 @@ describe("getAvailability on the coming Saturday", () => {
       },
     });
     const err = await rejection(
-      getAvailability({ clock, catalog: spy }, "harts", {
+      getAvailability({ ...deps, catalog: spy }, "harts", {
         service_id: "haircut",
         from: "2026-11-10T00:00:00-05:00",
         to: "2026-11-25T00:00:00-05:00",

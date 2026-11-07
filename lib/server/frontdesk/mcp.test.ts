@@ -1,13 +1,23 @@
-import { describe, expect, it } from "vitest";
-import type { ApiError, GetAvailabilityResult, ListServicesResult } from "../../types/frontdesk";
-import { fixedClock } from "../clock";
-import { createHardcodedCatalog } from "./hardcoded-catalog";
-import { createFrontDeskMcpHandler } from "./mcp";
+import { beforeEach, describe, expect, it } from "vitest";
+import type {
+  ApiError,
+  BookResult,
+  GetAvailabilityResult,
+  ListServicesResult,
+} from "../../types/frontdesk";
+import { agentNameFrom, createFrontDeskMcpHandler } from "./mcp";
+import type { FrontDeskDeps } from "./service";
+import { EXAMPLE_BOOKINGS, memoryDeps } from "./test-support";
 
 // End to end through the real MCP handler (the same one /api/mcp mounts), speaking
 // stateless Streamable HTTP JSON-RPC. "Now" is Sat 7 Nov 2026, so the coming Saturday is 14 Nov.
-const clock = fixedClock(new Date("2026-11-07T12:00:00-05:00"));
-const handler = createFrontDeskMcpHandler({ clock, catalog: createHardcodedCatalog(clock) });
+// Each test gets a fresh in-memory store holding the two example bookings on that Saturday.
+let deps: FrontDeskDeps;
+beforeEach(() => {
+  deps = memoryDeps({ initialBookings: EXAMPLE_BOOKINGS });
+});
+// Deps are resolved per tool call, the same way the route passes getFrontDeskDeps.
+const handler = createFrontDeskMcpHandler(() => deps);
 
 type ToolResult = {
   content: { type: string; text: string }[];
@@ -47,7 +57,7 @@ const callTool = (name: string, args: Record<string, unknown> = {}) =>
   rpc<ToolResult>("tools/call", { name, arguments: args });
 
 describe("MCP /api/mcp", () => {
-  it("lists both tools as read-only, with RFC 3339 inputs documented", async () => {
+  it("lists the two read tools as read-only, with RFC 3339 inputs documented", async () => {
     const { tools } = await rpc<{
       tools: {
         name: string;
@@ -58,8 +68,8 @@ describe("MCP /api/mcp", () => {
       }[];
     }>("tools/list");
 
-    expect(tools.map((t) => t.name).sort()).toEqual(["get_availability", "list_services"]);
-    for (const tool of tools) {
+    expect(tools.map((t) => t.name).sort()).toEqual(["book", "get_availability", "list_services"]);
+    for (const tool of tools.filter((t) => t.name !== "book")) {
       expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
       expect(tool.outputSchema).toBeDefined();
     }
@@ -153,5 +163,125 @@ describe("MCP /api/mcp", () => {
     expect(schema.properties.from).toMatchObject({ type: "string", format: "date-time" });
     expect(schema.properties.to).toMatchObject({ type: "string", format: "date-time" });
     expect(schema.properties.limit).toMatchObject({ type: "integer", minimum: 1, maximum: 50 });
+  });
+});
+
+describe("MCP book tool", () => {
+  const SLOT = "2026-11-14T14:30:00-05:00";
+  const bookArgs = { service_id: "haircut", start: SLOT, customer_name: "Maya" };
+
+  it("is advertised as a write that isn't destructive or idempotent, with actionable inputs", async () => {
+    const { tools } = await rpc<{
+      tools: {
+        name: string;
+        description: string;
+        annotations?: Record<string, unknown>;
+        inputSchema: { required?: string[]; properties: Record<string, Record<string, unknown>> };
+        outputSchema?: unknown;
+      }[];
+    }>("tools/list");
+    const tool = tools.find((t) => t.name === "book")!;
+    expect(tool.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    });
+    expect(tool.outputSchema).toBeDefined();
+    expect(tool.description).toMatch(/immediately/);
+    expect(tool.description).toMatch(/No deposit is collected/);
+    expect(tool.description).toMatch(/not verified/);
+    expect([...(tool.inputSchema.required ?? [])].sort()).toEqual(["customer_name", "service_id", "start"]);
+    expect(tool.inputSchema.properties.start).toMatchObject({ type: "string", format: "date-time" });
+    expect(String(tool.inputSchema.properties.start.description)).toMatch(/returned by get_availability/);
+    expect(tool.inputSchema.properties.customer_name).toMatchObject({ type: "string", minLength: 1, maxLength: 80 });
+  });
+
+  it("books a slot, returns BookResult and a summary, and the slot disappears", async () => {
+    const result = await callTool("book", bookArgs);
+    expect(result.isError).toBeFalsy();
+    const { booking } = result.structuredContent as BookResult;
+    expect(booking).toMatchObject({
+      shopSlug: "harts",
+      serviceId: "haircut",
+      serviceName: "Haircut",
+      staffId: "dana",
+      start: SLOT,
+      end: "2026-11-14T15:00:00-05:00",
+      display: "Sat 14 Nov, 2:30 pm EST",
+      status: "confirmed",
+      customer: { displayName: "Maya", verified: false },
+      agent: { name: "unknown agent" }, // 2025-era requests carry no clientInfo
+      depositCents: 1000,
+      createdAt: "2026-11-07T12:00:00-05:00",
+    });
+    expect(result.content[0].text).toContain(
+      "Booked Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. A $10 deposit will be required once deposits are enabled",
+    );
+    expect(result.content[0].text).toContain(booking.id);
+
+    const after = await callTool("get_availability", {
+      service_id: "haircut",
+      from: "2026-11-14T14:00:00-05:00",
+      to: "2026-11-14T16:00:00-05:00",
+    });
+    const starts = (after.structuredContent as GetAvailabilityResult).slots.map((s) => s.start.slice(11, 16));
+    expect(starts).not.toContain("14:30");
+  });
+
+  it("refuses the same slot twice with slot_taken", async () => {
+    expect((await callTool("book", bookArgs)).isError).toBeFalsy();
+    const second = await callTool("book", { ...bookArgs, customer_name: "Jo" });
+    expect(second.isError).toBe(true);
+    expect(second.structuredContent).toBeUndefined();
+    const envelope = JSON.parse(second.content[0].text) as ApiError;
+    expect(envelope.error.code).toBe("slot_taken");
+    expect(envelope.error.next_action).toBe(
+      "Someone just took that time. Call get_availability again and choose another start.",
+    );
+  });
+
+  it("returns slot_taken through the envelope when the database refuses an overlap", async () => {
+    // Simulate a race: availability (the catalog) still shows the slot free, but the store has it.
+    const base = deps;
+    deps = { ...base, catalog: { ...base.catalog, getBusyIntervals: async () => [] } };
+    expect((await callTool("book", bookArgs)).isError).toBeFalsy();
+    const raced = await callTool("book", { ...bookArgs, customer_name: "Jo" });
+    expect(raced.isError).toBe(true);
+    const envelope = JSON.parse(raced.content[0].text) as ApiError;
+    expect(envelope.error.code).toBe("slot_taken");
+    expect(envelope.error.next_action).toBe(
+      "Someone just took that time. Call get_availability again and choose another start.",
+    );
+  });
+
+  it.each<[string, Record<string, unknown>, string]>([
+    ["no arguments", {}, "service_id"],
+    ["a missing customer_name", { service_id: "haircut", start: SLOT }, "customer_name"],
+    ["a blank customer_name", { ...bookArgs, customer_name: "   " }, "customer_name"],
+    ["an 81-character customer_name", { ...bookArgs, customer_name: "x".repeat(81) }, "customer_name"],
+    ["a start without an offset", { ...bookArgs, start: "2026-11-14T14:30:00" }, "start"],
+    ["a numeric start", { ...bookArgs, start: 1763148600 }, "start"],
+  ])("returns the invalid_request envelope for %s", async (_label, args, field) => {
+    const result = await callTool("book", args);
+    expect(result.isError).toBe(true);
+    const envelope = JSON.parse(result.content[0].text) as ApiError;
+    expect(envelope.error.code).toBe("invalid_request");
+    expect(envelope.error.details).toMatchObject({ field });
+    expect(envelope.error.next_action.length).toBeGreaterThan(0);
+  });
+});
+
+describe("agentNameFrom", () => {
+  it("reads the MCP client's name from the 2026-07-28 request envelope", () => {
+    const ctx = { mcpReq: { envelope: { "io.modelcontextprotocol/clientInfo": { name: "claude-ai", version: "1.0" } } } };
+    expect(agentNameFrom(ctx)).toBe("claude-ai");
+  });
+
+  it("falls back to 'unknown agent' when the request carries no client name", () => {
+    expect(agentNameFrom(undefined)).toBe("unknown agent");
+    expect(agentNameFrom({ mcpReq: {} })).toBe("unknown agent");
+    expect(agentNameFrom({ mcpReq: { envelope: { "io.modelcontextprotocol/clientInfo": { name: "  " } } } })).toBe(
+      "unknown agent",
+    );
   });
 });
