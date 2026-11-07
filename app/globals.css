@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8f7f3;
+  --foreground: #24251f;
+  --surface: #f0efe9;
+  --muted: #686960;
+  --line: #dcdcd2;
+  --accent: #be431f;
+  color-scheme: light;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 7rem;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+::selection { background: #be431f; color: #fff; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+
+@layer components {
+  .page-shell { @apply mx-auto w-full max-w-6xl px-6 sm:px-10 lg:px-12; }
+  .section-space { @apply py-16 sm:py-20; }
+  .eyebrow { @apply font-mono text-[10px] font-medium uppercase tracking-[0.14em] sm:text-[11px]; }
+  .section-title { @apply text-3xl leading-[1.15] font-medium tracking-[-0.045em] sm:text-4xl; }
+  .primary-button { @apply inline-flex min-h-12 items-center justify-center gap-8 rounded-sm bg-accent px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-foreground; }
+  .nav-link { @apply flex min-h-11 items-center transition-colors hover:text-accent; }
+  .skip-link { @apply fixed top-3 left-3 z-50 -translate-y-24 rounded bg-foreground px-4 py-3 text-background focus:translate-y-0; }
+}
+
+.hero-grid {
+  background-image: linear-gradient(to right, rgb(104 105 96 / 5%) 1px, transparent 1px);
+  background-size: 12.5% 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { transition-duration: 0s !important; }
+}

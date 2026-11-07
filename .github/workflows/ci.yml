@@ -1,0 +1,47 @@
+# Runs on every pull request and every push to main.
+# Each step is one check; if any step fails, the PR shows a red X.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# If an agent pushes again while checks are still running, cancel the old run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: lint · typecheck · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm (version from package.json "packageManager")
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        # Fails if package.json and pnpm-lock.yaml disagree
+        # (catches an agent adding a dependency without updating the lockfile).
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
