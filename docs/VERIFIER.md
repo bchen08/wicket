@@ -39,9 +39,12 @@ Never write to production.
 5. Check any new API shape is an exported type in lib/types/ and the UI uses it.
 
 Reply with one PR comment:
-- Verdict: READY or NOT READY
+- Verdict: READY or NOT READY. If any check is SKIPPED, say how many
+  in the verdict line, e.g. "READY, 2 checks skipped". A skipped check
+  is not a pass.
 - A table of every check with PASS/FAIL/SKIPPED and evidence
-- A short list of anything the human reviewer should look at closely
+- A short list of anything the human reviewer should look at closely,
+  starting with every SKIPPED check: a human must verify those
 Do not fix anything yourself.
 ```
 
@@ -49,3 +52,4 @@ Do not fix anything yourself.
 
 - NOT READY → paste the comment into the author's session (same Claude session or v0 chat) and let it push a fix to the same branch.
 - READY → a human reviews the diff, clicks through the preview, and squash-merges.
+- READY with skipped checks → before merging, a human verifies each skipped check. Either redeploy the preview so it shows "Hart's Barbers (preview)" and run the check there, or run it locally (see [frontdesk-api.md → Try the full loop](frontdesk-api.md#try-the-full-loop)).
