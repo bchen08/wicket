@@ -1,6 +1,6 @@
 # emergent
 
-The Emergent web app. Built by agents, shipped by people.
+hackathon project.
 
 - **Backend** (`app/api`, `lib`) is written by Claude Code.
 - **Frontend** (`components`, pages, styles) is written by v0.
