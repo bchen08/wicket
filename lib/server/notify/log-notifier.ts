@@ -1,6 +1,6 @@
 import type { Notifier } from "./notifier";
 
-// TODO(ring-1): alert the owner on a real channel (email or SMS) instead of a log line.
+// TODO(ring-1c): alert the owner on a real channel (Photon) instead of a log line.
 
 /** The customer's first name only: everything before the first space. */
 export function firstName(displayName: string): string {

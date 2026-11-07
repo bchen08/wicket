@@ -1,25 +1,45 @@
+import { DateTime } from "luxon";
 import type {
   BookInput,
+  Booking,
+  BookingEventType,
   BookingsResponse,
+  BookingTransitionResult,
   BookResult,
+  CancelInput,
+  CancelResult,
   GetAvailabilityInput,
   GetAvailabilityResult,
+  GetBookingInput,
+  GetBookingResult,
+  GetPoliciesResult,
   ListServicesResult,
+  Policies,
   Service,
   Shop,
+  Slot,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
 import {
+  bookingBounds,
+  checkStart,
   computeAvailability,
-  MAX_LIMIT,
+  formatDisplay,
+  nearbySlots,
   validateRequest,
-  type AvailabilityInput,
+  type BookingRules,
+  type StartCheck,
+  type StartCheckInput,
 } from "../engine/availability";
+import { decide, type LifecycleAction, type LifecycleActor } from "../engine/lifecycle";
 import type { Notifier } from "../notify/notifier";
 import { SlotTakenError, type BookingStore } from "./booking-store";
-import type { ShopCatalog } from "./catalog";
+import type { BusyInterval, ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
-import { parseRfc3339 } from "./time";
+import { parseIdempotencyKey, requestHash } from "./idempotency";
+import { normalizeUuid } from "./idempotency-errors";
+import { DEFAULT_POLICIES } from "./policies";
+import { parseRfc3339, toRfc3339 } from "./time";
 
 // Transport-agnostic use cases behind the MCP tools and the UI routes. They take their
 // dependencies as arguments so tests can pass a fixed clock and the in-memory store.
@@ -32,7 +52,11 @@ export type FrontDeskDeps = {
   notifier: Notifier;
 };
 
-function shopNotFound(slug: string): FrontDeskError {
+const MIN_MS = 60_000;
+const HOUR_MS = 60 * MIN_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+export function shopNotFound(slug: string): FrontDeskError {
   return new FrontDeskError(
     "not_found",
     `No shop with slug "${slug}".`,
@@ -41,16 +65,121 @@ function shopNotFound(slug: string): FrontDeskError {
   );
 }
 
+/** U+0000. Postgres text can't hold it (SQLSTATE 22021), so it never reaches a query or a stored row. */
+export const NUL = "\u0000";
+
+/** The shop, or a not_found FrontDeskError. A slug containing NUL is not_found without a query. */
+export async function requireShop(deps: FrontDeskDeps, shopSlug: string): Promise<Shop> {
+  if (shopSlug.includes(NUL)) throw shopNotFound(shopSlug);
+  const shop = await deps.catalog.getShop(shopSlug);
+  if (!shop) throw shopNotFound(shopSlug);
+  return shop;
+}
+
+/** The shop's policies; DEFAULT_POLICIES if it has no row. Doesn't check that the shop exists. */
+export async function policiesFor(deps: FrontDeskDeps, shopSlug: string): Promise<Policies> {
+  return (await deps.catalog.getPolicies(shopSlug)) ?? { ...DEFAULT_POLICIES };
+}
+
+export function bookingNotFound(bookingId: string): FrontDeskError {
+  return new FrontDeskError(
+    "booking_not_found",
+    `No booking with id "${bookingId}" at this shop.`,
+    "Check the booking id. It is the booking.id (a UUID) that book returned.",
+    { booking_id: bookingId },
+  );
+}
+
+/** The booking if it exists and belongs to `shopSlug`; otherwise booking_not_found. */
+export async function requireBooking(deps: FrontDeskDeps, shopSlug: string, bookingId: string): Promise<Booking> {
+  const booking = await deps.store.getBooking(bookingId);
+  if (!booking || booking.shopSlug !== shopSlug) throw bookingNotFound(bookingId);
+  return booking;
+}
+
+const EVENT_FOR: Record<LifecycleAction, BookingEventType> = {
+  cancel: "cancelled",
+  complete: "completed",
+  mark_no_show: "no_show",
+};
+
+/** How many times transitionBooking re-reads and re-decides after losing a race. */
+const MAX_TRANSITION_ATTEMPTS = 3;
+
+/**
+ * Apply a lifecycle action to a booking: decide() against the shop's policies and the clock, then
+ * store.transition() conditionally on the status it decided from, writing one event.
+ * If another transition got there first (transition returns null), re-read the booking and decide
+ * again, so the loser gets the right error (e.g. not_cancellable) instead of a stale success.
+ * Throws not_found (shop), booking_not_found, or decide()'s FrontDeskError.
+ * TODO(ring-1c): move real money. depositEffect is what the policy decides; nothing is collected.
+ */
+export async function transitionBooking(
+  deps: FrontDeskDeps,
+  shopSlug: string,
+  bookingId: string,
+  action: LifecycleAction,
+  actor: LifecycleActor,
+): Promise<BookingTransitionResult> {
+  await requireShop(deps, shopSlug);
+  const policies = await policiesFor(deps, shopSlug);
+  for (let attempt = 1; attempt <= MAX_TRANSITION_ATTEMPTS; attempt++) {
+    const booking = await requireBooking(deps, shopSlug, bookingId);
+    const decision = decide(booking, { type: action, actor }, deps.clock.now(), policies);
+    if (decision instanceof FrontDeskError) throw decision;
+    const updated = await deps.store.transition(booking.id, booking.status, decision.nextStatus, {
+      actor,
+      type: EVENT_FOR[action],
+      data: {
+        from: booking.status,
+        to: decision.nextStatus,
+        depositEffect: decision.depositEffect,
+        depositCollected: false,
+      },
+    });
+    if (updated) return { booking: updated, depositEffect: decision.depositEffect, depositCollected: false };
+  }
+  throw new Error(`Booking ${bookingId} kept changing status during ${action}; gave up after ${MAX_TRANSITION_ATTEMPTS} attempts.`);
+}
+
 /** The shop and everything it sells. */
 export async function listServices(
   deps: FrontDeskDeps,
   shopSlug: string,
 ): Promise<ListServicesResult> {
-  const shop = await deps.catalog.getShop(shopSlug);
-  if (!shop) throw shopNotFound(shopSlug);
+  const shop = await requireShop(deps, shopSlug);
   const services = await deps.catalog.listServices(shopSlug);
   return { shop, services };
 }
+
+/** The shop and its booking rules (lead time, horizons, cancellation window, pause, phone, rule texts). */
+export async function getPolicies(deps: FrontDeskDeps, shopSlug: string): Promise<GetPoliciesResult> {
+  const shop = await requireShop(deps, shopSlug);
+  return { shop, policies: await policiesFor(deps, shopSlug) };
+}
+
+// ---- Wording shared with the MCP text summaries ----
+
+/** "1 hour", "30 days": `n` and `unit`, with an "s" unless n is 1. */
+export function pluralize(n: number, unit: string): string {
+  return `${n} ${unit}${n === 1 ? "" : "s"}`;
+}
+
+/** A number of minutes in words: "2 hours", "45 minutes", "1 hour 30 minutes", "7 days". */
+export function minutesInWords(minutes: number): string {
+  const perDay = 24 * 60;
+  if (minutes >= perDay && minutes % perDay === 0) return pluralize(minutes / perDay, "day");
+  if (minutes >= 60 && minutes % 60 === 0) return pluralize(minutes / 60, "hour");
+  if (minutes > 60) return `${pluralize(Math.floor(minutes / 60), "hour")} ${pluralize(minutes % 60, "minute")}`;
+  return pluralize(minutes, "minute");
+}
+
+/** The shop's phone for people to call, or null if it has none. */
+function shopPhone(policies: Policies): string | null {
+  return policies.phone?.trim() || null;
+}
+
+// ---- Availability ----
 
 function parseInstant(field: "from" | "to", value: string): Date {
   const parsed = parseRfc3339(value);
@@ -114,7 +243,34 @@ export function parseGetAvailabilityArgs(raw: unknown): GetAvailabilityInput {
   };
 }
 
-/** Bookable start times for one service in a window. */
+/** The parts of the shop's policies the availability engine applies. */
+function bookingRules(policies: Policies): BookingRules {
+  return {
+    leadTimeMin: policies.leadTimeMin,
+    horizonDays: policies.horizonDays,
+    depositHorizonDays: policies.depositHorizonDays,
+    paused: policies.paused,
+  };
+}
+
+/** The shop's service with this id, or `error` built from the valid ids. */
+async function findService(
+  deps: FrontDeskDeps,
+  shop: Shop,
+  serviceId: string,
+  error: (validIds: string[]) => FrontDeskError,
+): Promise<Service> {
+  const services = await deps.catalog.listServices(shop.slug);
+  const service = services.find((s) => s.id === serviceId);
+  if (!service) throw error(services.map((s) => s.id));
+  return service;
+}
+
+/**
+ * Bookable start times for one service in a window, under the shop's rules: nothing inside the
+ * lead time, nothing beyond the horizon (the deposit horizon for a service with a deposit), and
+ * nothing at all while the shop is paused ({ slots: [], truncated: false }).
+ */
 export async function getAvailability(
   deps: FrontDeskDeps,
   shopSlug: string,
@@ -125,51 +281,55 @@ export async function getAvailability(
   // Reject a bad window before asking the catalog for anything.
   validateRequest({ from, to, limit: input.limit });
 
-  const shop = await deps.catalog.getShop(shopSlug);
-  if (!shop) throw shopNotFound(shopSlug);
+  const shop = await requireShop(deps, shopSlug);
+  const [service, policies] = await Promise.all([
+    findService(
+      deps,
+      shop,
+      input.service_id,
+      (validIds) =>
+        new FrontDeskError(
+          "not_found",
+          `No service with id "${input.service_id}" at ${shop.name}.`,
+          "Call list_services to get valid service ids, then retry with one of them.",
+          { service_id: input.service_id, valid_service_ids: validIds },
+        ),
+    ),
+    policiesFor(deps, shopSlug),
+  ]);
+  if (policies.paused) return { slots: [], truncated: false };
 
-  const services = await deps.catalog.listServices(shopSlug);
-  const service = services.find((s) => s.id === input.service_id);
-  if (!service) {
-    throw new FrontDeskError(
-      "not_found",
-      `No service with id "${input.service_id}" at ${shop.name}.`,
-      "Call list_services to get valid service ids, then retry with one of them.",
-      { service_id: input.service_id, valid_service_ids: services.map((s) => s.id) },
-    );
-  }
-
-  const { result } = await findSlots(deps, shop, service, { from, to, limit: input.limit });
-  return result;
-}
-
-/** Run the engine for one service over [from, to). Also returns the staff hours it used. */
-async function findSlots(
-  deps: FrontDeskDeps,
-  shop: Shop,
-  service: Service,
-  window: { from: Date; to: Date; limit?: number },
-) {
-  const { from, to, limit } = window;
-  // A slot may start just before `to` and run past it, so fetch busy time up to
-  // to + duration; otherwise a booking right after the window could be missed.
-  const busyUntil = new Date(to.getTime() + service.durationMin * 60_000);
+  const now = deps.clock.now();
+  const rules = bookingRules(policies);
+  // Busy time only matters for the starts the rules allow: [max(from, earliest), min(to, latest)).
+  // A slot may start just before the end of that range and run past it, so fetch busy time up to
+  // there + duration; otherwise a booking right after it could be missed. A window wholly outside
+  // the rules (e.g. in year 9999 or year 1, where the range would be out of the database's reach)
+  // fetches nothing.
+  const bounds = bookingBounds({ now, timezone: shop.timezone, depositCents: service.depositCents, rules });
+  const startsFrom = Math.max(from.getTime(), bounds.earliest.getTime());
+  const startsTo = Math.min(to.getTime(), bounds.latest?.getTime() ?? Infinity);
   const [staffHours, busy] = await Promise.all([
     deps.catalog.getStaffHours(shop.slug),
-    deps.catalog.getBusyIntervals(shop.slug, { start: from, end: busyUntil }),
+    startsFrom < startsTo
+      ? deps.catalog.getBusyIntervals(shop.slug, {
+          start: new Date(startsFrom),
+          end: new Date(startsTo + service.durationMin * MIN_MS),
+        })
+      : Promise.resolve([]),
   ]);
-
-  const input: AvailabilityInput = {
+  return computeAvailability({
     timezone: shop.timezone,
     durationMin: service.durationMin,
     staffHours,
     busy,
     from,
     to,
-    now: deps.clock.now(),
-    limit,
-  };
-  return { result: computeAvailability(input), staffHours, input };
+    now,
+    limit: input.limit,
+    depositCents: service.depositCents,
+    rules,
+  });
 }
 
 // ---- Booking ----
@@ -179,15 +339,17 @@ export const MAX_CUSTOMER_NAME = 80;
 /** Longest agent label stored. Longer client names are cut. */
 const MAX_AGENT_NAME = 80;
 export const UNKNOWN_AGENT = "unknown agent";
+/** How many nearby starts a slot_taken error offers in details.alternatives. */
+export const MAX_ALTERNATIVES = 3;
 
 /**
  * Check raw `book` tool arguments (any JSON) and narrow them to BookInput, in the same style as
  * parseGetAvailabilityArgs: missing fields and wrong JSON types become invalid_request errors.
- * customer_name is returned trimmed.
+ * customer_name is returned trimmed; idempotency_key is checked by parseIdempotencyKey.
  */
 export function parseBookArgs(raw: unknown): BookInput {
   const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  const { service_id, start, customer_name } = args;
+  const { service_id, start, customer_name, idempotency_key } = args;
 
   if (typeof service_id !== "string" || service_id.trim() === "") {
     throw invalidField(
@@ -214,38 +376,54 @@ export function parseBookArgs(raw: unknown): BookInput {
       customer_name,
     );
   }
+  if (name.includes(NUL)) {
+    throw invalidField(
+      "customer_name",
+      "customer_name can't contain the NUL character (U+0000).",
+      "Send the name the booking should be under as plain text, without control characters.",
+      customer_name,
+    );
+  }
 
-  return { service_id, start, customer_name: name };
+  return { service_id, start, customer_name: name, idempotency_key: parseIdempotencyKey(idempotency_key) };
 }
 
 /** What book() hands back: the contract's BookResult, plus the staff name for the text summary. */
 export type BookOutcome = BookResult & { staffName: string };
 
 /**
- * Book `input.start` for `input.service_id`, immediately and confirmed.
+ * Book `input.start` for `input.service_id`, immediately and confirmed, at most once per
+ * idempotency_key.
  *
- * 1. Validate the input.
- * 2. Recompute availability over [start, start + duration) with the current clock and require
- *    `start` to be one of the returned slots. The staff member comes from the matching slot.
- *    Off-grid, out-of-hours and past starts are invalid_request. A start that is only blocked by
- *    an existing booking is slot_taken, so booking the same slot twice says "taken" either way.
- * 3. Store it. If another booking got there first (SlotTakenError, i.e. the database's
- *    no_overlap constraint), fail with slot_taken. The database is the final word even when
- *    step 2 passed.
- * 4. Alert the owner. A failing notifier is logged and never fails the booking.
+ * 1. Validate the input (invalid_request).
+ * 2. Hash the normalized request (shop, service, start as an instant, trimmed name) and run the rest
+ *    inside store.idempotent: the same key with the same request returns the first call's booking
+ *    (replayed: true) without booking again; the same key with another request is
+ *    idempotency_conflict. A call that fails isn't remembered, so it can be retried with the same key.
+ * 3. Check the start against the shop's rules (engine checkStart): paused, too_soon
+ *    (details.earliest), too_far (details.latest). These are decided before busy time is read, so a
+ *    start far in the past or future never queries bookings. Then against hours, blocked time and
+ *    bookings: outside_hours, or slot_taken (details.alternatives: up to 3 nearby free starts). The
+ *    staff member comes from the check.
+ * 4. Store it with the store the idempotent action receives (in Postgres, the key's transaction).
+ *    If another booking got there first (SlotTakenError, i.e. the no_overlap constraint), read busy
+ *    time again and, if another staff member is free at exactly this start, try once more with them.
+ *    If that fails too, or nobody is free, fail with slot_taken; the database is the final word even
+ *    when step 3 passed.
+ * 5. Alert the owner, only for a new booking (not a replay). A failing notifier is logged and never
+ *    fails the booking.
  *
- * TODO(ring-1): deposits. Booking.depositCents shows what the service requires; nothing is collected.
- * TODO(ring-1): idempotency keys, so an agent can safely retry a book call that timed out.
- * TODO(ring-2): verified customer identity. customer.verified is always false.
+ * TODO(ring-1c): deposits. book creates confirmed bookings; awaiting_deposit and collecting the
+ * deposit come with Stripe. Booking.depositCents shows what the service requires; nothing is collected.
+ * TODO(ring-1b): verified customer identity, consent and mandate. customer.verified is always false.
  */
 export async function book(
   deps: FrontDeskDeps,
   shopSlug: string,
   input: BookInput,
   agentName: string,
-): Promise<BookOutcome> {
+): Promise<BookOutcome & { replayed: boolean }> {
   const args = parseBookArgs(input);
-
   const start = parseRfc3339(args.start);
   if (!start) {
     throw invalidField(
@@ -256,61 +434,136 @@ export async function book(
     );
   }
 
-  const shop = await deps.catalog.getShop(shopSlug);
-  if (!shop) throw shopNotFound(shopSlug);
+  const scope = {
+    key: args.idempotency_key,
+    tool: "book" as const,
+    // The instant, not the string: the same time written with another offset is the same request.
+    requestHash: requestHash({
+      shop: shopSlug,
+      service_id: args.service_id,
+      start: start.toISOString(),
+      customer_name: args.customer_name,
+    }),
+  };
+  // The action reads and writes through the store it's given (in Postgres, the key's transaction).
+  const { result, replayed } = await deps.store.idempotent(scope, (tx) =>
+    bookOnce({ ...deps, catalog: tx, store: tx }, shopSlug, args, start, cleanAgentName(agentName)),
+  );
 
-  const services = await deps.catalog.listServices(shopSlug);
-  const service = services.find((s) => s.id === args.service_id);
-  if (!service) {
-    throw new FrontDeskError(
-      "invalid_request",
-      `No service with id "${args.service_id}" at ${shop.name}.`,
-      "Call list_services to get valid service ids, then call get_availability for that service and book one of its starts.",
-      { field: "service_id", value: args.service_id, valid_service_ids: services.map((s) => s.id) },
-    );
-  }
+  if (!replayed) await alertOwner(deps.notifier, result.booking);
+  return { ...result, replayed };
+}
 
-  const end = new Date(start.getTime() + service.durationMin * 60_000);
-  const { result, staffHours, input: engineInput } = await findSlots(deps, shop, service, {
-    from: start,
-    to: end,
-    limit: MAX_LIMIT,
+/** checkStart's refusals that come from the shop's rules alone, before hours and busy time count. */
+const RULE_REFUSALS: ReadonlySet<RefusedStart["reason"]> = new Set(["paused", "too_soon", "too_far"]);
+
+/** Steps 3 and 4 of book(): check the start and store the booking. `deps.catalog` and `deps.store` are the idempotent action's store. */
+async function bookOnce(
+  deps: FrontDeskDeps,
+  shopSlug: string,
+  args: BookInput,
+  start: Date,
+  agentName: string,
+): Promise<BookOutcome> {
+  const shop = await requireShop(deps, shopSlug);
+  const [service, policies, staffHours] = await Promise.all([
+    findService(
+      deps,
+      shop,
+      args.service_id,
+      (validIds) =>
+        new FrontDeskError(
+          "invalid_request",
+          `No service with id "${args.service_id}" at ${shop.name}.`,
+          "Call list_services to get valid service ids, then call get_availability for that service and book one of its starts.",
+          { field: "service_id", value: args.service_id, valid_service_ids: validIds },
+        ),
+    ),
+    policiesFor(deps, shopSlug),
+    deps.catalog.getStaffHours(shopSlug),
+  ]);
+
+  const rulesOnly: StartCheckInput = {
+    timezone: shop.timezone,
+    durationMin: service.durationMin,
+    staffHours,
+    busy: [],
+    now: deps.clock.now(),
+    depositCents: service.depositCents,
+    rules: bookingRules(policies),
+  };
+  const refused = (check: RefusedStart, engine: StartCheckInput) =>
+    startRefused(check, { shop, service, policies, requested: args.start, start, engine });
+  /** The engine input with busy time around `start`, read now. */
+  const withBusy = async (): Promise<StartCheckInput> => ({
+    ...rulesOnly,
+    busy: await busyAround(deps, shop, service, start),
   });
-  const isStart = (s: { start: string }) => parseRfc3339(s.start)?.getTime() === start.getTime();
-  const slot = result.slots.find(isStart);
-  if (!slot) {
-    // Would it be free if nobody had booked? Then it's taken, not invalid.
-    const freeWithoutBookings = computeAvailability({ ...engineInput, busy: [] }).slots.some(isStart);
-    if (freeWithoutBookings) throw slotTaken(args.start, service.id);
-    throw new FrontDeskError(
-      "invalid_request",
-      "That start time isn't available.",
-      "Call get_availability and choose one of the returned starts.",
-      { field: "start", value: args.start, service_id: service.id },
-    );
+
+  // The rules first, with no busy time: paused, too_soon and too_far don't depend on it, and a start
+  // far in the past or future (year 1, year 9999) would put the busy-time range out of the database's reach.
+  const byRules = checkStart(rulesOnly, start);
+  if (!byRules.ok && RULE_REFUSALS.has(byRules.reason)) throw refused(byRules, rulesOnly);
+
+  let engine = await withBusy();
+  const check = checkStart(engine, start);
+  if (!check.ok) throw refused(check, engine);
+
+  /** The stored booking, or null if another booking holds that staff member's time (SlotTakenError). */
+  const create = async (staffId: string): Promise<Booking | null> => {
+    try {
+      return await deps.store.createBooking({
+        shopSlug: shop.slug,
+        serviceId: service.id,
+        staffId,
+        start,
+        end: new Date(start.getTime() + service.durationMin * MIN_MS),
+        customerName: args.customer_name,
+        agentName,
+        depositCents: service.depositCents,
+      });
+    } catch (err) {
+      if (err instanceof SlotTakenError) return null;
+      throw err;
+    }
+  };
+
+  let booking = await create(check.slot.staffId);
+  if (!booking) {
+    // Another booking won the race between the check and the insert. Read busy time again, now that
+    // the winner is stored: another staff member may still be free at exactly this start, so try once
+    // more with them. Otherwise offer starts around it, from that fresh busy time.
+    engine = await withBusy();
+    const recheck = checkStart(engine, start);
+    if (recheck.ok) {
+      booking = await create(recheck.slot.staffId);
+      if (!booking) engine = await withBusy();
+    }
+    if (!booking) throw slotTaken(args.start, service.id, alternativesNear(engine, start));
   }
 
-  let booking;
-  try {
-    booking = await deps.store.createBooking({
-      shopSlug: shop.slug,
-      serviceId: service.id,
-      staffId: slot.staffId,
-      start,
-      end,
-      customerName: args.customer_name,
-      agentName: cleanAgentName(agentName),
-    });
-  } catch (err) {
-    // Another booking won the race between step 2 and the insert.
-    if (err instanceof SlotTakenError) throw slotTaken(args.start, service.id);
-    throw err;
-  }
+  const staffId = booking.staffId;
+  const staffName = staffHours.find((s) => s.staffId === staffId)?.staffName ?? staffId;
+  return { booking, staffName };
+}
 
+/**
+ * Busy time that can matter for a booking at `start` or for an alternative near it: every slot
+ * nearbySlots considers starts within 24 hours of `start` and runs up to the service's duration.
+ */
+function busyAround(deps: FrontDeskDeps, shop: Shop, service: Service, start: Date): Promise<BusyInterval[]> {
+  return deps.catalog.getBusyIntervals(shop.slug, {
+    start: new Date(start.getTime() - DAY_MS),
+    end: new Date(start.getTime() + service.durationMin * MIN_MS + DAY_MS),
+  });
+}
+
+/** Tell the owner about a new booking. It's already stored, so a failure is only logged. */
+async function alertOwner(notifier: Notifier, booking: Booking): Promise<void> {
   try {
-    await deps.notifier.alertOwner(booking);
+    await notifier.alertOwner(booking);
   } catch (err) {
-    // The booking is already stored; failing now would make the agent retry into slot_taken.
+    // Failing now would make the agent retry into slot_taken (or a replay) for a booking that exists.
     console.error(
       JSON.stringify({
         event: "booking.notify_failed",
@@ -320,23 +573,171 @@ export async function book(
       }),
     );
   }
-
-  const staffName = staffHours.find((s) => s.staffId === slot.staffId)?.staffName ?? slot.staffId;
-  return { booking, staffName };
 }
 
-function slotTaken(start: string, serviceId: string): FrontDeskError {
+type RefusedStart = Exclude<StartCheck, { ok: true }>;
+
+/** The FrontDeskError for a start checkStart refused, with the most specific code. */
+function startRefused(
+  check: RefusedStart,
+  ctx: { shop: Shop; service: Service; policies: Policies; requested: string; start: Date; engine: StartCheckInput },
+): FrontDeskError {
+  const { shop, service, policies, requested, start, engine } = ctx;
+  switch (check.reason) {
+    case "paused": {
+      const phone = shopPhone(policies);
+      return new FrontDeskError(
+        "paused",
+        `${shop.name} isn't taking bookings right now.`,
+        `Tell the person to call the shop${phone ? ` at ${phone}` : ""}.`,
+        { phone },
+      );
+    }
+    case "too_soon": {
+      const display = formatDisplay(DateTime.fromJSDate(check.earliest, { zone: shop.timezone }));
+      const message =
+        policies.leadTimeMin > 0
+          ? `${shop.name} needs at least ${minutesInWords(policies.leadTimeMin)} notice; the earliest start is ${display}.`
+          : `That time has already passed; the earliest start at ${shop.name} is ${display}.`;
+      return new FrontDeskError("too_soon", message, "Pick a later time: call get_availability from details.earliest.", {
+        earliest: toRfc3339(check.earliest, shop.timezone),
+        lead_time_min: policies.leadTimeMin,
+        start: requested,
+      });
+    }
+    case "too_far": {
+      const days = service.depositCents > 0 ? policies.depositHorizonDays : policies.horizonDays;
+      return new FrontDeskError(
+        "too_far",
+        `${shop.name} takes bookings for ${service.name} up to ${pluralize(days, "day")} ahead.`,
+        "Pick an earlier time, before details.latest.",
+        { latest: toRfc3339(check.latest, shop.timezone), horizon_days: days, start: requested },
+      );
+    }
+    case "outside_hours":
+      return new FrontDeskError(
+        "outside_hours",
+        `That isn't a bookable time for ${service.name}.`,
+        "Call get_availability and choose one of the returned starts.",
+        { field: "start", value: requested, service_id: service.id },
+      );
+    case "taken":
+      return slotTaken(requested, service.id, alternativesNear(engine, start));
+  }
+}
+
+const SLOT_TAKEN_NEXT = "Someone just took that time. Call get_availability again and choose another start.";
+
+function slotTaken(start: string, serviceId: string, alternatives: Slot[]): FrontDeskError {
   return new FrontDeskError(
     "slot_taken",
     "That time is already booked.",
-    "Someone just took that time. Call get_availability again and choose another start.",
-    { start, service_id: serviceId },
+    alternatives.length > 0
+      ? `${SLOT_TAKEN_NEXT} Nearby open starts you can offer instead are in details.alternatives.`
+      : SLOT_TAKEN_NEXT,
+    { start, service_id: serviceId, alternatives },
   );
 }
 
+/**
+ * Up to MAX_ALTERNATIVES free starts closest to `start`, one Slot per distinct start, earliest first.
+ * `start` itself is one of them only while some staff member is still free then (e.g. after a lost
+ * race, when the retry with another staff member lost too and a third is free). nearbySlots returns
+ * one Slot per free staff member and book picks the staff member itself, so ask it for enough Slots
+ * to be sure of MAX_ALTERNATIVES distinct starts and keep the first Slot (lowest staffId) per start.
+ */
+function alternativesNear(engine: StartCheckInput, start: Date): Slot[] {
+  const startMs = start.getTime();
+  const perStart = Math.max(1, engine.staffHours.length);
+  const distinct = new Map<number, Slot>();
+  for (const slot of nearbySlots(engine, start, MAX_ALTERNATIVES * perStart)) {
+    const ms = Date.parse(slot.start);
+    if (!distinct.has(ms)) distinct.set(ms, slot);
+  }
+  return [...distinct]
+    .sort(([a], [b]) => Math.abs(a - startMs) - Math.abs(b - startMs) || a - b)
+    .slice(0, MAX_ALTERNATIVES)
+    .sort(([a], [b]) => a - b)
+    .map(([, slot]) => slot);
+}
+
+/** C0 control characters, U+0000–U+001F: no use in a label, and Postgres text can't hold U+0000. */
+const CONTROL_CHARACTERS = /[\u0000-\u001F]/g;
+
+/** The MCP client's self-reported name as stored: control characters removed, trimmed, at most 80 characters. */
 function cleanAgentName(name: string): string {
-  const trimmed = name.trim().slice(0, MAX_AGENT_NAME);
+  const trimmed = name.replace(CONTROL_CHARACTERS, "").trim().slice(0, MAX_AGENT_NAME);
   return trimmed === "" ? UNKNOWN_AGENT : trimmed;
+}
+
+// ---- Reading and cancelling a booking (agents) ----
+
+function parseBookingId(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw invalidField(
+      "booking_id",
+      "booking_id is required and must be a non-empty string.",
+      "Pass the booking.id (a UUID) that book returned.",
+      value,
+    );
+  }
+  return value.trim();
+}
+
+/** Check raw `get_booking` arguments (any JSON) and narrow them to GetBookingInput. booking_id is returned trimmed. */
+export function parseGetBookingArgs(raw: unknown): GetBookingInput {
+  const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  return { booking_id: parseBookingId(args.booking_id) };
+}
+
+/**
+ * One booking at the shop. An unknown, malformed or other shop's id is booking_not_found.
+ * TODO(ring-1b): anyone holding a booking id can read or cancel it until customer consent ships.
+ */
+export async function getBooking(
+  deps: FrontDeskDeps,
+  shopSlug: string,
+  input: GetBookingInput,
+): Promise<GetBookingResult> {
+  const { booking_id } = parseGetBookingArgs(input);
+  await requireShop(deps, shopSlug);
+  return { booking: await requireBooking(deps, shopSlug, booking_id) };
+}
+
+/** Check raw `cancel` arguments (any JSON) and narrow them to CancelInput. booking_id is returned trimmed. */
+export function parseCancelArgs(raw: unknown): CancelInput {
+  const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  return {
+    booking_id: parseBookingId(args.booking_id),
+    idempotency_key: parseIdempotencyKey(args.idempotency_key),
+  };
+}
+
+/**
+ * An agent cancels a booking, under the shop's policy (decide(): cancelled at least
+ * cancelWindowHours ahead → deposit released; later but before the start → captured; after the start
+ * or from a final status → not_cancellable). At most once per idempotency_key: the same key for the
+ * same booking returns the first result (replayed: true) without a second event; the same key for
+ * another booking is idempotency_conflict. A call that fails isn't remembered.
+ * TODO(ring-1b): anyone holding a booking id can read or cancel it until customer consent ships.
+ * TODO(ring-1c): alert the owner when an agent cancels (the Notifier only knows new bookings).
+ */
+export async function cancelBooking(
+  deps: FrontDeskDeps,
+  shopSlug: string,
+  input: CancelInput,
+): Promise<CancelResult & { replayed: boolean }> {
+  const args = parseCancelArgs(input);
+  const scope = {
+    key: args.idempotency_key,
+    tool: "cancel" as const,
+    // A UUID in either case is the same booking, so the same request.
+    requestHash: requestHash({ shop: shopSlug, booking_id: normalizeUuid(args.booking_id) ?? args.booking_id }),
+  };
+  const { result, replayed } = await deps.store.idempotent(scope, (tx) =>
+    transitionBooking({ ...deps, catalog: tx, store: tx }, shopSlug, args.booking_id, "cancel", "agent"),
+  );
+  return { ...result, replayed };
 }
 
 // ---- Bookings list (UI) ----
@@ -344,17 +745,14 @@ function cleanAgentName(name: string): string {
 /** The bookings window the UI sees: this far back and ahead of now. */
 export const BOOKINGS_PAST_DAYS = 7;
 export const BOOKINGS_FUTURE_DAYS = 30;
-const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * The shop and its bookings (confirmed and cancelled) from 7 days ago to 30 days ahead, sorted
- * by start.
+ * The shop and its bookings of any status from 7 days ago to 30 days ahead, sorted by start.
  *
  * TODO(ring-2): owner sign-in. Until then anyone with the URL can read customer names.
  */
 export async function listShopBookings(deps: FrontDeskDeps, shopSlug: string): Promise<BookingsResponse> {
-  const shop = await deps.catalog.getShop(shopSlug);
-  if (!shop) throw shopNotFound(shopSlug);
+  const shop = await requireShop(deps, shopSlug);
   const now = deps.clock.now().getTime();
   const bookings = await deps.store.listBookings(shopSlug, {
     start: new Date(now - BOOKINGS_PAST_DAYS * DAY_MS),
