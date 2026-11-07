@@ -3,7 +3,12 @@ import { fixedClock } from "../clock";
 import type { ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { comingSaturday, createHardcodedCatalog } from "./hardcoded-catalog";
-import { getAvailability, listServices, type FrontDeskDeps } from "./service";
+import {
+  getAvailability,
+  listServices,
+  parseGetAvailabilityArgs,
+  type FrontDeskDeps,
+} from "./service";
 
 // "Now" is Saturday 7 Nov 2026, noon in New York, so the coming Saturday is 14 Nov.
 const NOW = new Date("2026-11-07T12:00:00-05:00");
@@ -43,6 +48,26 @@ describe("hard-coded catalog", () => {
     expect(busy.every((b) => b.staffId === "dana")).toBe(true);
   });
 
+  // Contract every ShopCatalog (including the coming Postgres one) must meet: an interval that
+  // began before range.start but is still running overlaps the range and must be returned.
+  it("returns busy intervals that started before the range but overlap it", async () => {
+    const busy = await deps.catalog.getBusyIntervals("harts", {
+      start: new Date("2026-11-14T10:20:00-05:00"),
+      end: new Date("2026-11-14T11:00:00-05:00"),
+    });
+    expect(busy.map((b) => [b.start.toISOString(), b.end.toISOString()])).toEqual([
+      ["2026-11-14T15:00:00.000Z", "2026-11-14T15:45:00.000Z"], // the 10:00–10:45 booking
+    ]);
+  });
+
+  it("does not return intervals that only touch the range edge (half-open)", async () => {
+    const busy = await deps.catalog.getBusyIntervals("harts", {
+      start: new Date("2026-11-14T10:45:00-05:00"),
+      end: new Date("2026-11-14T12:00:00-05:00"),
+    });
+    expect(busy).toEqual([]);
+  });
+
   it("knows nothing about other shops", async () => {
     expect(await deps.catalog.getShop("nope")).toBeNull();
     expect(await deps.catalog.listServices("nope")).toEqual([]);
@@ -63,6 +88,38 @@ describe("listServices", () => {
 
   it("is not_found for an unknown shop", async () => {
     expect((await rejection(listServices(deps, "nope"))).code).toBe("not_found");
+  });
+});
+
+describe("parseGetAvailabilityArgs", () => {
+  const ok = { service_id: "haircut", ...SAT };
+
+  it("passes valid arguments through and drops unknown ones", () => {
+    expect(parseGetAvailabilityArgs({ ...ok, limit: 5, extra: true })).toEqual({ ...ok, limit: 5 });
+  });
+
+  it("treats limit null as omitted", () => {
+    expect(parseGetAvailabilityArgs({ ...ok, limit: null })).toEqual(ok);
+  });
+
+  it.each<[string, unknown, string]>([
+    ["missing service_id", { from: SAT.from, to: SAT.to }, "service_id"],
+    ["empty service_id", { ...ok, service_id: " " }, "service_id"],
+    ["numeric service_id", { ...ok, service_id: 5 }, "service_id"],
+    ["missing from", { service_id: "haircut", to: SAT.to }, "from"],
+    ["numeric to", { ...ok, to: 1731560400 }, "to"],
+    ["string limit", { ...ok, limit: "5" }, "limit"],
+    ["no arguments", undefined, "service_id"],
+  ])("rejects %s with invalid_request naming the field", (_label, raw, field) => {
+    let caught: unknown;
+    try {
+      parseGetAvailabilityArgs(raw);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(FrontDeskError);
+    expect((caught as FrontDeskError).code).toBe("invalid_request");
+    expect((caught as FrontDeskError).details).toMatchObject({ field });
   });
 });
 
@@ -98,6 +155,15 @@ describe("getAvailability on the coming Saturday", () => {
       to: "2026-11-14T09:50:00-05:00",
     });
     expect(slots.map((s) => s.start)).toEqual(["2026-11-14T09:30:00-05:00"]);
+  });
+
+  it("respects a booking that is already running when the window starts", async () => {
+    const { slots } = await getAvailability(deps, "harts", {
+      service_id: "haircut",
+      from: "2026-11-14T10:20:00-05:00",
+      to: "2026-11-14T11:30:00-05:00",
+    });
+    expect(slots.map((s) => s.start.slice(11, 16))).toEqual(["10:45", "11:00", "11:15"]);
   });
 
   it("is not_found with a next_action for an unknown service", async () => {

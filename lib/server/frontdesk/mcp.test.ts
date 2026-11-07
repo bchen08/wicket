@@ -114,16 +114,44 @@ describe("MCP /api/mcp", () => {
     expect(envelope.error.next_action).toMatch(/list_services/);
   });
 
-  it.each([
-    ["a 15-day window", { from: "2026-11-14T00:00:00-05:00", to: "2026-11-29T00:00:00-05:00" }],
-    ["from after to", { from: "2026-11-15T00:00:00-05:00", to: "2026-11-14T00:00:00-05:00" }],
-    ["a date with no offset", { from: "2026-11-14", to: "2026-11-15T00:00:00-05:00" }],
-    ["a limit over 50", { from: "2026-11-14T00:00:00-05:00", to: "2026-11-15T00:00:00-05:00", limit: 99 }],
-  ])("returns invalid_request for %s", async (_label, args) => {
-    const result = await callTool("get_availability", { service_id: "haircut", ...args });
+  const SAT = { from: "2026-11-14T00:00:00-05:00", to: "2026-11-15T00:00:00-05:00" };
+
+  it.each<[string, Record<string, unknown>]>([
+    ["a 15-day window", { service_id: "haircut", from: SAT.from, to: "2026-11-29T00:00:00-05:00" }],
+    ["from after to", { service_id: "haircut", from: SAT.to, to: SAT.from }],
+    ["a date with no offset", { service_id: "haircut", from: "2026-11-14", to: SAT.to }],
+    ["an out-of-range offset", { service_id: "haircut", from: "2026-11-14T09:00:00+99:99", to: SAT.to }],
+    ["a limit over 50", { service_id: "haircut", ...SAT, limit: 99 }],
+    ["a limit that is a string", { service_id: "haircut", ...SAT, limit: "5" }],
+    ["a missing service_id", { ...SAT }],
+    ["a numeric service_id", { service_id: 5, ...SAT }],
+    ["a missing to", { service_id: "haircut", from: SAT.from }],
+    ["no arguments at all", {}],
+  ])("returns the invalid_request envelope for %s", async (_label, args) => {
+    const result = await callTool("get_availability", args);
     expect(result.isError).toBe(true);
     const envelope = JSON.parse(result.content[0].text) as ApiError;
     expect(envelope.error.code).toBe("invalid_request");
     expect(envelope.error.next_action.length).toBeGreaterThan(0);
+  });
+
+  it("treats limit: null as omitted (default 20)", async () => {
+    const result = await callTool("get_availability", { service_id: "haircut", ...SAT, limit: null });
+    expect(result.isError).toBeFalsy();
+    const { slots, truncated } = result.structuredContent as GetAvailabilityResult;
+    expect(slots).toHaveLength(20);
+    expect(truncated).toBe(true);
+  });
+
+  it("advertises types, formats, limits and required fields in the input schema", async () => {
+    const { tools } = await rpc<{
+      tools: { name: string; inputSchema: { required?: string[]; properties: Record<string, Record<string, unknown>> } }[];
+    }>("tools/list");
+    const schema = tools.find((t) => t.name === "get_availability")!.inputSchema;
+    expect([...(schema.required ?? [])].sort()).toEqual(["from", "service_id", "to"]);
+    expect(schema.properties.service_id).toMatchObject({ type: "string" });
+    expect(schema.properties.from).toMatchObject({ type: "string", format: "date-time" });
+    expect(schema.properties.to).toMatchObject({ type: "string", format: "date-time" });
+    expect(schema.properties.limit).toMatchObject({ type: "integer", minimum: 1, maximum: 50 });
   });
 });

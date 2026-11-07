@@ -85,8 +85,8 @@ export function validateRequest(req: { from: Date; to: Date; limit?: number }): 
   if (to.getTime() - from.getTime() > MAX_WINDOW_DAYS * DAY_MS) {
     throw new FrontDeskError(
       "invalid_request",
-      `The window is longer than ${MAX_WINDOW_DAYS} days.`,
-      `Ask for at most ${MAX_WINDOW_DAYS} days at a time; split longer ranges into several calls.`,
+      `The window is longer than ${MAX_WINDOW_DAYS} days (${MAX_WINDOW_DAYS * 24} hours).`,
+      `Ask for at most ${MAX_WINDOW_DAYS * 24} hours at a time (to - from); split longer ranges into several calls.`,
       { maxWindowDays: MAX_WINDOW_DAYS, from: from.toISOString(), to: to.toISOString() },
     );
   }

@@ -50,6 +50,55 @@ function parseInstant(field: "from" | "to", value: string): Date {
   return parsed;
 }
 
+function invalidField(field: string, message: string, nextAction: string, value: unknown): FrontDeskError {
+  return new FrontDeskError("invalid_request", message, nextAction, { field, value: value ?? null });
+}
+
+/**
+ * Check raw tool arguments (any JSON) and narrow them to GetAvailabilityInput.
+ * Missing fields and wrong JSON types become invalid_request errors with a next_action,
+ * the same as bad values, so an agent always gets the ApiError envelope.
+ * `limit: null` is treated as omitted (some function-calling adapters send null for unset options).
+ */
+export function parseGetAvailabilityArgs(raw: unknown): GetAvailabilityInput {
+  const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const { service_id, from, to, limit } = args;
+
+  if (typeof service_id !== "string" || service_id.trim() === "") {
+    throw invalidField(
+      "service_id",
+      "service_id is required and must be a non-empty string.",
+      'Call list_services and pass one of its service ids, e.g. "haircut".',
+      service_id,
+    );
+  }
+  for (const [field, value] of [["from", from], ["to", to]] as const) {
+    if (typeof value !== "string") {
+      throw invalidField(
+        field,
+        `${field} is required and must be an RFC 3339 date-time string.`,
+        `Send ${field} like 2026-11-14T09:00:00-05:00 (a time zone offset is required).`,
+        value,
+      );
+    }
+  }
+  if (limit !== undefined && limit !== null && typeof limit !== "number") {
+    throw invalidField(
+      "limit",
+      "limit must be a number.",
+      "Omit limit to get up to 20 slots, or pass a whole number from 1 to 50.",
+      limit,
+    );
+  }
+
+  return {
+    service_id,
+    from: from as string,
+    to: to as string,
+    ...(typeof limit === "number" ? { limit } : {}),
+  };
+}
+
 /** Bookable start times for one service in a window. */
 export async function getAvailability(
   deps: FrontDeskDeps,

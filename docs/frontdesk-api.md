@@ -24,7 +24,8 @@ Request and response shapes are exported from [`lib/types/frontdesk.ts`](../lib/
   ```
 
   `code` is `invalid_request`, `not_found` or `internal`. Agents should follow `next_action`.
-  A missing required field, or a value of the wrong JSON type (e.g. `"limit": "ten"`), is rejected by the MCP SDK before Front Desk sees it. That error is a plain-text tool error, not the envelope.
+  Every failure uses this envelope, including a missing field and a wrong JSON type (e.g. `"limit": "ten"`). `details.field` names the offending argument. `"limit": null` is treated as omitted.
+  The envelope is in the text, not `structuredContent`. Clients such as MCP Inspector validate `structuredContent` against the tool's `outputSchema` even on errors, so they would reject it there.
 
 ## `list_services`
 
@@ -69,8 +70,15 @@ Returns open start times for one service in a window.
 |---|---|---|
 | `service_id` | string | Required. An `id` from `list_services`. |
 | `from` | string | Required. RFC 3339 with offset. Inclusive. |
-| `to` | string | Required. RFC 3339 with offset. Exclusive. After `from`, at most 14 days later. |
+| `to` | string | Required. RFC 3339 with offset. Exclusive. After `from`, at most 14 days (336 hours) later. |
 | `limit` | integer | Optional. 1–50, default 20. |
+
+`from` and `to` must be real RFC 3339 instants:
+- The offset is required.
+- Hours run 00–23, and offsets go up to ±23:59.
+- The date must exist; `2026-02-30` is rejected.
+
+The 14-day limit is elapsed time: `to - from` ≤ 336 hours. A window from local midnight to local midnight two weeks later that crosses the November clock change is 337 hours, so it's rejected. Ask for slightly less, or split the window.
 
 How it works:
 - Starts are on a 15-minute grid from opening time, and the whole appointment must end by closing time.
@@ -130,8 +138,9 @@ On the coming Saturday the full day (`limit: 50`) has 21 haircut starts. The gap
 Other `invalid_request` cases:
 - a window over 14 days;
 - `from` not before `to`;
-- a date without an offset (e.g. `"2026-11-14"`);
-- a `limit` outside 1–50.
+- a date without an offset (e.g. `"2026-11-14"`) or with an impossible offset (e.g. `+99:99`);
+- a `limit` that is not a whole number from 1 to 50;
+- a missing field, or a field of the wrong JSON type.
 
 ## Demo data
 
@@ -188,11 +197,14 @@ Vercel Deployment Protection on preview URLs blocks outside clients like Claude.
 ## Not built yet
 
 These are marked `TODO(ring-N)` in the code:
-- booking;
-- a database;
-- sign-in;
-- deposits;
-- lead time;
-- booking horizons;
-- multi-shop routing;
-- daylight-saving gap handling.
+
+| Ring | Item | Where |
+|---|---|---|
+| ring-0 | Postgres instead of the hard-coded catalog | `lib/server/frontdesk/hardcoded-catalog.ts`, `app/api/mcp/route.ts` |
+| ring-1 | Booking (`book_appointment`) | `lib/server/frontdesk/mcp.ts` |
+| ring-1 | Let agents pick the shop | `lib/server/frontdesk/mcp.ts` |
+| ring-1 | Lead time, booking horizon, deposit horizon, daylight-saving gaps | `lib/server/engine/availability.ts` |
+| ring-2 | Sign-in / caller authentication | `app/api/mcp/route.ts` |
+| ring-2 | Taking deposits | `lib/server/frontdesk/mcp.ts` |
+
+A UI for any of this is v0's lane.

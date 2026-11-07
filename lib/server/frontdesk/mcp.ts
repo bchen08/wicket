@@ -9,7 +9,12 @@ import type {
 } from "../../types/frontdesk";
 import { DEFAULT_LIMIT, MAX_LIMIT, MAX_WINDOW_DAYS } from "../engine/availability";
 import { toApiError } from "./errors";
-import { getAvailability, listServices, type FrontDeskDeps } from "./service";
+import {
+  getAvailability,
+  listServices,
+  parseGetAvailabilityArgs,
+  type FrontDeskDeps,
+} from "./service";
 
 // The agent door: Front Desk's MCP tools. Transport lives in app/api/mcp/route.ts.
 
@@ -26,32 +31,46 @@ export const SERVER_INSTRUCTIONS = [
 
 // ---- Schemas (zod) mirrored from lib/types/frontdesk.ts ----
 
-const rfc3339 = (description: string) => z.string().meta({ format: "date-time", description });
+// The input schema only ADVERTISES types and constraints (via .meta, which becomes the JSON
+// Schema agents see); it accepts any value. All checking happens in parseGetAvailabilityArgs
+// and the engine, so every failure (missing field, wrong type, bad value) comes back as the
+// ApiError envelope with a next_action instead of the SDK's plain-text validation error.
+const advertise = (jsonSchema: Record<string, unknown>) => z.unknown().optional().meta(jsonSchema);
 
-// Value checks (formats, ranges, unknown ids) happen in the handler, not here, so a bad value
-// comes back as the ApiError envelope with a next_action. The schema still advertises the
-// constraints (format, minimum, maximum) so agents can get it right the first time.
-// Only a missing field or a wrong JSON type is rejected by the SDK before our handler runs.
-const getAvailabilityInputSchema = z.object({
-  service_id: z.string().describe('A service id from list_services, e.g. "haircut".'),
-  from: rfc3339(
-    "Window start, inclusive. RFC 3339 date-time with a time zone offset, " +
+const getAvailabilityInputShape = {
+  service_id: advertise({
+    type: "string",
+    description: 'A service id from list_services, e.g. "haircut".',
+  }),
+  from: advertise({
+    type: "string",
+    format: "date-time",
+    description:
+      "Window start, inclusive. RFC 3339 date-time with a time zone offset, " +
       'e.g. "2026-11-14T00:00:00-05:00" or "2026-11-14T05:00:00Z".',
-  ),
-  to: rfc3339(
-    "Window end, exclusive. RFC 3339 date-time with a time zone offset, " +
-      `e.g. "2026-11-15T00:00:00-05:00". Must be after from and at most ${MAX_WINDOW_DAYS} days after it.`,
-  ),
-  limit: z
-    .number()
-    .optional()
-    .meta({
-      type: "integer",
-      minimum: 1,
-      maximum: MAX_LIMIT,
-      description: `Maximum number of slots to return, a whole number from 1 to ${MAX_LIMIT}. Default ${DEFAULT_LIMIT}.`,
-    }),
-});
+  }),
+  to: advertise({
+    type: "string",
+    format: "date-time",
+    description:
+      "Window end, exclusive. RFC 3339 date-time with a time zone offset, " +
+      `e.g. "2026-11-15T00:00:00-05:00". Must be after from and at most ${MAX_WINDOW_DAYS} days ` +
+      `(${MAX_WINDOW_DAYS * 24} hours) after it.`,
+  }),
+  limit: advertise({
+    type: "integer",
+    minimum: 1,
+    maximum: MAX_LIMIT,
+    description: `Maximum number of slots to return, a whole number from 1 to ${MAX_LIMIT}. Default ${DEFAULT_LIMIT}.`,
+  }),
+} satisfies Record<keyof GetAvailabilityInput, z.ZodType>; // same keys as the contract, no more, no fewer
+
+type RequiredKeys<T> = { [K in keyof T]-?: object extends Pick<T, K> ? never : K }[keyof T];
+const GET_AVAILABILITY_REQUIRED = ["service_id", "from", "to"] as const;
+
+const getAvailabilityInputSchema = z
+  .object(getAvailabilityInputShape)
+  .meta({ required: [...GET_AVAILABILITY_REQUIRED] });
 
 const shopSchema = z.object({
   slug: z.string(),
@@ -84,12 +103,14 @@ const getAvailabilityOutputSchema = z.object({
   truncated: z.boolean().describe("true if more slots exist in the window than were returned."),
 });
 
-// Compile-time guards: the zod schemas must produce exactly the contract types.
-type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+// Compile-time guards: the schemas must match the contract types exactly (including optional
+// fields), so `tsc` fails if either side drifts.
+type Exact<X, Y> =
+  (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
 const contractChecks: [
   Exact<z.infer<typeof listServicesOutputSchema>, ListServicesResult>,
   Exact<z.infer<typeof getAvailabilityOutputSchema>, GetAvailabilityResult>,
-  Exact<z.infer<typeof getAvailabilityInputSchema>, GetAvailabilityInput>,
+  Exact<(typeof GET_AVAILABILITY_REQUIRED)[number], RequiredKeys<GetAvailabilityInput>>,
 ] = [true, true, true];
 void contractChecks;
 
@@ -192,6 +213,8 @@ export function registerFrontDeskTools(
     },
   );
 
+  // TODO(ring-1): book_appointment tool (hold a slot, then confirm it). Until then everything is read-only.
+  // TODO(ring-2): take deposits (Service.depositCents) when a booking is confirmed.
   server.registerTool(
     "get_availability",
     {
@@ -199,7 +222,7 @@ export function registerFrontDeskTools(
       description:
         "Find open appointment start times at Hart's Barbers for one service. " +
         "from and to are RFC 3339 date-times with an offset (e.g. 2026-11-14T00:00:00-05:00); the window is [from, to) " +
-        `and may be at most ${MAX_WINDOW_DAYS} days long. ` +
+        `and may be at most ${MAX_WINDOW_DAYS} days (${MAX_WINDOW_DAYS * 24} hours) long. ` +
         `Returns up to limit slots (default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}), earliest first. Each slot has start and end ` +
         "as RFC 3339 in the shop's time zone (America/New_York), the staffId, and a display string like " +
         '"Sat 14 Nov, 2:30 pm EST". Starts are on a 15-minute grid; past times are never returned. ' +
@@ -210,8 +233,9 @@ export function registerFrontDeskTools(
       outputSchema: getAvailabilityOutputSchema,
       annotations: { title: "Get availability", ...READ_ONLY },
     },
-    async (args) => {
+    async (rawArgs) => {
       try {
+        const args = parseGetAvailabilityArgs(rawArgs);
         const result = await getAvailability(getDeps(), shopSlug, args);
         return {
           content: [{ type: "text", text: availabilityText(result, args.service_id) }],

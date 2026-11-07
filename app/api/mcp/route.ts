@@ -7,6 +7,7 @@ import { createFrontDeskMcpHandler } from "@/lib/server/frontdesk/mcp";
 // Tools: list_services, get_availability. See docs/frontdesk-api.md.
 
 // TODO(ring-0): swap the hard-coded catalog for the Postgres one in the next slice.
+// TODO(ring-2): sign-in. Authenticate callers (mcp-handler's withMcpAuth) before booking ships.
 const mcpHandler = createFrontDeskMcpHandler({
   clock: systemClock,
   catalog: createHardcodedCatalog(systemClock),
