@@ -1,11 +1,15 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { ApiError } from "../../types/frontdesk";
 
-// Stub auth for the owner routes: one shared secret, OWNER_API_TOKEN, sent as a bearer token.
-// TODO(ring-2): owner sign-in replaces the token.
+// Stub auth for the owner routes: one shared secret, OWNER_API_TOKEN. A request proves it holds the
+// secret in one of two ways:
+// - the header `Authorization: Bearer <token>` (curl, scripts); or
+// - the fd_owner session cookie, which POST /api/owner/session sets after checking the token once, so
+//   the v0 console never keeps the token in page code (see owner-session.ts).
+// TODO(ring-2): owner sign-in by texted code replaces the token and this cookie.
 //
 // Never open: an unset or too-short token makes every owner route a 503, not a free pass.
-// The token is never logged and never echoed in a response.
+// The token is never logged, never echoed in a response and never stored in the cookie.
 
 /** Shortest OWNER_API_TOKEN accepted, after trimming. Anything shorter is treated as not configured. */
 export const MIN_OWNER_TOKEN_LENGTH = 16;
@@ -13,17 +17,27 @@ export const MIN_OWNER_TOKEN_LENGTH = 16;
 /** The WWW-Authenticate challenge every 401 carries. */
 export const OWNER_AUTH_CHALLENGE = 'Bearer realm="front-desk-owner"';
 
-/** What checkOwnerAuth decided. On failure, respond with `status`, `body` and `headers` as they are. */
-export type OwnerAuthResult =
-  | { ok: true }
-  | {
-      ok: false;
-      /** 401: the caller sent no token or the wrong one. 503: the deployment has no usable token. */
-      status: 401 | 503;
-      body: ApiError;
-      /** Extra response headers: WWW-Authenticate on a 401, none on a 503. */
-      headers: Record<string, string>;
-    };
+/** The owner session cookie. */
+export const OWNER_SESSION_COOKIE = "fd_owner";
+
+/** How long an owner session lasts, in seconds (the cookie's Max-Age): 12 hours. */
+export const OWNER_SESSION_MAX_AGE_S = 12 * 60 * 60;
+
+/** A refusal from checkOwnerAuth. Respond with `status`, `body` and `headers` as they are. */
+export type OwnerAuthFailure = {
+  ok: false;
+  /**
+   * 401: no valid bearer token and no valid session cookie. 403: a write authenticated by the session
+   * cookie whose Origin isn't this site. 503: the deployment has no usable token.
+   */
+  status: 401 | 403 | 503;
+  body: ApiError;
+  /** Extra response headers: WWW-Authenticate on a 401, none otherwise. */
+  headers: Record<string, string>;
+};
+
+/** What checkOwnerAuth decided. */
+export type OwnerAuthResult = { ok: true } | OwnerAuthFailure;
 
 const CONFIGURE_NEXT_ACTION =
   "Set OWNER_API_TOKEN (at least 16 random characters) in the deployment's environment variables, then redeploy.";
@@ -31,7 +45,13 @@ const CONFIGURE_NEXT_ACTION =
 // "Bearer", then one or more spaces, then the token. The scheme is case-insensitive (RFC 7235).
 const BEARER = /^Bearer +(.*)$/i;
 
-function notConfigured(message: string): OwnerAuthResult {
+// A session cookie value: the expiry in Unix seconds, ".", then the base64url HMAC-SHA256 (43 chars).
+const SESSION_VALUE = /^(\d{1,12})\.([A-Za-z0-9_-]{43})$/;
+
+// A cookie-authenticated request with any other method must come from this site (the CSRF guard).
+const SAFE_METHODS = new Set(["GET", "HEAD"]);
+
+function notConfigured(message: string): OwnerAuthFailure {
   return {
     ok: false,
     status: 503,
@@ -40,7 +60,7 @@ function notConfigured(message: string): OwnerAuthResult {
   };
 }
 
-function unauthorized(): OwnerAuthResult {
+function unauthorized(): OwnerAuthFailure {
   return {
     ok: false,
     status: 401,
@@ -55,34 +75,162 @@ function unauthorized(): OwnerAuthResult {
   };
 }
 
+function crossOrigin(): OwnerAuthFailure {
+  return {
+    ok: false,
+    status: 403,
+    body: {
+      error: {
+        code: "invalid_request",
+        message: "Refused a write signed in with the owner session cookie: the Origin header is missing or isn't this site.",
+        next_action:
+          "Send it from the Front Desk console on this site (the browser adds the matching Origin header), or authenticate with Authorization: Bearer <OWNER_API_TOKEN> instead of the cookie.",
+      },
+    },
+    headers: {},
+  };
+}
+
 function sha256(value: string): Buffer {
   return createHash("sha256").update(value, "utf8").digest();
 }
 
 /**
- * Check a request's `Authorization: Bearer <token>` header against the configured owner token.
- *
- * - `configuredToken` unset, blank, or shorter than MIN_OWNER_TOKEN_LENGTH after trimming → 503
- *   (code `internal`) with a configuration message. Never open.
- * - No Authorization header, another scheme, an empty token or the wrong token → 401 (code
- *   `unauthorized`) with a WWW-Authenticate challenge.
- *
- * Both tokens are trimmed, then compared in constant time on their sha256 digests, so neither the
- * contents nor the length of the configured token leak through timing.
+ * The configured owner token, trimmed, or the 503 to answer when it isn't usable: unset, blank, or
+ * shorter than MIN_OWNER_TOKEN_LENGTH after trimming. Never open.
  */
-export function checkOwnerAuth(request: Request, configuredToken: string | undefined): OwnerAuthResult {
-  const expected = configuredToken?.trim() ?? "";
-  if (expected === "") {
+export function configuredOwnerToken(configured: string | undefined): { ok: true; token: string } | OwnerAuthFailure {
+  const token = configured?.trim() ?? "";
+  if (token === "") {
     return notConfigured("The owner API is not configured on this deployment: OWNER_API_TOKEN is not set.");
   }
-  if (expected.length < MIN_OWNER_TOKEN_LENGTH) {
+  if (token.length < MIN_OWNER_TOKEN_LENGTH) {
     return notConfigured(
       `The owner API is not configured on this deployment: OWNER_API_TOKEN is too short (at least ${MIN_OWNER_TOKEN_LENGTH} characters).`,
     );
   }
+  return { ok: true, token };
+}
 
-  const match = BEARER.exec(request.headers.get("authorization") ?? "");
-  const given = match?.[1].trim() ?? "";
-  if (given === "") return unauthorized();
-  return timingSafeEqual(sha256(given), sha256(expected)) ? { ok: true } : unauthorized();
+/**
+ * Whether `given` (trimmed) is the configured token `expected` (already trimmed). An empty `given`
+ * never matches. Compared in constant time on sha256 digests, so neither the contents nor the length
+ * of the configured token leak through timing.
+ */
+export function ownerTokenMatches(given: string, expected: string): boolean {
+  const trimmed = given.trim();
+  if (trimmed === "") return false;
+  return timingSafeEqual(sha256(trimmed), sha256(expected));
+}
+
+// HMAC-SHA256 of "owner:<expiry>", keyed with the owner token: changing the token ends every session.
+function sessionSignature(token: string, expiresAtS: string): string {
+  return createHmac("sha256", token).update(`owner:${expiresAtS}`, "utf8").digest("base64url");
+}
+
+/** The fd_owner cookie value for a session that ends at `expiresAtS` (Unix seconds): "<expiresAtS>.<signature>". */
+export function ownerSessionValue(token: string, expiresAtS: number): string {
+  const expiry = String(expiresAtS);
+  return `${expiry}.${sessionSignature(token, expiry)}`;
+}
+
+/** Every value the Cookie header gives `name`. A browser can send several cookies with one name. */
+function cookieValues(request: Request, name: string): string[] {
+  const values: string[] = [];
+  for (const part of (request.headers.get("cookie") ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq !== -1 && part.slice(0, eq).trim() === name) values.push(part.slice(eq + 1).trim());
+  }
+  return values;
+}
+
+/**
+ * When the request's owner session ends (Unix seconds), or null when it has no valid fd_owner cookie.
+ * Valid means signed with `token` and ending after `nowMs`. The signature is compared in constant time.
+ *
+ * Sessions run on wall-clock time, not systemClock: the browser drops the cookie by its own clock
+ * (Max-Age), and FRONTDESK_NOW must not freeze a session open.
+ */
+export function ownerSessionExpiry(request: Request, token: string, nowMs: number): number | null {
+  for (const value of cookieValues(request, OWNER_SESSION_COOKIE)) {
+    const match = SESSION_VALUE.exec(value);
+    if (!match) continue;
+    const expected = Buffer.from(sessionSignature(token, match[1]), "utf8");
+    if (!timingSafeEqual(Buffer.from(match[2], "utf8"), expected)) continue;
+    const expiresAtS = Number(match[1]);
+    if (expiresAtS * 1000 > nowMs) return expiresAtS;
+  }
+  return null;
+}
+
+/** The first entry of a comma-separated forwarding header, or undefined when it's absent or empty. */
+function firstForwarded(value: string | null): string | undefined {
+  return value?.split(",")[0]?.trim() || undefined;
+}
+
+/**
+ * The origin the browser sent the request to, e.g. "https://front-desk.vercel.app".
+ *
+ * Built from X-Forwarded-Proto and X-Forwarded-Host (or Host), not from request.url: Next.js builds
+ * request.url from the server's own hostname and port (`next start` says http://localhost:3000 even
+ * when the browser used http://127.0.0.1:3000), and on Vercel it isn't the public URL either. Next.js
+ * fills these headers in from the connection when a proxy hasn't, and Vercel overwrites them. A
+ * cross-site page can't set Host, and setting a custom X-Forwarded-* header would need a CORS preflight
+ * these routes don't grant, so the headers can't be used to forge a same-origin write.
+ * Falls back to request.url's origin when no host header is present (tests, plain Requests).
+ * Null when the headers don't make an http(s) origin: nothing then counts as same-origin.
+ */
+export function requestOrigin(request: Request): string | null {
+  const url = new URL(request.url);
+  const host = firstForwarded(request.headers.get("x-forwarded-host")) ?? firstForwarded(request.headers.get("host"));
+  const proto = (firstForwarded(request.headers.get("x-forwarded-proto")) ?? url.protocol.slice(0, -1)).toLowerCase();
+  if (proto !== "http" && proto !== "https") return null;
+  if (host === undefined) return `${proto}://${url.host}`;
+  // A host and optional port only: no path, user info or other characters that would change the URL.
+  if (!/^[A-Za-z0-9.\-]+(:\d+)?$|^\[[0-9A-Fa-f:.]+\](:\d+)?$/.test(host)) return null;
+  try {
+    return new URL(`${proto}://${host}`).origin; // lowercases the host, drops a default port
+  } catch {
+    return null;
+  }
+}
+
+/** Whether the Origin header is exactly the origin the request was sent to (see requestOrigin). */
+function sameOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  const own = requestOrigin(request);
+  return origin !== null && own !== null && origin === own;
+}
+
+/**
+ * Check that a request comes from the owner: a valid `Authorization: Bearer <token>` header, OR a
+ * valid, unexpired fd_owner session cookie.
+ *
+ * - `configuredToken` unset, blank, or shorter than MIN_OWNER_TOKEN_LENGTH after trimming → 503
+ *   (code `internal`) with a configuration message. Never open.
+ * - The right bearer token → ok, for any method. No Origin check: a browser never adds this header on
+ *   its own, so it can't be forged cross-site.
+ * - Otherwise a valid session cookie → ok for GET and HEAD. Any other method also needs an Origin
+ *   header equal to the request's own origin, or it's 403 `invalid_request` (the CSRF guard).
+ * - Otherwise (no header, another scheme, an empty or wrong token, no cookie, or an expired or
+ *   tampered cookie) → 401 `unauthorized` with a WWW-Authenticate challenge.
+ *
+ * `nowMs` is for tests; it defaults to the wall clock.
+ */
+export function checkOwnerAuth(
+  request: Request,
+  configuredToken: string | undefined,
+  nowMs: number = Date.now(),
+): OwnerAuthResult {
+  const configured = configuredOwnerToken(configuredToken);
+  if (!configured.ok) return configured;
+
+  const bearer = BEARER.exec(request.headers.get("authorization") ?? "");
+  if (bearer && ownerTokenMatches(bearer[1], configured.token)) return { ok: true };
+
+  if (ownerSessionExpiry(request, configured.token, nowMs) !== null) {
+    if (SAFE_METHODS.has(request.method.toUpperCase()) || sameOrigin(request)) return { ok: true };
+    return crossOrigin();
+  }
+  return unauthorized();
 }
