@@ -48,39 +48,69 @@ The in-memory store (no `DATABASE_URL`) stamps all of these with the app clock i
 
 ### 1. Apply the migrations, then the seed
 
-On a new database, run the files in this order: `0001_skeleton.sql`, then `0002_rules.sql`, then `seed.sql`. The seed needs 0002, because it inserts Hart's policies.
+**Don't paste migrations into the SQL editor.** Supabase keeps a migration history in `supabase_migrations.schema_migrations` and runs only the files missing from it. A migration run by hand isn't recorded, so the next deploy runs it again and fails, for example with `relation "shops" already exists`. Apply migrations one of these two ways, which both record them:
 
-**Option A: Supabase SQL editor.** In the Supabase dashboard, open **SQL Editor**. Paste the whole of `supabase/migrations/0001_skeleton.sql` and click **Run**. Then do the same with `supabase/migrations/0002_rules.sql`, then `supabase/seed.sql`.
+**Option A: the GitHub integration (how this project is set up).** In the Supabase dashboard, **Branching → GitHub connection** links the repository, with `main` as the production branch. Every push to `main` applies the files in `supabase/migrations/` that aren't recorded yet. To run it without a new commit, open **Branches**, then the **⋯** menu on `main`, and choose **Resync branch**.
 
-**Option B: Supabase CLI.**
-
-```bash
-supabase login
-supabase link --project-ref <project-ref>
-supabase db push
-```
-
-`db push` applies the migrations in `supabase/migrations/` that the project hasn't run yet: both, on a new project. It doesn't load the seed. Load it from the SQL editor (Option A), or with `psql`:
+**Option B: Supabase CLI 3.x.**
+- **Pass `--remote` every time.** In CLI 3, every command targets a *local* database unless you do. Pass the project's **Session pooler** connection string, with the password filled in. To find it, click **Connect**, open the **Direct** tab and choose **Session pooler**. The port is 5432. The transaction pooler is for the app, not the CLI.
+- **Keep the password out of your shell history.** Put the string in a variable first: run `read -rs DB_URL`, paste the string and press Enter.
 
 ```bash
-psql "<direct or session connection string>" -f supabase/seed.sql
+npx supabase@3 db push --remote="$DB_URL" --dry-run
 ```
 
-To check it worked, run `select * from services;` in the SQL editor. You should see three rows. `select * from policies;` should show one row, for `harts`.
+```bash
+npx supabase@3 db push --remote="$DB_URL"
+```
 
-### Upgrading a database that already has 0001
+`db push` applies and records the migrations the database hasn't run yet; `--dry-run` lists them first. `--include-seed` also loads the seed in the same run. The CLI writes a `supabase/.temp/` folder, which isn't git-ignored yet, so don't commit it.
 
-1. **Apply `0002_rules.sql`, once.**
-   - SQL editor: paste the whole file and click **Run**.
-   - Or `supabase db push`, which runs only the migrations missing from the project's migration history. If you applied 0001 in the SQL editor, that history doesn't list it, and `db push` would try to run 0001 again and fail. In that case use the SQL editor for 0002 too.
-2. **Re-run `seed.sql`, after 0002.** It now also inserts Hart's policies. It's safe to re-run: every insert is `on conflict do nothing`, so it never overwrites an existing policies row, and an owner's changes stay.
-3. Check: `select * from policies;` shows one row, for `harts`.
+**Then load the seed,** after every migration has run: it needs 0002, because it also inserts Hart's policies. The integration never loads it on production; its log says "Skipping seed data for protected branch". Run `supabase/seed.sql` once in the **SQL Editor**, or add `--include-seed` to Option B's `db push`. Running it again is safe.
+
+To check it worked, run these in the SQL editor:
+- `select * from services;` should return three rows, and `select * from policies;` one row, for `harts`.
+- `select version from supabase_migrations.schema_migrations;` should list every file in `supabase/migrations/`.
+
+#### If a migration was applied by hand
+
+Record it as applied, or the next deploy runs it again and fails. With CLI 3.x, using the Session pooler string as in Option B:
+
+```bash
+npx supabase@3 migration repair --status applied 0001 --remote="$DB_URL"
+```
+
+Without `--remote`, CLI 3 repairs a local database instead and changes nothing on Supabase.
+
+Or in the SQL editor:
+
+```sql
+insert into supabase_migrations.schema_migrations (version, name, statements)
+values ('0001', 'skeleton', '{}');
+```
+
+The version is the number before the first `_` in the file name. The name is the rest, without `.sql`. Then re-run the failed deploy with **Resync branch** (Option A). Its log should say "All migrations are up to date."
+
+### Ring 1a: applying 0002 to a database that already has 0001
+
+`0002_rules.sql` is applied like any other migration (never in the SQL editor):
+
+1. **Preview database, before the verifier runs on the Ring 1a PR:** from the PR branch, push it, then re-run the seed so Hart's gets its policies:
+
+   ```bash
+   npx supabase@3 db push --remote="$PREVIEW_DB_URL" --include-seed
+   ```
+
+   Re-seeding is safe: every insert is `on conflict do nothing`, so it doesn't overwrite the "(preview)" shop name or any policies an owner changed.
+2. **Production:** the GitHub integration applies 0002 when the PR merges. Then run `supabase/seed.sql` once in the production **SQL Editor** to insert Hart's policies. Until then, Hart's uses the column defaults (no phone, empty rule texts).
+3. **Check** with `select * from policies;` (one row, for `harts`) and `select version from supabase_migrations.schema_migrations;` (lists `0002`).
 
 What 0002 does to existing data:
 - Existing bookings keep their status (`confirmed` and `cancelled` are still valid). Each gets `deposit_cents` from its service's current deposit.
 - `services` gets a check that `deposit_cents <= price_cents`. It's validated against existing rows, so 0002 fails if a service already has a deposit larger than its price; fix that row first.
 - The new tables start empty, so old bookings have no events.
-- 0002 can't be run twice: the second run fails because its tables already exist.
+
+It's additive, so it's compatible with the Ring 0 code already deployed: new tables, nullable columns, a `deposit_cents` column with a default, and widened checks that Ring 0's writes already meet. If the new code is deployed before the integration has applied 0002, Front Desk calls fail with `internal` until it has.
 
 ### 2. Get the connection string: use the transaction pooler
 
@@ -104,7 +134,11 @@ The code connects with `prepare: false`, which the transaction pooler requires.
 DATABASE_URL=postgres://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres
 ```
 
-**On Vercel:** go to **Project → Settings → Environment Variables** and add `DATABASE_URL` for **Preview** and **Production**. Redeploy afterwards, because environment variables apply to new deployments only.
+**On Vercel:** go to **Project → Settings → Environment Variables**. `DATABASE_URL` has a different value per environment:
+- For **Production**, the production project's string.
+- For **Preview**, the Preview project's string. See [Production and Preview databases](#production-and-preview-databases).
+
+The Add dialog selects Production only by default, so check the environment before saving. Redeploy afterwards, because environment variables apply to new deployments only.
 
 ### 4. Set `OWNER_API_TOKEN`
 
@@ -122,11 +156,73 @@ openssl rand -hex 32
 OWNER_API_TOKEN=<64 hex characters>
 ```
 
-**On Vercel:** add `OWNER_API_TOKEN` for **Preview** and **Production**, then redeploy.
+**On Vercel:** under **Settings → Environment Variables**, add `OWNER_API_TOKEN` (type Secret) for **Production** and for **Preview**, ideally with a different value for each, then redeploy. The Add dialog selects Production only by default, so check the environments before saving.
 
 - **Never open.** If it's unset, blank or shorter than 16 characters, every owner route answers **503** with a configuration message. A missing or wrong token in a request is **401**.
 - **Never commit it.** Anyone holding it can change the shop's rules and act on its bookings. To rotate it, change the value in Vercel and redeploy.
 - It's a stopgap: `TODO(ring-2)`: owner sign-in replaces the token.
+
+## Production and Preview databases
+
+Every PR gets a Vercel Preview deployment, and the verifier tests `book` there. If Preview used the production database, every test booking would land in the shop's real calendar. From Ring 1, it would also alert the real owner. So each environment has its own database:
+
+| Vercel environment | `DATABASE_URL` points at | Migrations applied by |
+|---|---|---|
+| Production | the production Supabase project | the GitHub integration, on merge to `main` |
+| Preview | a second, scratch Supabase project | you, with the CLI (below) |
+| Local | whatever `.env.local` says, or unset for in-memory data | you |
+
+**Tell them apart by the shop name.** In the Preview database, the shop is named **Hart's Barbers (preview)**. Before anything writes to a preview, check that `/api/shops/harts/services` on it shows "(preview)"; [VERIFIER.md](VERIFIER.md) requires this. If the name is plain, that preview is using the production database, and nothing may write to it.
+
+### One-time setup
+
+1. **Create a second Supabase project,** for example `emergent-preview`, in the same organization and region.
+   - Don't connect it to GitHub; the integration stays on production.
+   - A free project pauses after a week without use. Restore it from the dashboard before verifying.
+2. **Apply the migrations and the seed** from an up-to-date `main` checkout, using the Preview project's **Session pooler** string:
+
+   ```bash
+   read -rs PREVIEW_DB_URL
+   ```
+
+   ```bash
+   npx supabase@3 db push --remote="$PREVIEW_DB_URL" --include-seed
+   ```
+
+3. **Mark it as the preview database** by running this in the Preview project's SQL editor:
+
+   ```sql
+   update shops set name = 'Hart''s Barbers (preview)' where slug = 'harts';
+   ```
+
+4. **Split the variable in Vercel,** under **Settings → Environment Variables**:
+   - Edit the existing `DATABASE_URL` so it applies to **Production** only.
+   - Add another `DATABASE_URL`, type Secret, for **Preview** only. Its value is the Preview project's **Transaction pooler** string (port 6543), the same kind production uses.
+5. **Redeploy a preview** and open `/api/shops/harts/services` on it. It should show "Hart's Barbers (preview)", while production still shows "Hart's Barbers".
+
+### When a PR adds a migration
+
+Before the verifier runs, push the PR's new migration to the Preview database from the PR branch:
+
+```bash
+npx supabase@3 db push --remote="$PREVIEW_DB_URL"
+```
+
+Production gets the migration from the integration when the PR merges.
+
+### Resetting the Preview database
+
+The Preview database is scratch, so reset it whenever it drifts from `main`: for example after a PR whose migration changed or was abandoned, or to clear test bookings. From an up-to-date `main` checkout:
+
+```bash
+npx supabase@3 db reset --remote="$PREVIEW_DB_URL"
+```
+
+The reset re-seeds, which brings back the plain shop name, so run the `update shops …` from step 3 again. If you forget, the verifier just won't book there, which is the safe direction.
+
+> ⚠️ **`db reset` deletes every row and rebuilds the schema.** Before running it, check that `$PREVIEW_DB_URL` contains the Preview project's ref (`postgres.<ref>`). Never point it at production.
+
+To clear only the bookings, run `delete from bookings;` in the **Preview** project's SQL editor.
 
 ## What happens without `DATABASE_URL`
 
@@ -158,11 +254,34 @@ A throwaway local database with Docker:
 
 ```bash
 docker run -d --rm --name frontdesk-pg -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:5432:5432 postgres:17-alpine
-docker exec -i frontdesk-pg psql -U postgres < supabase/migrations/0001_skeleton.sql
-docker exec -i frontdesk-pg psql -U postgres < supabase/migrations/0002_rules.sql
-docker exec -i frontdesk-pg psql -U postgres < supabase/seed.sql
+```
+
+Then apply every migration in order, followed by the seed:
+
+```bash
+for f in supabase/migrations/*.sql supabase/seed.sql; do docker exec -i frontdesk-pg psql -U postgres -v ON_ERROR_STOP=1 < "$f" || break; done
 ```
 
 ## Changing the schema
 
-Add a new numbered file, for example `supabase/migrations/0003_<what>.sql`. Never edit a migration that has already been applied to a shared database. If you change the demo data, update `SEED` in [`lib/server/frontdesk/memory-store.ts`](../lib/server/frontdesk/memory-store.ts) to match `supabase/seed.sql`. If you change a policy default or range, update `DEFAULT_POLICIES` and `POLICY_LIMITS` in [`lib/server/frontdesk/policies.ts`](../lib/server/frontdesk/policies.ts) to match the `policies` table.
+Every schema change is a new migration file in an ordinary PR. The GitHub integration applies it to production when the PR merges to `main`.
+
+1. **Add the next numbered file,** for example `supabase/migrations/0003_add_staff_color.sql`, containing only the change:
+
+   ```sql
+   alter table staff add column color text;
+   ```
+
+   Keep the `0001`, `0002`, … numbering. Supabase applies files in version order. `supabase migration new` names files with a timestamp (`20261108120000_x.sql`), which sorts after every numbered file, so a later `0003` would be refused as out of order.
+2. **Never edit a migration that has been merged.** Production has already run it. To fix one, add another, such as `0003_fix_…`.
+3. **Test it locally:** apply every migration and the seed to a throwaway Postgres, then run the Postgres tests. See [Running the Postgres tests](#running-the-postgres-tests).
+4. **Open a PR, and push the migration to the Preview database** so the PR's preview runs against the new schema. See [When a PR adds a migration](#when-a-pr-adds-a-migration). The **Supabase Preview** check is skipped on PRs unless preview branches are enabled in Supabase, so production isn't touched before merge.
+5. **Merge.** On the push to `main`, the integration applies the new file to production and records it. To confirm, check that the **Supabase Preview** check on the merge commit is green, or look at **Branches → main → View Logs** in Supabase.
+
+**Keep each migration compatible with the code that's already deployed.** On merge, Vercel deploys the new code while Supabase applies the migration, in no guaranteed order. Only add things the current code tolerates: new tables, nullable columns or columns with a default, constraints its writes already meet. Rename or drop something in a later PR, once no deployed code uses it.
+
+**Never apply a migration in the SQL editor.** It bypasses the migration history; see [If a migration was applied by hand](#if-a-migration-was-applied-by-hand).
+
+**Demo data:** the seed doesn't run on production. If you change `supabase/seed.sql`, run it once in the SQL editor after merging; it's safe to run again. Also update `SEED` in [`lib/server/frontdesk/memory-store.ts`](../lib/server/frontdesk/memory-store.ts) to match. If you change a policy default or range, update `DEFAULT_POLICIES` and `POLICY_LIMITS` in [`lib/server/frontdesk/policies.ts`](../lib/server/frontdesk/policies.ts) to match the `policies` table.
+
+**Agents:** `supabase/**` isn't in Claude Code's default ownership area in AGENTS.md. An issue that needs a migration must authorize it, as #6 did.
