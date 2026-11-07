@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fixedClock } from "../clock";
-import type { ShopCatalog } from "./catalog";
+import type { ShopCatalog, TimeRange } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { createMemoryStore } from "./memory-store";
 import {
@@ -13,7 +13,7 @@ import {
   parseGetBookingArgs,
   type FrontDeskDeps,
 } from "./service";
-import { EXAMPLE_BOOKINGS, memoryDeps, SAT } from "./test-support";
+import { EXAMPLE_BOOKINGS, memoryDeps, SAT, withCatalog } from "./test-support";
 
 // "Now" is Monday 9 Nov 2026, noon in New York (Hart's is closed on Mondays), so the coming Saturday
 // is 14 Nov, 5 days ahead. The store holds the two example bookings on that Saturday: 10:00–10:45 and
@@ -104,6 +104,15 @@ describe("listServices", () => {
 
   it("is not_found for an unknown shop", async () => {
     expect((await rejection(listServices(deps, "nope"))).code).toBe("not_found");
+  });
+
+  it("is not_found for a slug containing NUL, without asking the catalog (Postgres text can't hold U+0000)", async () => {
+    const d = memoryDeps();
+    const getShop = vi.spyOn(d.catalog, "getShop");
+    const err = await rejection(listServices(d, "harts\u0000"));
+    expect(err.code).toBe("not_found");
+    expect(err.details).toEqual({ shop: "harts\u0000" });
+    expect(getShop).not.toHaveBeenCalled();
   });
 });
 
@@ -280,6 +289,45 @@ describe("getAvailability under the shop's rules", () => {
     ).toBe("invalid_request");
   });
 
+  /** `d` recording the range of every busy-time read. */
+  function recordingBusy(d: FrontDeskDeps): { deps: FrontDeskDeps; ranges: TimeRange[] } {
+    const ranges: TimeRange[] = [];
+    return {
+      ranges,
+      deps: withCatalog(d, (catalog) => ({
+        getBusyIntervals: (slug, range) => {
+          ranges.push(range);
+          return catalog.getBusyIntervals(slug, range);
+        },
+      })),
+    };
+  }
+
+  it("reads busy time only for the starts the rules allow, plus one service length", async () => {
+    const { deps: d, ranges } = recordingBusy(memoryDeps());
+    // Sat 7 Nov to Sat 21 Nov, but a haircut can only start from now + 2 hours (Mon 9 Nov 14:00) to
+    // the 6-day deposit horizon (Sun 15 Nov noon); a start just before noon runs 30 minutes past it.
+    await getAvailability(d, "harts", {
+      service_id: "haircut",
+      from: "2026-11-07T00:00:00-05:00",
+      to: "2026-11-21T00:00:00-05:00",
+    });
+    expect(ranges).toEqual([
+      { start: new Date("2026-11-09T14:00:00-05:00"), end: new Date("2026-11-15T12:30:00-05:00") },
+    ]);
+  });
+
+  it.each([
+    ["year 9999", { from: "9999-12-30T00:00:00Z", to: "9999-12-31T00:00:00Z" }],
+    ["year 1", { from: "0001-01-01T00:00:00Z", to: "0001-01-02T00:00:00Z" }],
+  ])("offers nothing for a window in %s, without reading busy time", async (_label, window) => {
+    const { deps: d, ranges } = recordingBusy(memoryDeps());
+    for (const service_id of ["haircut", "beard-trim"]) {
+      expect(await getAvailability(d, "harts", { service_id, ...window })).toEqual({ slots: [], truncated: false });
+    }
+    expect(ranges).toEqual([]);
+  });
+
   it("removes the starts a blocked time covers, including ones that would run into it", async () => {
     const d = memoryDeps({
       initialBlocks: [
@@ -307,6 +355,18 @@ describe("tool argument parsing", () => {
       idempotency_key: "abcd-1234",
     });
     expect(() => parseBookArgs(book)).toThrow(FrontDeskError);
+  });
+
+  it("parseBookArgs refuses a customer_name containing NUL (Postgres text can't hold U+0000)", () => {
+    let caught: unknown;
+    try {
+      parseBookArgs({ ...book, customer_name: "Ma\u0000ya", idempotency_key: "abcd-1234" });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(FrontDeskError);
+    expect((caught as FrontDeskError).code).toBe("invalid_request");
+    expect((caught as FrontDeskError).details).toEqual({ field: "customer_name", value: "Ma\u0000ya" });
   });
 
   it("parseGetBookingArgs and parseCancelArgs require a booking_id; cancel also an idempotency_key", () => {

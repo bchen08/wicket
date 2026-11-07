@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { DateTime } from "luxon";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { BookInput, Slot } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
-import type { NewBlock } from "./catalog";
+import type { NewBlock, TimeRange } from "./catalog";
 import { FrontDeskError } from "./errors";
-import { book, getAvailability, type FrontDeskDeps } from "./service";
+import { SEED } from "./memory-store";
+import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
+import { book, getAvailability, listServices, type FrontDeskDeps } from "./service";
 import { memoryDeps, NOW, recordingNotifier, SAT, withCatalog } from "./test-support";
 
 // book() against the in-memory store with a fixed clock: Mon 9 Nov 2026, noon in New York (Hart's is
@@ -64,6 +67,35 @@ function staleOnce(deps: FrontDeskDeps): FrontDeskDeps {
         ? (await catalog.getBusyIntervals(slug, range)).filter((b) => b.kind === "block")
         : catalog.getBusyIntervals(slug, range),
   }));
+}
+
+/** `deps` that record the range of every busy-time read (including the ones inside book's idempotent action). */
+function recordingBusy(deps: FrontDeskDeps): { deps: FrontDeskDeps; ranges: TimeRange[] } {
+  const ranges: TimeRange[] = [];
+  return {
+    ranges,
+    deps: withCatalog(deps, (catalog) => ({
+      getBusyIntervals: (slug, range) => {
+        ranges.push(range);
+        return catalog.getBusyIntervals(slug, range);
+      },
+    })),
+  };
+}
+
+/**
+ * Deps for a Hart's where more barbers work Dana's exact hours. Their ids sort after "dana", so a
+ * check picks Dana first. The memory store mirrors the staff foreign key, so they go into the seed it
+ * copies, only while the store is created.
+ */
+function withBarbers(...names: string[]): FrontDeskDeps {
+  const added = names.map((name) => ({ ...structuredClone(SEED.staff[0]), id: name.toLowerCase(), name }));
+  SEED.staff.push(...added);
+  try {
+    return memoryDeps();
+  } finally {
+    SEED.staff.splice(-added.length, added.length);
+  }
 }
 
 const slot = (start: string, end: string): Slot => ({
@@ -143,6 +175,7 @@ describe("book", () => {
     ["an empty customer name", haircut(at("10:00"), ""), "customer_name"],
     ["a customer name of only spaces", haircut(at("10:00"), "   "), "customer_name"],
     ["an 81-character customer name", haircut(at("10:00"), "x".repeat(81)), "customer_name"],
+    ["a customer name with a NUL character", haircut(at("10:00"), "Ma\u0000ya"), "customer_name"],
   ])("refuses %s with invalid_request and a next_action", async (_label, args, field) => {
     const err = await rejection(book(memoryDeps(), "harts", args, "agent"));
     expect(err.code).toBe("invalid_request");
@@ -165,6 +198,12 @@ describe("book", () => {
     const deps = memoryDeps();
     expect((await book(deps, "harts", haircut(at("09:00")), "  ")).booking.agent.name).toBe("unknown agent");
     expect((await book(deps, "harts", haircut(at("09:30")), "a".repeat(200))).booking.agent.name).toHaveLength(80);
+  });
+
+  it("strips NUL and other control characters from the agent name (Postgres text can't hold U+0000)", async () => {
+    const deps = memoryDeps();
+    expect((await book(deps, "harts", haircut(at("09:00")), "claude\u0000-ai\t\n")).booking.agent.name).toBe("claude-ai");
+    expect((await book(deps, "harts", haircut(at("09:30")), "\u0000\u001f")).booking.agent.name).toBe("unknown agent");
   });
 
   it("still books when the notifier throws, and logs the failure", async () => {
@@ -249,6 +288,54 @@ describe("book: slot_taken", () => {
     // Computed after the refusal, so none of them overlaps A's 10:00–10:30 haircut.
     expect(alternatives.map((s) => s.start)).toEqual([at("09:00"), at("09:15"), at("10:30")]);
     expect((await deps.store.listBookings("harts", { start: new Date(SAT.from), end: new Date(SAT.to) })).length).toBe(1);
+  });
+
+  it("books another staff member free at the same start when the race for the first is lost", async () => {
+    const notifier = recordingNotifier();
+    const deps = { ...withBarbers("Sam"), notifier };
+    const winner = await book(deps, "harts", haircut(at("14:30")), "agent A");
+    expect(winner.booking.staffId).toBe("dana");
+
+    // Agent B's check doesn't see A's booking, so it picks Dana too and the store refuses. B reads busy
+    // time again, sees Sam is free at exactly 14:30, and books Sam instead of failing with slot_taken.
+    const loser = await book(staleOnce(deps), "harts", haircut(at("14:30"), "Jo"), "agent B");
+    expect(loser.booking).toMatchObject({ staffId: "sam", start: at("14:30"), status: "confirmed" });
+    expect(loser.booking.customer.displayName).toBe("Jo");
+    expect(loser.staffName).toBe("Sam");
+    expect(loser.replayed).toBe(false);
+
+    const stored = await deps.store.listBookings("harts", { start: new Date(SAT.from), end: new Date(SAT.to) });
+    expect(stored.map((b) => b.staffId).sort()).toEqual(["dana", "sam"]);
+    expect(notifier.alerts.map((b) => b.id)).toEqual([winner.booking.id, loser.booking.id]);
+  });
+
+  it("is slot_taken after one retry, and keeps the start in the alternatives while someone is still free then", async () => {
+    const deps = withBarbers("Kim", "Sam");
+    expect((await book(deps, "harts", haircut(at("14:30")), "agent A")).booking.staffId).toBe("dana");
+    expect((await book(deps, "harts", haircut(at("14:30"), "Lee"), "agent B")).booking.staffId).toBe("kim");
+
+    // Agent C's first read misses both bookings (it picks Dana), its second misses Kim's (it retries
+    // with Kim). Both inserts lose; the third read sees everything, and Sam is still free at 14:30.
+    let reads = 0;
+    const racing = withCatalog(deps, (catalog) => ({
+      getBusyIntervals: async (slug, range) => {
+        const busy = await catalog.getBusyIntervals(slug, range);
+        const read = reads++;
+        if (read === 0) return busy.filter((b) => b.kind === "block");
+        if (read === 1) return busy.filter((b) => b.staffId !== "kim");
+        return busy;
+      },
+    }));
+    const err = await rejection(book(racing, "harts", haircut(at("14:30"), "Jo"), "agent C"));
+    expect(err.code).toBe("slot_taken");
+    expect(reads).toBe(3);
+    const alternatives = (err.details as { alternatives: Slot[] }).alternatives;
+    expect(alternatives.map((s) => [s.start, s.staffId])).toEqual([
+      [at("14:15"), "sam"],
+      [at("14:30"), "sam"],
+      [at("14:45"), "sam"],
+    ]);
+    expect(await deps.store.listBookings("harts", { start: new Date(SAT.from), end: new Date(SAT.to) })).toHaveLength(2);
   });
 
   it("has no alternatives (and doesn't mention them) when nothing nearby is free", async () => {
@@ -368,6 +455,18 @@ describe("book: a start that isn't bookable gets the most specific code", () => 
     expect(err.details).toEqual({ field: "start", value: start, service_id: "haircut" });
   });
 
+  it.each<[string, string, { paused?: boolean }]>([
+    ["too_far", "9999-12-31T15:00:00Z", {}],
+    ["too_soon", "0001-01-01T15:00:00Z", {}],
+    ["paused", at("14:30"), { paused: true }],
+  ])("is %s for %s without reading busy time", async (code, start, policies) => {
+    const { deps, ranges } = recordingBusy(memoryDeps({ policies }));
+    const err = await rejection(book(deps, "harts", haircut(start), "agent"));
+    expect(err.code).toBe(code);
+    if (code !== "paused") expect(err.details).toMatchObject({ start });
+    expect(ranges).toEqual([]);
+  });
+
   it("checks the pause before the lead time and the horizon", async () => {
     const deps = memoryDeps({ policies: { paused: true } });
     expect((await rejection(book(deps, "harts", haircut("2026-11-07T09:00:00-05:00"), "agent"))).code).toBe("paused");
@@ -478,3 +577,102 @@ describe("book: idempotency", () => {
     expect(later.booking.start).toBe(at("15:30"));
   });
 });
+
+// ---- On Postgres ----
+// The same fixes against a real database, when DATABASE_URL_TEST points at one with 0001, 0002 and the
+// seed applied (see docs/database.md): a lost race books the other staff member inside the
+// idempotency transaction, and extreme dates and NUL characters never reach a query (Postgres would
+// refuse them, a 500). Like flow-pg.test.ts it never touches Hart's: it makes a throwaway shop (two
+// staff members working Tue–Sat 09:00–17:00, a 30-minute service, the default policies), books only
+// in 2099, and deletes everything it made in afterAll.
+const pgUrl = process.env.DATABASE_URL_TEST?.trim();
+
+if (!pgUrl) {
+  describe("book on Postgres", () => {
+    it.skip("skipped: set DATABASE_URL_TEST to a migrated, seeded Postgres to run book against a real database", () => {});
+  });
+} else {
+  describe("book on Postgres (DATABASE_URL_TEST)", () => {
+    const store = createPostgresStore(pgUrl);
+    const sql = getPostgresClient(pgUrl);
+    const run = Math.random().toString(16).slice(2, 10);
+    const shop = `vitest-book-${run}`;
+    const ann = `${shop}-ann`;
+    const bob = `${shop}-bob`;
+    const zone = "America/New_York";
+
+    // "Now" is 08:00 on a random Tuesday in 2099; with the default 2-hour lead time, starts from 10:00.
+    const tuesday = DateTime.fromObject({ year: 2099, month: 1, day: 6 }, { zone })
+      .plus({ weeks: Math.floor(Math.random() * 30) })
+      .set({ weekday: 2 })
+      .startOf("day");
+    const time = (hh: number, mm = 0) => tuesday.set({ hour: hh, minute: mm }).toISO({ suppressMilliseconds: true })!;
+    const deps: FrontDeskDeps = { catalog: store, store, clock: fixedClock(new Date(time(8))), notifier: recordingNotifier() };
+
+    /** Every idempotency key this block uses, deleted in afterAll. */
+    const keys: string[] = [];
+    const trim = (start: string, customer_name = "E2E Book"): BookInput => {
+      const idempotency_key = crypto.randomUUID();
+      keys.push(idempotency_key);
+      return { service_id: "trim", start, customer_name, idempotency_key };
+    };
+
+    beforeAll(async () => {
+      await sql`insert into shops (slug, name, timezone) values (${shop}, 'Vitest Book Shop', ${zone})`;
+      await sql`insert into staff (id, shop_slug, name) values (${ann}, ${shop}, 'Ann'), (${bob}, ${shop}, 'Bob')`;
+      await sql`
+        insert into weekly_hours (staff_id, weekday, opens, closes)
+        select s.id, day, time '09:00', time '17:00'
+        from unnest(${[ann, bob]}::text[]) as s(id), generate_series(2, 6) as day
+      `;
+      await sql`
+        insert into services (shop_slug, id, name, duration_min, price_cents, deposit_cents, position)
+        values (${shop}, 'trim', 'Trim', 30, 2000, 0, 1)
+      `;
+    });
+
+    afterAll(async () => {
+      if (keys.length > 0) await sql`delete from idempotency_keys where key = any(${keys}::text[])`;
+      await sql`delete from bookings where shop_slug = ${shop}`; // events cascade
+      await sql`delete from shops where slug = ${shop}`; // staff, hours and services cascade
+      await closePostgresClients();
+    });
+
+    it("books the other staff member when the race for the first is lost, in the same transaction as the key", async () => {
+      const winner = await book(deps, shop, trim(time(10)), "vitest A");
+      expect(winner.booking.staffId).toBe(ann);
+
+      const args = trim(time(10), "E2E Loser");
+      const loser = await book(staleOnce(deps), shop, args, "vitest B");
+      expect(loser.booking).toMatchObject({ staffId: bob, start: time(10), status: "confirmed" });
+      expect(loser.staffName).toBe("Bob");
+      // The retry committed with the idempotency key: the same call replays it.
+      const replay = await book(deps, shop, args, "vitest B");
+      expect(replay.replayed).toBe(true);
+      expect(replay.booking.id).toBe(loser.booking.id);
+      expect(await deps.store.listEvents(loser.booking.id)).toHaveLength(1);
+    });
+
+    it("is too_far for year 9999 and too_soon for year 1, and get_availability offers nothing there", async () => {
+      expect((await rejection(book(deps, shop, trim("9999-12-31T15:00:00Z"), "vitest"))).code).toBe("too_far");
+      expect((await rejection(book(deps, shop, trim("0001-01-01T15:00:00Z"), "vitest"))).code).toBe("too_soon");
+      for (const window of [
+        { from: "9999-12-30T00:00:00Z", to: "9999-12-31T00:00:00Z" },
+        { from: "0001-01-01T00:00:00Z", to: "0001-01-02T00:00:00Z" },
+      ]) {
+        expect(await getAvailability(deps, shop, { service_id: "trim", ...window })).toEqual({ slots: [], truncated: false });
+      }
+    });
+
+    it("refuses NUL in customer_name, strips it from the agent name, and treats a slug with it as not_found", async () => {
+      const err = await rejection(book(deps, shop, trim(time(11), "E2E\u0000Nul"), "vitest"));
+      expect(err.code).toBe("invalid_request");
+      expect(err.details).toMatchObject({ field: "customer_name" });
+
+      const { booking } = await book(deps, shop, trim(time(11)), "vitest\u0000agent");
+      expect(booking.agent.name).toBe("vitestagent");
+
+      expect((await rejection(listServices(deps, `${shop}\u0000`))).code).toBe("not_found");
+    });
+  });
+}

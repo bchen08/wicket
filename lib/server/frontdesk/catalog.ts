@@ -51,6 +51,14 @@ export class DuplicateServiceError extends Error {
   }
 }
 
+/** A service would end up with a deposit larger than its price. */
+export class DepositExceedsPriceError extends Error {
+  constructor(readonly serviceId: string) {
+    super(`Service "${serviceId}" can't have a deposit larger than its price.`);
+    this.name = "DepositExceedsPriceError";
+  }
+}
+
 export interface ShopCatalog {
   /** The shop, or null if no shop has this slug. */
   getShop(slug: string): Promise<Shop | null>;
@@ -71,8 +79,14 @@ export interface ShopCatalog {
 
   // ---- Owner writes. Callers check that the shop exists first. ----
 
-  /** Insert or replace the shop's whole policies row. Returns what was stored. */
-  savePolicies(slug: string, policies: Policies): Promise<Policies>;
+  /**
+   * Merge `patch` into the shop's policies row and return the whole stored row. A shop without a row
+   * gets one with the defaults (DEFAULT_POLICIES / the column defaults) first. Fields that are absent
+   * or undefined in `patch` keep their stored values; phone: null clears the phone.
+   * Atomic: concurrent calls with different fields both take effect (Postgres: the row is locked
+   * between the read and the write), so one owner request never silently undoes another.
+   */
+  savePolicies(slug: string, patch: Partial<Policies>): Promise<Policies>;
   /**
    * Replace one staff member's entire week, atomically. The caller has validated `weekly`.
    * Returns false (and changes nothing) if the staff member isn't in the shop.
@@ -84,9 +98,17 @@ export interface ShopCatalog {
   createBlock(slug: string, block: NewBlock): Promise<BlockedTime | null>;
   /** Delete one blocked time and return it. null if the shop has no block with that id (any string is accepted). */
   deleteBlock(slug: string, id: string): Promise<BlockedTime | null>;
-  /** Add a service at the end of the display order. Throws DuplicateServiceError if the id is taken. */
+  /**
+   * Add a service at the end of the display order. Throws DuplicateServiceError if the id is taken,
+   * DepositExceedsPriceError if depositCents > priceCents.
+   */
   createService(slug: string, service: Service): Promise<Service>;
-  /** Change some fields of a service and return it. null if the shop has no service with that id. */
+  /**
+   * Change some fields of a service and return it. null if the shop has no service with that id.
+   * Throws DepositExceedsPriceError (and changes nothing) if the result would have depositCents >
+   * priceCents, judged against the row as it is when the update applies, not an earlier read
+   * (Postgres: the services_deposit_le_price check constraint).
+   */
   updateService(slug: string, id: string, patch: ServicePatch): Promise<Service | null>;
 }
 

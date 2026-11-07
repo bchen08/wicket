@@ -138,8 +138,21 @@ describe("MCP /api/mcp", () => {
     expect([...(schema("cancel").required ?? [])].sort()).toEqual(["booking_id", "idempotency_key"]);
     expect(schema("get_booking").required).toEqual(["booking_id"]);
     for (const name of ["book", "cancel"]) {
-      expect(schema(name).properties?.idempotency_key).toMatchObject({ type: "string", minLength: 8, maxLength: 128 });
-      expect(String(schema(name).properties?.idempotency_key.description)).toMatch(/fresh UUID/);
+      const idempotencyKey = schema(name).properties?.idempotency_key;
+      // The same rule as parseIdempotencyKey and lib/types/frontdesk.ts: 8–128 visible ASCII characters.
+      expect(idempotencyKey).toMatchObject({
+        type: "string",
+        minLength: 8,
+        maxLength: 128,
+        pattern: "^[\\x21-\\x7E]{8,128}$",
+      });
+      const pattern = new RegExp(String(idempotencyKey?.pattern));
+      expect(pattern.test(crypto.randomUUID())).toBe(true);
+      for (const bad of ["1234567", "k".repeat(129), "my booking key", "clé-de-réservation"]) {
+        expect(pattern.test(bad)).toBe(false);
+      }
+      expect(String(idempotencyKey?.description)).toMatch(/fresh UUID/);
+      expect(String(idempotencyKey?.description)).toContain("8–128 visible ASCII characters, no spaces");
     }
     for (const name of ["get_booking", "cancel"]) {
       expect(schema(name).properties?.booking_id).toMatchObject({ type: "string" });

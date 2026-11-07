@@ -17,10 +17,10 @@ import type {
   WeeklyHours,
 } from "../../types/frontdesk";
 import type { LifecycleAction } from "../engine/lifecycle";
-import { DuplicateServiceError } from "./catalog";
+import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { POLICY_LIMITS } from "./policies";
-import { policiesFor, requireBooking, requireShop, transitionBooking, type FrontDeskDeps } from "./service";
+import { NUL, policiesFor, requireBooking, requireShop, transitionBooking, type FrontDeskDeps } from "./service";
 import { parseRfc3339 } from "./time";
 
 // Owner use cases behind the /api/shops/[shop]/* owner routes (policies, hours, blocks, services,
@@ -81,6 +81,12 @@ function defined<T extends object>(patch: T): Partial<T> {
 
 const atLeastOneField = (body: object) => Object.keys(defined(body)).length > 0;
 
+/** For .refine on every string that is stored or queried: Postgres text can't hold U+0000 (SQLSTATE 22021). */
+const hasNoNul = (value: string) => !value.includes(NUL);
+function noNul(field: string) {
+  return { error: `${field} can't contain the NUL character (U+0000).`, abort: true };
+}
+
 /** A whole number in [min, max], with one message for every way it can be wrong. */
 function wholeNumber(field: string, min: number, max: number, unit: string) {
   const message = `${field} must be a whole number of ${unit} from ${min} to ${max}.`;
@@ -90,17 +96,46 @@ function wholeNumber(field: string, min: number, max: number, unit: string) {
 /** A string that is 1–max characters after trimming. Returned trimmed. */
 function requiredText(field: string, max: number) {
   const message = `${field} must be text of 1–${max} characters.`;
-  return z.string({ error: message }).trim().min(1, { error: message }).max(max, { error: message });
+  return z
+    .string({ error: message })
+    .trim()
+    .min(1, { error: message })
+    .max(max, { error: message })
+    .refine(hasNoNul, noNul(field));
 }
 
 const staffIdSchema = z
   .string({ error: 'staffId must be the id of one of the shop\'s staff members, e.g. "dana".' })
-  .min(1, { error: 'staffId must be the id of one of the shop\'s staff members, e.g. "dana".' });
+  .min(1, { error: 'staffId must be the id of one of the shop\'s staff members, e.g. "dana".' })
+  .refine(hasNoNul, noNul("staffId"));
 
-/** An RFC 3339 instant with an offset, kept as the string. Aborts, so the object's cross-field checks are skipped. */
+/**
+ * The instants the owner API accepts (inclusive). Anything outside is surely a typo, and years like
+ * 0001 or 9999 would be out of the database's reach once a range is built around them.
+ */
+export const INSTANT_LIMITS = { earliest: "2000-01-01T00:00:00Z", latest: "2999-12-31T23:59:59Z" } as const;
+
+const EARLIEST_MS = Date.parse(INSTANT_LIMITS.earliest);
+const LATEST_MS = Date.parse(INSTANT_LIMITS.latest);
+
+function inInstantRange(instant: Date): boolean {
+  return instant.getTime() >= EARLIEST_MS && instant.getTime() <= LATEST_MS;
+}
+
+function instantRangeMessage(field: string): string {
+  return `${field} must be between ${INSTANT_LIMITS.earliest} and ${INSTANT_LIMITS.latest}.`;
+}
+
+/**
+ * An RFC 3339 instant with an offset, from 2000 to 2999 (INSTANT_LIMITS), kept as the string.
+ * Aborts, so the object's cross-field checks are skipped.
+ */
 function instant(field: string) {
   const message = `${field} must be an RFC 3339 date-time with an offset, e.g. "2026-12-24T00:00:00-05:00".`;
-  return z.string({ error: message }).refine((v) => parseRfc3339(v) !== null, { error: message, abort: true });
+  return z
+    .string({ error: message })
+    .refine((v) => parseRfc3339(v) !== null, { error: message, abort: true })
+    .refine((v) => inInstantRange(toDate(v)), { error: instantRangeMessage(field), abort: true });
 }
 
 /** A string that already passed instant(). */
@@ -120,6 +155,9 @@ function parseQueryInstant(field: "from" | "to", value: string | null | undefine
       `Send ${field} like 2026-11-01T00:00:00-05:00 (a time zone offset is required), or leave it out.`,
     );
   }
+  if (!inInstantRange(parsed)) {
+    throw invalidField(field, instantRangeMessage(field), `Send a ${field} in the years 2000–2999, or leave it out.`);
+  }
   return parsed;
 }
 
@@ -129,7 +167,7 @@ const { leadTimeMin, horizonDays, depositHorizonDays, cancelWindowHours, phoneMa
 
 function ruleText(field: string) {
   const message = `${field} must be text of at most ${ruleMaxLength} characters ("" to clear it).`;
-  return z.string({ error: message }).trim().max(ruleMaxLength, { error: message });
+  return z.string({ error: message }).trim().max(ruleMaxLength, { error: message }).refine(hasNoNul, noNul(field));
 }
 
 const phoneMessage = `phone must be text of 1–${phoneMaxLength} characters, or null to remove it.`;
@@ -146,6 +184,7 @@ const updatePoliciesSchema = z
       .trim()
       .min(1, { error: phoneMessage })
       .max(phoneMaxLength, { error: phoneMessage })
+      .refine(hasNoNul, noNul("phone"))
       .nullable()
       .optional(),
     depositRule: ruleText("depositRule").optional(),
@@ -164,14 +203,14 @@ export async function getShopPolicies(deps: FrontDeskDeps, shopSlug: string): Pr
 }
 
 /**
- * PUT /api/shops/[shop]/policies: merge UpdatePoliciesRequest (at least one field) onto the current
- * policies and save the whole row. Text fields are stored trimmed.
+ * PUT /api/shops/[shop]/policies: change the fields in UpdatePoliciesRequest (at least one) and return
+ * the whole row. Text fields are stored trimmed. The store merges the patch atomically, so two
+ * concurrent PUTs of different fields both take effect.
  */
 export async function updateShopPolicies(deps: FrontDeskDeps, shopSlug: string, body: unknown): Promise<PoliciesResponse> {
   const shop = await requireShop(deps, shopSlug);
   const patch = parseBody(updatePoliciesSchema, body, POLICIES_NEXT_ACTION);
-  const current = await policiesFor(deps, shopSlug);
-  const policies = await deps.catalog.savePolicies(shopSlug, { ...current, ...defined(patch) });
+  const policies = await deps.catalog.savePolicies(shopSlug, defined(patch));
   return { shop, policies };
 }
 
@@ -297,7 +336,12 @@ const createBlockSchema = z
     staffId: staffIdSchema,
     start: instant("start"),
     end: instant("end"),
-    reason: z.string({ error: reasonMessage }).trim().max(MAX_BLOCK_REASON, { error: reasonMessage }).optional(),
+    reason: z
+      .string({ error: reasonMessage })
+      .trim()
+      .max(MAX_BLOCK_REASON, { error: reasonMessage })
+      .refine(hasNoNul, noNul("reason"))
+      .optional(),
   } satisfies Record<keyof CreateBlockRequest, z.ZodType>)
   .superRefine((block, ctx) => {
     const start = parseRfc3339(block.start);
@@ -319,7 +363,8 @@ const BLOCK_NEXT_ACTION = "Fix the field named in details.field, then send the b
 
 /**
  * GET /api/shops/[shop]/blocks?from=&to=: blocked times overlapping [from, to), sorted by start.
- * Both are optional RFC 3339 instants; the default is 7 days ago to 366 days ahead of the clock.
+ * Both are optional RFC 3339 instants in the years 2000–2999 (INSTANT_LIMITS); the default is 7 days
+ * ago to 366 days ahead of the clock.
  */
 export async function listShopBlocks(
   deps: FrontDeskDeps,
@@ -400,6 +445,21 @@ function depositOverPrice(depositCents: number, priceCents: number): string {
   return `depositCents (${depositCents}) can't be more than priceCents (${priceCents}).`;
 }
 
+const DEPOSIT_NEXT_ACTION = "Lower depositCents or raise priceCents so the deposit is at most the price.";
+
+/**
+ * The store refused a deposit over the price (DepositExceedsPriceError): the services check
+ * constraint, judged on the row as it was when the write applied. Reached when another change to the
+ * same service landed between the friendly pre-check and the write.
+ */
+function depositRefused(serviceId: string, field: "depositCents" | "priceCents"): FrontDeskError {
+  return invalidField(
+    field,
+    `The deposit can't be more than the price: another change to service "${serviceId}" landed first.`,
+    `Read the service again (GET /api/shops/[shop]/services), then send it again. ${DEPOSIT_NEXT_ACTION}`,
+  );
+}
+
 const createServiceSchema = z
   .strictObject({
     id: z.string({ error: serviceIdMessage }).regex(SERVICE_LIMITS.idPattern, { error: serviceIdMessage }),
@@ -429,7 +489,8 @@ const SERVICE_NEXT_ACTION = "Fix the field named in details.field, then send the
 
 /**
  * POST /api/shops/[shop]/services: add a service (CreateServiceRequest) at the end of the list.
- * A taken id → invalid_request (field "id").
+ * A taken id → invalid_request (field "id"); a deposit over the price → invalid_request (field
+ * "depositCents"), whether the schema or the store catches it.
  */
 export async function createShopService(deps: FrontDeskDeps, shopSlug: string, body: unknown): Promise<ServiceResponse> {
   await requireShop(deps, shopSlug);
@@ -444,14 +505,21 @@ export async function createShopService(deps: FrontDeskDeps, shopSlug: string, b
         "Pick a different id, or change the existing service with PATCH /api/shops/[shop]/services/[id].",
       );
     }
+    if (err instanceof DepositExceedsPriceError) {
+      // The schema already rejects deposit > price, so this is the store's check as a backstop.
+      throw invalidField("depositCents", "The deposit can't be more than the price.", DEPOSIT_NEXT_ACTION);
+    }
     throw err;
   }
 }
 
 /**
  * PATCH /api/shops/[shop]/services/[id]: change some fields of a service (UpdateServiceRequest, at
- * least one). depositCents <= priceCents is checked on the merged values. Unknown id → not_found.
- * Existing bookings keep their own depositCents snapshot.
+ * least one). depositCents <= priceCents is checked on the merged values first, for a friendly
+ * message; the store checks it again on the row as it is when the write applies (so two concurrent
+ * PATCHes can't combine into a deposit over the price), and that refusal is the same invalid_request
+ * (field "depositCents"). Unknown id → not_found; the id is only compared with the listed services,
+ * never sent in a query of its own. Existing bookings keep their own depositCents snapshot.
  */
 export async function updateShopService(
   deps: FrontDeskDeps,
@@ -477,10 +545,19 @@ export async function updateShopService(
     throw invalidField(
       patch.depositCents !== undefined ? "depositCents" : "priceCents",
       depositOverPrice(merged.depositCents, merged.priceCents),
-      "Lower depositCents or raise priceCents so the deposit is at most the price.",
+      DEPOSIT_NEXT_ACTION,
     );
   }
-  const service = await deps.catalog.updateService(shopSlug, serviceId, patch);
+  let service;
+  try {
+    service = await deps.catalog.updateService(shopSlug, serviceId, patch);
+  } catch (err) {
+    if (err instanceof DepositExceedsPriceError) {
+      // Name the field this request changed, like the pre-check above.
+      throw depositRefused(serviceId, patch.depositCents !== undefined ? "depositCents" : "priceCents");
+    }
+    throw err;
+  }
   if (!service) throw notFound();
   return { service };
 }

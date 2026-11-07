@@ -40,7 +40,7 @@ import {
 // The agent door: Front Desk's MCP tools. Transport lives in app/api/mcp/route.ts.
 
 /** Every tool is scoped to this shop until multi-shop routing lands. */
-// TODO(ring-1): let agents pick the shop (by slug or URL) instead of hard-coding it.
+// TODO(ring-2): let agents pick the shop (by slug or URL) instead of hard-coding it.
 export const DEFAULT_SHOP_SLUG = "harts";
 
 export const SERVER_INSTRUCTIONS = [
@@ -157,13 +157,17 @@ const getAvailabilityOutputSchema = z.object({
   truncated: z.boolean().describe("true if more slots exist in the window than were returned."),
 });
 
+/** The JSON Schema pattern parseIdempotencyKey enforces: 8–128 visible ASCII characters (U+0021–U+007E). */
+const IDEMPOTENCY_KEY_PATTERN = `^[\\x21-\\x7E]{${IDEMPOTENCY_KEY_MIN},${IDEMPOTENCY_KEY_MAX}}$`;
+
 const idempotencyKeyInput = (what: string) =>
   advertise({
     type: "string",
     minLength: IDEMPOTENCY_KEY_MIN,
     maxLength: IDEMPOTENCY_KEY_MAX,
+    pattern: IDEMPOTENCY_KEY_PATTERN,
     description:
-      `A fresh UUID for this ${what} (${IDEMPOTENCY_KEY_MIN}–${IDEMPOTENCY_KEY_MAX} visible characters, no spaces). ` +
+      `A fresh UUID for this ${what} (${IDEMPOTENCY_KEY_MIN}–${IDEMPOTENCY_KEY_MAX} visible ASCII characters, no spaces). ` +
       "Send the same key only to retry the same call (e.g. after a timeout): it then returns the first result " +
       "instead of acting twice. Never reuse it for a different request.",
   });

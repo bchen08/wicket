@@ -21,6 +21,7 @@ import type {
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
 import {
+  bookingBounds,
   checkStart,
   computeAvailability,
   formatDisplay,
@@ -64,8 +65,12 @@ export function shopNotFound(slug: string): FrontDeskError {
   );
 }
 
-/** The shop, or a not_found FrontDeskError. */
+/** U+0000. Postgres text can't hold it (SQLSTATE 22021), so it never reaches a query or a stored row. */
+export const NUL = "\u0000";
+
+/** The shop, or a not_found FrontDeskError. A slug containing NUL is not_found without a query. */
 export async function requireShop(deps: FrontDeskDeps, shopSlug: string): Promise<Shop> {
+  if (shopSlug.includes(NUL)) throw shopNotFound(shopSlug);
   const shop = await deps.catalog.getShop(shopSlug);
   if (!shop) throw shopNotFound(shopSlug);
   return shop;
@@ -294,12 +299,24 @@ export async function getAvailability(
   ]);
   if (policies.paused) return { slots: [], truncated: false };
 
-  // A slot may start just before `to` and run past it, so fetch busy time up to
-  // to + duration; otherwise a booking right after the window could be missed.
-  const busyUntil = new Date(to.getTime() + service.durationMin * MIN_MS);
+  const now = deps.clock.now();
+  const rules = bookingRules(policies);
+  // Busy time only matters for the starts the rules allow: [max(from, earliest), min(to, latest)).
+  // A slot may start just before the end of that range and run past it, so fetch busy time up to
+  // there + duration; otherwise a booking right after it could be missed. A window wholly outside
+  // the rules (e.g. in year 9999 or year 1, where the range would be out of the database's reach)
+  // fetches nothing.
+  const bounds = bookingBounds({ now, timezone: shop.timezone, depositCents: service.depositCents, rules });
+  const startsFrom = Math.max(from.getTime(), bounds.earliest.getTime());
+  const startsTo = Math.min(to.getTime(), bounds.latest?.getTime() ?? Infinity);
   const [staffHours, busy] = await Promise.all([
     deps.catalog.getStaffHours(shop.slug),
-    deps.catalog.getBusyIntervals(shop.slug, { start: from, end: busyUntil }),
+    startsFrom < startsTo
+      ? deps.catalog.getBusyIntervals(shop.slug, {
+          start: new Date(startsFrom),
+          end: new Date(startsTo + service.durationMin * MIN_MS),
+        })
+      : Promise.resolve([]),
   ]);
   return computeAvailability({
     timezone: shop.timezone,
@@ -308,10 +325,10 @@ export async function getAvailability(
     busy,
     from,
     to,
-    now: deps.clock.now(),
+    now,
     limit: input.limit,
     depositCents: service.depositCents,
-    rules: bookingRules(policies),
+    rules,
   });
 }
 
@@ -359,6 +376,14 @@ export function parseBookArgs(raw: unknown): BookInput {
       customer_name,
     );
   }
+  if (name.includes(NUL)) {
+    throw invalidField(
+      "customer_name",
+      "customer_name can't contain the NUL character (U+0000).",
+      "Send the name the booking should be under as plain text, without control characters.",
+      customer_name,
+    );
+  }
 
   return { service_id, start, customer_name: name, idempotency_key: parseIdempotencyKey(idempotency_key) };
 }
@@ -375,12 +400,16 @@ export type BookOutcome = BookResult & { staffName: string };
  *    inside store.idempotent: the same key with the same request returns the first call's booking
  *    (replayed: true) without booking again; the same key with another request is
  *    idempotency_conflict. A call that fails isn't remembered, so it can be retried with the same key.
- * 3. Check the start against the shop's rules, hours, blocked time and bookings (engine checkStart):
- *    paused, too_soon (details.earliest), too_far (details.latest), outside_hours, or slot_taken
- *    (details.alternatives: up to 3 nearby free starts). The staff member comes from the check.
+ * 3. Check the start against the shop's rules (engine checkStart): paused, too_soon
+ *    (details.earliest), too_far (details.latest). These are decided before busy time is read, so a
+ *    start far in the past or future never queries bookings. Then against hours, blocked time and
+ *    bookings: outside_hours, or slot_taken (details.alternatives: up to 3 nearby free starts). The
+ *    staff member comes from the check.
  * 4. Store it with the store the idempotent action receives (in Postgres, the key's transaction).
- *    If another booking got there first (SlotTakenError, i.e. the no_overlap constraint), fail with
- *    slot_taken; the database is the final word even when step 3 passed.
+ *    If another booking got there first (SlotTakenError, i.e. the no_overlap constraint), read busy
+ *    time again and, if another staff member is free at exactly this start, try once more with them.
+ *    If that fails too, or nobody is free, fail with slot_taken; the database is the final word even
+ *    when step 3 passed.
  * 5. Alert the owner, only for a new booking (not a replay). A failing notifier is logged and never
  *    fails the booking.
  *
@@ -425,6 +454,9 @@ export async function book(
   return { ...result, replayed };
 }
 
+/** checkStart's refusals that come from the shop's rules alone, before hours and busy time count. */
+const RULE_REFUSALS: ReadonlySet<RefusedStart["reason"]> = new Set(["paused", "too_soon", "too_far"]);
+
 /** Steps 3 and 4 of book(): check the start and store the booking. `deps.catalog` and `deps.store` are the idempotent action's store. */
 async function bookOnce(
   deps: FrontDeskDeps,
@@ -451,39 +483,67 @@ async function bookOnce(
     deps.catalog.getStaffHours(shopSlug),
   ]);
 
-  const engine: StartCheckInput = {
+  const rulesOnly: StartCheckInput = {
     timezone: shop.timezone,
     durationMin: service.durationMin,
     staffHours,
-    busy: await busyAround(deps, shop, service, start),
+    busy: [],
     now: deps.clock.now(),
     depositCents: service.depositCents,
     rules: bookingRules(policies),
   };
-  const check = checkStart(engine, start);
-  if (!check.ok) throw startRefused(check, { shop, service, policies, requested: args.start, start, engine });
+  const refused = (check: RefusedStart, engine: StartCheckInput) =>
+    startRefused(check, { shop, service, policies, requested: args.start, start, engine });
+  /** The engine input with busy time around `start`, read now. */
+  const withBusy = async (): Promise<StartCheckInput> => ({
+    ...rulesOnly,
+    busy: await busyAround(deps, shop, service, start),
+  });
 
-  let booking;
-  try {
-    booking = await deps.store.createBooking({
-      shopSlug: shop.slug,
-      serviceId: service.id,
-      staffId: check.slot.staffId,
-      start,
-      end: new Date(start.getTime() + service.durationMin * MIN_MS),
-      customerName: args.customer_name,
-      agentName,
-      depositCents: service.depositCents,
-    });
-  } catch (err) {
-    // Another booking won the race between the check and the insert. Offer starts around it,
-    // from busy time read again now that the winner is stored.
-    if (!(err instanceof SlotTakenError)) throw err;
-    const fresh = { ...engine, busy: await busyAround(deps, shop, service, start) };
-    throw slotTaken(args.start, service.id, alternativesNear(fresh, start));
+  // The rules first, with no busy time: paused, too_soon and too_far don't depend on it, and a start
+  // far in the past or future (year 1, year 9999) would put the busy-time range out of the database's reach.
+  const byRules = checkStart(rulesOnly, start);
+  if (!byRules.ok && RULE_REFUSALS.has(byRules.reason)) throw refused(byRules, rulesOnly);
+
+  let engine = await withBusy();
+  const check = checkStart(engine, start);
+  if (!check.ok) throw refused(check, engine);
+
+  /** The stored booking, or null if another booking holds that staff member's time (SlotTakenError). */
+  const create = async (staffId: string): Promise<Booking | null> => {
+    try {
+      return await deps.store.createBooking({
+        shopSlug: shop.slug,
+        serviceId: service.id,
+        staffId,
+        start,
+        end: new Date(start.getTime() + service.durationMin * MIN_MS),
+        customerName: args.customer_name,
+        agentName,
+        depositCents: service.depositCents,
+      });
+    } catch (err) {
+      if (err instanceof SlotTakenError) return null;
+      throw err;
+    }
+  };
+
+  let booking = await create(check.slot.staffId);
+  if (!booking) {
+    // Another booking won the race between the check and the insert. Read busy time again, now that
+    // the winner is stored: another staff member may still be free at exactly this start, so try once
+    // more with them. Otherwise offer starts around it, from that fresh busy time.
+    engine = await withBusy();
+    const recheck = checkStart(engine, start);
+    if (recheck.ok) {
+      booking = await create(recheck.slot.staffId);
+      if (!booking) engine = await withBusy();
+    }
+    if (!booking) throw slotTaken(args.start, service.id, alternativesNear(engine, start));
   }
 
-  const staffName = staffHours.find((s) => s.staffId === check.slot.staffId)?.staffName ?? check.slot.staffId;
+  const staffId = booking.staffId;
+  const staffName = staffHours.find((s) => s.staffId === staffId)?.staffName ?? staffId;
   return { booking, staffName };
 }
 
@@ -580,18 +640,19 @@ function slotTaken(start: string, serviceId: string, alternatives: Slot[]): Fron
 }
 
 /**
- * Up to MAX_ALTERNATIVES free starts closest to `start` (not `start` itself), one Slot per distinct
- * start, earliest first. nearbySlots returns one Slot per free staff member and book picks the staff
- * member itself, so ask it for enough Slots to be sure of MAX_ALTERNATIVES + 1 distinct starts, keep
- * the first Slot (lowest staffId) per start, and drop the refused one.
+ * Up to MAX_ALTERNATIVES free starts closest to `start`, one Slot per distinct start, earliest first.
+ * `start` itself is one of them only while some staff member is still free then (e.g. after a lost
+ * race, when the retry with another staff member lost too and a third is free). nearbySlots returns
+ * one Slot per free staff member and book picks the staff member itself, so ask it for enough Slots
+ * to be sure of MAX_ALTERNATIVES distinct starts and keep the first Slot (lowest staffId) per start.
  */
 function alternativesNear(engine: StartCheckInput, start: Date): Slot[] {
   const startMs = start.getTime();
   const perStart = Math.max(1, engine.staffHours.length);
   const distinct = new Map<number, Slot>();
-  for (const slot of nearbySlots(engine, start, (MAX_ALTERNATIVES + 1) * perStart)) {
+  for (const slot of nearbySlots(engine, start, MAX_ALTERNATIVES * perStart)) {
     const ms = Date.parse(slot.start);
-    if (ms !== startMs && !distinct.has(ms)) distinct.set(ms, slot);
+    if (!distinct.has(ms)) distinct.set(ms, slot);
   }
   return [...distinct]
     .sort(([a], [b]) => Math.abs(a - startMs) - Math.abs(b - startMs) || a - b)
@@ -600,8 +661,12 @@ function alternativesNear(engine: StartCheckInput, start: Date): Slot[] {
     .map(([, slot]) => slot);
 }
 
+/** C0 control characters, U+0000–U+001F: no use in a label, and Postgres text can't hold U+0000. */
+const CONTROL_CHARACTERS = /[\u0000-\u001F]/g;
+
+/** The MCP client's self-reported name as stored: control characters removed, trimmed, at most 80 characters. */
 function cleanAgentName(name: string): string {
-  const trimmed = name.trim().slice(0, MAX_AGENT_NAME);
+  const trimmed = name.replace(CONTROL_CHARACTERS, "").trim().slice(0, MAX_AGENT_NAME);
   return trimmed === "" ? UNKNOWN_AGENT : trimmed;
 }
 

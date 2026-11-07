@@ -42,7 +42,7 @@ The HTTP status applies to the `/api/shops/*` routes. Tools always answer a norm
 |---|---|---|---|---|
 | `invalid_request` | 400 | Bad arguments or body. `book` with an unknown `service_id`. An owner action the booking's status or time doesn't allow. | Tools: `field`, `value`. Owner bodies: `field`, `issues`. Owner actions: `status`, `action`, `booking_id`. | Says what to send instead. |
 | `not_found` | 404 | No such shop, service (`get_availability`, `PATCH` service), staff member or blocked time. | What was asked for, plus the valid ids where useful (`valid_service_ids`, `valid_staff_ids`). | Check the slug or id; use one of the valid ids. |
-| `slot_taken` | 409 | `book`: a booking is in the way, or another agent won the race for that time. | `start`, `service_id`, `alternatives` (up to 3 nearby `Slot`s, possibly empty) | "Someone just took that time. Call get_availability again and choose another start." When there are alternatives it adds "Nearby open starts you can offer instead are in details.alternatives." |
+| `slot_taken` | 409 | `book`: a booking is in the way, or another agent won the race for that time and no other staff member is free then. | `start`, `service_id`, `alternatives` (up to 3 nearby `Slot`s, possibly empty) | "Someone just took that time. Call get_availability again and choose another start." When there are alternatives it adds "Nearby open starts you can offer instead are in details.alternatives." |
 | `outside_hours` | 422 | `book`: not a bookable start for that service: closed, lunch, blocked time, off the 15-minute grid, or the service would run past closing. | `field: "start"`, `value`, `service_id` | "Call get_availability and choose one of the returned starts." |
 | `too_soon` | 422 | `book`: before now + the lead time (rounded up to the grid). This includes the past. | `earliest`, `lead_time_min`, `start` | "Pick a later time: call get_availability from details.earliest." |
 | `too_far` | 422 | `book`: at or after the booking horizon for that service. | `latest` (starts must be before it), `horizon_days`, `start` | "Pick an earlier time, before details.latest." |
@@ -254,14 +254,14 @@ Books an appointment. **It's confirmed as soon as the call returns**: there's no
 - **`idempotency_key` is required.** Send a fresh UUID per intended booking. Reuse it only to retry the same call, e.g. after a timeout. See [Idempotency](#idempotency).
 - **No deposit is collected yet.** `depositCents` is the deposit the service required when it was booked; it will be collected once deposits are enabled.
 - **The customer is not verified.** `customer.verified` is always `false`.
-- `agent.name` is a best-effort, unverified label: the MCP client's self-reported name. Clients on the 2026-07-28 protocol send it with every request. Stateless 2025-era requests don't, so those bookings show `"unknown agent"`. MCP Inspector is one of these.
+- `agent.name` is a best-effort, unverified label: the MCP client's self-reported name, with control characters removed and cut to 80 characters. Clients on the 2026-07-28 protocol send it with every request. Stateless 2025-era requests don't, so those bookings show `"unknown agent"`. MCP Inspector is one of these.
 - Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true` (the same arguments, key included, have no additional effect), `openWorldHint: false`.
 
 | Field | Type | Notes |
 |---|---|---|
 | `service_id` | string | Required. An `id` from `list_services`. |
 | `start` | string | Required. A slot `start` from `get_availability`, RFC 3339 with offset. Any offset is accepted if it's the same instant. |
-| `customer_name` | string | Required. 1–80 characters after trimming. The name the booking is under. |
+| `customer_name` | string | Required. 1–80 characters after trimming, without the NUL character (U+0000). The name the booking is under. |
 | `idempotency_key` | string | Required. 8–128 visible ASCII characters, no spaces. A UUID. |
 
 **Input**
@@ -317,8 +317,8 @@ This example ran on the in-memory store with the clock frozen at Tue 10 Nov, 10:
 **How it decides:**
 1. It checks the arguments (`invalid_request`).
 2. It looks up the `idempotency_key`. The same key with the same arguments returns the stored booking without doing anything else; the same key with other arguments is `idempotency_conflict`.
-3. It checks `start` against the shop's rules, using the current clock, in this order: `paused`, then `too_soon` (lead time), then `too_far` (horizon). Then against hours and busy time: if a booking is in the way it's `slot_taken`, otherwise `outside_hours` (closed, lunch, blocked time, off the grid, or running past closing). The staff member comes from the free slot.
-4. It stores the booking and its `booked` event in one transaction (in Postgres, the same transaction as the idempotency key). The database's `no_overlap` constraint has the final word, so two agents racing for the same time can't both win; the loser gets `slot_taken` with alternatives.
+3. It checks `start` against the shop's rules, using the current clock, in this order: `paused`, then `too_soon` (lead time), then `too_far` (horizon). These don't read any bookings, so a start in year 1 or year 9999 is simply `too_soon` or `too_far`. Then against hours and busy time: if a booking is in the way it's `slot_taken`, otherwise `outside_hours` (closed, lunch, blocked time, off the grid, or running past closing). The staff member comes from the free slot.
+4. It stores the booking and its `booked` event in one transaction (in Postgres, the same transaction as the idempotency key). The database's `no_overlap` constraint has the final word, so two agents racing for the same staff member and time can't both win. The loser reads busy time again: if another staff member is free at exactly that start, it books them instead (once). Otherwise, or if that insert loses too, it gets `slot_taken` with alternatives.
 5. It notifies the owner, only for a new booking (not a replay). In Ring 1a that's one JSON log line, `booking.created`, with the customer's first name only. A notifier failure never fails the booking.
 
 ### Idempotency
@@ -338,14 +338,14 @@ This example ran on the in-memory store with the clock frozen at Tue 10 Nov, 10:
 
 | `code` | When | `details` | `next_action` |
 |---|---|---|---|
-| `slot_taken` | A booking is already there. This covers booking the same slot twice, an overlapping service (e.g. a 45-min haircut-beard at 9:45 when 10:00 is booked), and losing a race to another agent. | `start`, `service_id`, `alternatives`: up to 3 free starts within 24 hours either side, closest first (listed earliest first), under the same rules | "Someone just took that time. Call get_availability again and choose another start." plus, when there are alternatives, "Nearby open starts you can offer instead are in details.alternatives." |
+| `slot_taken` | A booking is already there. This covers booking the same slot twice, an overlapping service (e.g. a 45-min haircut-beard at 9:45 when 10:00 is booked), and losing a race to another agent when no other staff member is free at that start (or the one retry with them loses too). | `start`, `service_id`, `alternatives`: up to 3 free starts within 24 hours either side, closest first (listed earliest first), under the same rules. They include `start` itself if some staff member is still free then. | "Someone just took that time. Call get_availability again and choose another start." plus, when there are alternatives, "Nearby open starts you can offer instead are in details.alternatives." |
 | `too_soon` | `start` is before now + the lead time, rounded up to the grid (or in the past). | `earliest`, `lead_time_min`, `start` | "Pick a later time: call get_availability from details.earliest." |
 | `too_far` | `start` is at or after the horizon: 6 days ahead for a service with a deposit, 30 days otherwise. | `latest`, `horizon_days`, `start` | "Pick an earlier time, before details.latest." |
 | `outside_hours` | `start` isn't a bookable time for that service: off the 15-minute grid, outside opening hours (including lunch, 12:00–12:30), on a closed day, on blocked time, or the service would run past closing. | `field: "start"`, `value`, `service_id` | "Call get_availability and choose one of the returned starts." |
 | `paused` | The owner paused bookings. | `phone` | "Tell the person to call the shop at +1 212-555-0142." |
 | `idempotency_conflict` | The key was already used with different arguments. | `idempotency_key`, `tool: "book"` | "Use a new idempotency_key (a fresh UUID) for a different request." |
 | `invalid_request` | Unknown `service_id`. | `field`, `value`, `valid_service_ids` | Call `list_services`, then `get_availability`. |
-| `invalid_request` | `start` isn't RFC 3339 with an offset; `customer_name` is missing, blank or over 80 characters; `idempotency_key` is missing, too short, too long or has spaces; a field is missing or the wrong JSON type. | `field`, `value` | Says what to send instead. |
+| `invalid_request` | `start` isn't RFC 3339 with an offset; `customer_name` is missing, blank, over 80 characters or contains the NUL character (U+0000); `idempotency_key` is missing, too short, too long or has spaces; a field is missing or the wrong JSON type. | `field`, `value` | Says what to send instead. |
 
 ```json
 {
@@ -694,6 +694,7 @@ Other statuses: **400** `invalid_request`, **401** `unauthorized`, **404** `not_
 **Validation.** Request bodies are checked with zod:
 - The body must be a JSON object. An empty body or invalid JSON is 400 with `details.field: "body"`.
 - Unknown fields are rejected.
+- Text can't contain the NUL character (U+0000), which Postgres can't store: `phone`, the three rules, a service's `id` and `name`, a block's `reason`, and `staffId`. A shop slug, service id or booking id in the path that contains it is simply 404.
 - A failure is 400 `invalid_request`. The message is the first problem; `details.field` is its dot path (e.g. `weekly.1.close`, or `body` for the body as a whole); `details.issues` lists every problem as `{ path, message }`.
 
 ```json
@@ -731,7 +732,7 @@ The examples below assume `export OWNER_API_TOKEN=<the deployment's token>`.
 | `phone` | 1–40 characters, or `null` to remove it |
 | `depositRule`, `lateCancelRule`, `noShowRule` | At most 1000 characters; `""` clears it |
 
-Text is stored trimmed. A shop without a policies row gets one.
+Text is stored trimmed. A shop without a policies row gets one, starting from the defaults. The change is merged into the stored row in one step, so two `PUT`s of different fields at the same moment both take effect.
 
 ```bash
 curl -s http://localhost:3000/api/shops/harts/policies -H "Authorization: Bearer $OWNER_API_TOKEN"
@@ -805,10 +806,10 @@ curl -s -X PUT http://localhost:3000/api/shops/harts/hours \
 
 Holidays and time off. A blocked time is half-open, `[start, end)`. While it lasts, `get_availability` offers no starts that would overlap it, and `book` there returns `outside_hours`.
 
-- `GET ?from=&to=`: blocks overlapping `[from, to)`, sorted by start (`BlocksResponse`). Both are optional RFC 3339 instants. The default is 7 days ago to 366 days ahead. `from` must be before `to`.
+- `GET ?from=&to=`: blocks overlapping `[from, to)`, sorted by start (`BlocksResponse`). Both are optional RFC 3339 instants from `2000-01-01T00:00:00Z` to `2999-12-31T23:59:59Z`. The default is 7 days ago to 366 days ahead. `from` must be before `to`.
 - `POST` (`CreateBlockRequest`) → **201** `BlockResponse`:
   - `staffId`: one of the shop's staff (else 404 `not_found`);
-  - `start`, `end`: RFC 3339 with an offset; `start` before `end`; at most 366 days long;
+  - `start`, `end`: RFC 3339 with an offset, from `2000-01-01T00:00:00Z` to `2999-12-31T23:59:59Z`; `start` before `end`; at most 366 days long;
   - `reason`: optional, at most 200 characters, default `""`. It's for the owner and never shown to agents.
   - Existing bookings inside the block are not touched. Cancel them separately if needed.
 - `DELETE ?id=<uuid>` → the deleted block (`BlockResponse`). A missing `id` is 400; an unknown or already-deleted one is 404 `not_found`.
@@ -839,7 +840,7 @@ curl -s -X DELETE "http://localhost:3000/api/shops/harts/blocks?id=bf989345-1adc
   - `durationMin`: whole number, 5–480.
   - `priceCents`: whole number, 0–1,000,000.
   - `depositCents`: whole number, 0 up to `priceCents`.
-- `PATCH /api/shops/[shop]/services/[id]` (`UpdateServiceRequest`) → `ServiceResponse`. Any of `name`, `durationMin`, `priceCents`, `depositCents`, at least one; the id can't change. `depositCents` ≤ `priceCents` is checked on the merged values. An unknown id is 404 `not_found` with `details.valid_service_ids`. Existing bookings keep the deposit they were booked with (`Booking.depositCents`).
+- `PATCH /api/shops/[shop]/services/[id]` (`UpdateServiceRequest`) → `ServiceResponse`. Any of `name`, `durationMin`, `priceCents`, `depositCents`, at least one; the id can't change. `depositCents` ≤ `priceCents` is checked on the merged values, and again by the database on the row as it is when the change applies, so two `PATCH`es at the same moment (one raising the deposit, one lowering the price) can't combine into a deposit over the price: the second gets 400 (`details.field: "depositCents"`). An unknown id is 404 `not_found` with `details.valid_service_ids`. Existing bookings keep the deposit they were booked with (`Booking.depositCents`).
 
 ```bash
 curl -s -X POST http://localhost:3000/api/shops/harts/services \
@@ -1091,12 +1092,12 @@ These are marked `TODO(ring-N)` in the code:
 
 | Ring | Item | Where |
 |---|---|---|
-| ring-1 | Let agents pick the shop (by slug or URL) instead of hard-coding Hart's | `lib/server/frontdesk/mcp.ts` (`DEFAULT_SHOP_SLUG`) |
 | ring-1b | Verified customer identity, consent and mandate (`customer.verified` is always `false`) | `lib/server/frontdesk/service.ts` (`book`) |
 | ring-1b | Anyone holding a booking id can read or cancel it, until customer consent ships | `lib/server/frontdesk/service.ts` (`getBooking`, `cancelBooking`), `app/api/mcp/route.ts` |
 | ring-1c | Collect deposits and move money (`depositEffect` is the policy's decision; `depositCollected` is always `false`) | `lib/server/frontdesk/service.ts` (`book`, `transitionBooking`), `lib/server/engine/lifecycle.ts` |
 | ring-1c | `awaiting_deposit` and `expired` (book creates `confirmed` bookings until deposits come with Stripe) | `lib/server/frontdesk/service.ts` (`book`) |
 | ring-1c | Owner alerts on a real channel (Photon) instead of a log line, including when an agent cancels | `lib/server/notify/log-notifier.ts`, `lib/server/frontdesk/service.ts` (`cancelBooking`) |
+| ring-2 | Let agents pick the shop (by slug or URL) instead of hard-coding Hart's | `lib/server/frontdesk/mcp.ts` (`DEFAULT_SHOP_SLUG`) |
 | ring-2 | Owner sign-in replaces `OWNER_API_TOKEN`, and protects the public bookings route | `lib/server/frontdesk/owner-auth.ts`, `lib/server/frontdesk/http.ts`, the owner route files, `lib/server/frontdesk/service.ts` (`listShopBookings`) |
 | ring-2 | MCP sign-in: authenticate callers (`book` and `cancel` are open to anyone) | `app/api/mcp/route.ts` |
 | ring-2 | Verified agent identity instead of the self-reported client name | `lib/server/frontdesk/mcp.ts` (`agentNameFrom`) |

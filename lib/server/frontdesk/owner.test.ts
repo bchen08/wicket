@@ -13,6 +13,7 @@ import type {
   WeeklyHours,
 } from "../../types/frontdesk";
 import type { LifecycleAction } from "../engine/lifecycle";
+import { DepositExceedsPriceError } from "./catalog";
 import { ConfigurationError } from "./deps";
 import {
   blocksDelete,
@@ -264,6 +265,14 @@ describe("owner auth on every owner route", () => {
     const error = await apiError(policiesGet(() => memoryDeps(), request("GET", "/policies"), "nope", OPTIONS), 404, "not_found");
     expect(error.details).toEqual({ shop: "nope" });
   });
+
+  it("is 404 not_found for a shop slug containing NUL, without looking it up (Postgres text can't hold U+0000)", async () => {
+    const deps = memoryDeps();
+    const getShop = vi.spyOn(deps.catalog, "getShop");
+    const error = await apiError(policiesGet(() => deps, request("GET", "/policies"), "harts\u0000", OPTIONS), 404, "not_found");
+    expect(error.details).toEqual({ shop: "harts\u0000" });
+    expect(getShop).not.toHaveBeenCalled();
+  });
 });
 
 // ---- Policies ----
@@ -299,6 +308,16 @@ describe("GET and PUT /api/shops/[shop]/policies", () => {
     expect((await call<PoliciesResponse>(get(deps))).policies).toEqual(expected);
   });
 
+  it("keeps both of two concurrent PUTs of different fields", async () => {
+    const deps = memoryDeps();
+    const before = (await call<PoliciesResponse>(get(deps))).policies;
+    await Promise.all([
+      call<PoliciesResponse>(put(deps, { body: { paused: true } })),
+      call<PoliciesResponse>(put(deps, { body: { leadTimeMin: 60 } })),
+    ]);
+    expect((await call<PoliciesResponse>(get(deps))).policies).toEqual({ ...before, paused: true, leadTimeMin: 60 });
+  });
+
   it("accepts phone null (removes it), an empty rule and the range limits", async () => {
     const deps = memoryDeps();
     const body = await call<PoliciesResponse>(
@@ -329,16 +348,22 @@ describe("GET and PUT /api/shops/[shop]/policies", () => {
     ["phone too long", { phone: "1".repeat(41) }, "phone"],
     ["phone a number", { phone: 2125550142 }, "phone"],
     ["a rule too long", { lateCancelRule: "x".repeat(1001) }, "lateCancelRule"],
+    ["a phone with a NUL character", { phone: "+1 212\u0000555-0142" }, "phone"],
+    ["a phone of only a NUL character", { phone: "\u0000" }, "phone"],
+    ["a depositRule with a NUL character", { depositRule: "Pay\u0000" }, "depositRule"],
+    ["a lateCancelRule with a NUL character", { lateCancelRule: "\u0000" }, "lateCancelRule"],
+    ["a noShowRule with a NUL character", { noShowRule: "No\u0000shows pay." }, "noShowRule"],
     ["an unknown field", { bogus: 1 }, "bogus"],
     ["an unknown field beside a valid one", { paused: true, timezone: "UTC" }, "timezone"],
     ["no fields", {}, "body"],
     ["an array", [], "body"],
     ["null", null, "body"],
-  ])("rejects %s with 400 invalid_request and leaves the policies alone", async (_name, payload, field) => {
+  ])("rejects %s with 400 invalid_request and leaves the policies alone", async (name, payload, field) => {
     const deps = memoryDeps();
     const before = await deps.catalog.getPolicies(SHOP);
     const error = await invalid(put(deps, { body: payload }), field);
     if (field === "bogus") expect(error.message).toBe('Unknown field "bogus".');
+    if (name === "a phone with a NUL character") expect(error.message).toBe("phone can't contain the NUL character (U+0000).");
     expect(await deps.catalog.getPolicies(SHOP)).toEqual(before);
   });
 
@@ -424,6 +449,7 @@ describe("GET and PUT /api/shops/[shop]/hours", () => {
     ["a missing weekly", { staffId: "dana" }, "weekly"],
     ["weekly not a list", { staffId: "dana", weekly: { weekday: 2 } }, "weekly"],
     ["an unknown top-level field", { staffId: "dana", weekly: [], shop: "harts" }, "shop"],
+    ["a staffId with a NUL character", { staffId: "da\u0000na", weekly: [] }, "staffId"],
   ])("rejects %s with 400 invalid_request", async (_name, body, field) => {
     await invalid(put(memoryDeps(), body), field);
   });
@@ -479,8 +505,17 @@ describe("GET, POST and DELETE /api/shops/[shop]/blocks", () => {
     ["a to that isn't a date", `?to=tomorrow`, "to"],
     ["from equal to to", `?from=${encodeURIComponent("2026-12-01T00:00:00Z")}&to=${encodeURIComponent("2026-12-01T00:00:00Z")}`, "to"],
     ["from after to", `?from=${encodeURIComponent("2026-12-02T00:00:00Z")}&to=${encodeURIComponent("2026-12-01T00:00:00Z")}`, "to"],
+    ["a from in year 0000", `?from=${encodeURIComponent("0000-01-01T00:00:00Z")}`, "from"],
+    ["a from in 1999", `?from=${encodeURIComponent("1999-12-31T23:59:59Z")}`, "from"],
+    ["a to in 3000", `?to=${encodeURIComponent("3000-01-01T00:00:00Z")}`, "to"],
+    ["a to in year 9999", `?to=${encodeURIComponent("9999-12-31T00:00:00Z")}`, "to"],
   ])("rejects %s with 400 invalid_request", async (_name, query, field) => {
     await invalid(get(memoryDeps(), query), field);
+  });
+
+  it("accepts ?from=&to= at the limits: 2000-01-01T00:00:00Z and 2999-12-31T23:59:59Z", async () => {
+    const query = `?from=${encodeURIComponent("2000-01-01T00:00:00Z")}&to=${encodeURIComponent("2999-12-31T23:59:59Z")}`;
+    expect((await call<BlocksResponse>(get(memoryDeps(), query))).blocks).toEqual([]);
   });
 
   it("creates a block (201), which then shows up in GET and as busy time of kind block", async () => {
@@ -537,10 +572,22 @@ describe("GET, POST and DELETE /api/shops/[shop]/blocks", () => {
     ["a missing staffId", { start: valid.start, end: valid.end }, "staffId"],
     ["a missing start", { staffId: "dana", end: valid.end }, "start"],
     ["an unknown field", { ...valid, kind: "holiday" }, "kind"],
-  ])("rejects %s with 400 invalid_request and stores nothing", async (_name, body, field) => {
+    ["a start in year 0000", { ...valid, start: "0000-12-24T00:00:00Z" }, "start"],
+    ["a start in 1999", { ...valid, start: "1999-12-31T23:59:59Z" }, "start"],
+    ["an end in 3000", { ...valid, end: "3000-01-01T00:00:00Z" }, "end"],
+    ["a reason with a NUL character", { ...valid, reason: "Holi\u0000day" }, "reason"],
+    ["a staffId with a NUL character", { ...valid, staffId: "dana\u0000" }, "staffId"],
+  ])("rejects %s with 400 invalid_request and stores nothing", async (name, body, field) => {
     const deps = memoryDeps();
-    await invalid(post(deps, body), field);
-    expect((await call<BlocksResponse>(get(deps))).blocks).toEqual([]);
+    const error = await invalid(post(deps, body), field);
+    if (name === "an end in 3000") expect(error.message).toBe("end must be between 2000-01-01T00:00:00Z and 2999-12-31T23:59:59Z.");
+    expect(await deps.catalog.listBlocks(SHOP, { start: new Date(0), end: new Date("3001-01-01T00:00:00Z") })).toEqual([]);
+  });
+
+  it("accepts blocks at the limits: from 2000-01-01T00:00:00Z, and up to 2999-12-31T23:59:59Z", async () => {
+    const deps = memoryDeps();
+    await call<BlockResponse>(post(deps, { ...valid, start: "2000-01-01T00:00:00Z", end: "2000-01-02T00:00:00Z" }), 201);
+    await call<BlockResponse>(post(deps, { ...valid, start: "2999-12-31T00:00:00Z", end: "2999-12-31T23:59:59Z" }), 201);
   });
 
   it("accepts a block of exactly 366 days", async () => {
@@ -616,12 +663,29 @@ describe("POST /api/shops/[shop]/services and PATCH /api/shops/[shop]/services/[
     ["a price in dollars", { ...kidsCut, priceCents: 20.5 }, "priceCents"],
     ["a missing depositCents", { id: "kids-cut", name: "Kids cut", durationMin: 20, priceCents: 2000 }, "depositCents"],
     ["an unknown field", { ...kidsCut, position: 4 }, "position"],
+    ["a name with a NUL character", { ...kidsCut, name: "Kids\u0000cut" }, "name"],
+    ["an id with a NUL character", { ...kidsCut, id: "kids\u0000cut" }, "id"],
   ])("rejects %s with 400 invalid_request and adds nothing", async (name, body, field) => {
     const deps = memoryDeps();
     const error = await invalid(post(deps, body), field);
     if (name === "a duplicate id") expect(error.message).toBe('The shop already has a service with id "haircut".');
     if (name === "a deposit over the price") expect(error.message).toBe("depositCents (2001) can't be more than priceCents (2000).");
     expect((await deps.catalog.listServices(SHOP)).map((s) => s.id)).toEqual(["haircut", "beard-trim", "haircut-beard"]);
+  });
+
+  it("turns the store's deposit check into 400 invalid_request (field depositCents)", async () => {
+    const deps = memoryDeps();
+    const refusing: FrontDeskDeps = {
+      ...deps,
+      catalog: {
+        ...deps.catalog,
+        createService: async (_slug, service) => {
+          throw new DepositExceedsPriceError(service.id);
+        },
+      },
+    };
+    const error = await invalid(post(refusing, kidsCut), "depositCents");
+    expect(error.message).toBe("The deposit can't be more than the price.");
   });
 
   it("changes some fields of a service and keeps the rest", async () => {
@@ -642,6 +706,19 @@ describe("POST /api/shops/[shop]/services and PATCH /api/shops/[shop]/services/[
     await call<ServiceResponse>(patch(deps, "haircut", { priceCents: 500, depositCents: 500 }));
   });
 
+  it("never stores a deposit over the price when two PATCHes race: one 200, one 400 naming the field it sent", async () => {
+    const deps = memoryDeps();
+    // haircut: price 3500, deposit 1000. Each change passes the pre-check alone; together the deposit
+    // would be over the price, and the store refuses whichever applies second.
+    const bodies = [{ depositCents: 3000 }, { priceCents: 2000 }];
+    const responses = await Promise.all(bodies.map((b) => patch(deps, "haircut", b)));
+    expect(responses.map((r) => r.status).sort()).toEqual([200, 400]);
+    const loser = responses.findIndex((r) => r.status === 400);
+    await invalid(Promise.resolve(responses[loser]), Object.keys(bodies[loser])[0]);
+    const stored = (await deps.catalog.listServices(SHOP)).find((s) => s.id === "haircut")!;
+    expect(stored.depositCents).toBeLessThanOrEqual(stored.priceCents);
+  });
+
   it("leaves existing bookings' deposit snapshot alone", async () => {
     const deps = memoryDeps();
     const booking = await createBooking(deps, FUTURE);
@@ -655,11 +732,20 @@ describe("POST /api/shops/[shop]/services and PATCH /api/shops/[shop]/services/[
     expect(error.details).toEqual({ service_id: "perm", valid_service_ids: ["haircut", "beard-trim", "haircut-beard"] });
   });
 
+  it("is 404 not_found for a service id containing NUL, without writing", async () => {
+    const deps = memoryDeps();
+    const updateService = vi.spyOn(deps.catalog, "updateService");
+    const error = await apiError(patch(deps, "hair\u0000cut", { priceCents: 4000 }), 404, "not_found");
+    expect(error.details).toMatchObject({ service_id: "hair\u0000cut" });
+    expect(updateService).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["no fields", {}, "body"],
     ["the id", { id: "new-id" }, "id"],
     ["a durationMin out of range", { durationMin: 2 }, "durationMin"],
     ["an empty name", { name: "" }, "name"],
+    ["a name with a NUL character", { name: "Hair\u0000cut" }, "name"],
   ])("rejects a patch with %s", async (_name, body, field) => {
     await invalid(patch(memoryDeps(), "haircut", body), field);
   });
@@ -714,6 +800,8 @@ describe("GET /api/shops/[shop]/bookings/[id]", () => {
     const booking = await createBooking(deps, FUTURE);
     await apiError(detail(deps, RANDOM_UUID), 404, "booking_not_found");
     await apiError(detail(deps, "not-a-uuid"), 404, "booking_not_found");
+    await apiError(detail(deps, `${booking.id}\u0000`), 404, "booking_not_found");
+    await apiError(act(deps, `${booking.id}\u0000`, "cancel"), 404, "booking_not_found");
 
     // A second shop that exists but doesn't own the booking.
     const other = { slug: "other", name: "Other Shop", timezone: "America/New_York" };

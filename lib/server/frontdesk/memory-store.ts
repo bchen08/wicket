@@ -15,6 +15,7 @@ import {
   type NewBookingEvent,
 } from "./booking-store";
 import {
+  DepositExceedsPriceError,
   DuplicateServiceError,
   toBlockedTime,
   type BusyInterval,
@@ -26,11 +27,12 @@ import {
   type WeeklyHours,
 } from "./catalog";
 import { idempotencyConflict, nestedIdempotencyError, normalizeUuid } from "./idempotency-errors";
+import { DEFAULT_POLICIES } from "./policies";
 
 // In-memory ShopCatalog + BookingStore, seeded like supabase/seed.sql. Used by the tests and by
 // local development when DATABASE_URL is unset. Enforces the same rules as the Postgres schema
-// (the no_overlap constraint, foreign keys, the blocked_times checks) and behaves like
-// postgres-store.ts in every method. Data lives only as long as the store.
+// (the no_overlap constraint, foreign keys, the blocked_times checks, deposit <= price) and behaves
+// like postgres-store.ts in every method. Data lives only as long as the store.
 
 type StaffSeed = { id: string; shopSlug: string; name: string; weekly: WeeklyHours[] };
 
@@ -101,8 +103,8 @@ export type MemoryStoreOptions = {
   clock?: Clock;
   /** Bookings that exist before the first call. Not checked for overlaps; no events. */
   initialBookings?: InitialBooking[];
-  /** Merged over the seeded Hart's policies. For tests. */
-  policies?: Partial<Policies>;
+  /** Merged over the seeded Hart's policies. null: Hart's has no policies row. For tests. */
+  policies?: Partial<Policies> | null;
   /** Blocked times that exist before the first call. The staff member must exist. */
   initialBlocks?: NewBlock[];
 };
@@ -191,7 +193,9 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   const services = new Map(Object.entries(structuredClone(SEED.services)));
   const staff: StaffSeed[] = structuredClone(SEED.staff);
   const policies = new Map(Object.entries(structuredClone(SEED.policies)));
-  if (options.policies) {
+  if (options.policies === null) {
+    policies.delete("harts");
+  } else if (options.policies) {
     const harts = policies.get("harts");
     if (harts) policies.set("harts", { ...harts, ...defined(options.policies) });
   }
@@ -340,10 +344,13 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       return p ? { ...p } : null;
     },
 
-    async savePolicies(slug, next) {
+    async savePolicies(slug, patch) {
       if (!shopOf(slug)) throw new Error(`Unknown shop: ${slug}`); // the policies foreign key
-      policies.set(slug, pickPolicies(next));
-      return pickPolicies(next);
+      // Read, merge and write in one synchronous step (no await in this method), so concurrent calls
+      // with different fields both take effect. A shop without a row starts from the defaults.
+      const merged = pickPolicies({ ...(policies.get(slug) ?? DEFAULT_POLICIES), ...defined(patch) });
+      policies.set(slug, merged);
+      return { ...merged };
     },
 
     async replaceWeeklyHours(slug, staffId, weekly) {
@@ -375,6 +382,8 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
 
     async createService(slug, service) {
       if (!shopOf(slug)) throw new Error(`Unknown shop: ${slug}`); // the services foreign key
+      // The services_deposit_le_price check, which Postgres runs before the primary key.
+      if (service.depositCents > service.priceCents) throw new DepositExceedsPriceError(service.id);
       const list = services.get(slug) ?? [];
       if (list.some((s) => s.id === service.id)) throw new DuplicateServiceError(service.id);
       list.push(pickService(service));
@@ -383,9 +392,14 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
     },
 
     async updateService(slug, id, patch) {
+      // Check and set in one synchronous step (no await in this method), so the deposit check judges
+      // the row as it is now, including a concurrent update's result.
       const service = services.get(slug)?.find((s) => s.id === id);
       if (!service) return null;
-      Object.assign(service, pickPatch(patch));
+      const next = { ...service, ...pickPatch(patch) };
+      // The services_deposit_le_price check: refuse without changing anything.
+      if (next.depositCents > next.priceCents) throw new DepositExceedsPriceError(id);
+      Object.assign(service, next);
       return { ...service };
     },
   };

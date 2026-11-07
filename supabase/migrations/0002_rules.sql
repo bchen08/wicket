@@ -75,6 +75,12 @@ alter table bookings
   add constraint no_overlap exclude using gist (staff_id with =, during with &&)
     where (status in ('awaiting_deposit', 'confirmed'));
 
+-- ---- Services: a deposit can't exceed the price ----
+-- Enforced here, not only in the owner API, so two concurrent edits (one lowering the price, one
+-- raising the deposit) can't combine into an invalid service.
+alter table services
+  add constraint services_deposit_le_price check (deposit_cents <= price_cents);
+
 -- ---- Events: one row per state change, written in the same transaction as the change ----
 create table events (
   id         bigint      generated always as identity primary key,

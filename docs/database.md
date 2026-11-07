@@ -30,7 +30,7 @@ constraint no_overlap exclude using gist (staff_id with =, during with &&)
   where (status in ('awaiting_deposit', 'confirmed'))
 ```
 
-Two bookings that hold time (`awaiting_deposit` or `confirmed`) for the same staff member can't overlap. Cancelled, expired, completed and no-show bookings free their time. `during` is half-open (`[start, end)`), so back-to-back bookings are fine. When the constraint fires, Postgres raises SQLSTATE `23P01`, and the `book` tool returns `slot_taken`. If two overlapping inserts arrive at the same moment, Postgres can also abort one with `40P01` (deadlock). The server retries that insert, which then fails cleanly with `23P01`.
+Two bookings that hold time (`awaiting_deposit` or `confirmed`) for the same staff member can't overlap. Cancelled, expired, completed and no-show bookings free their time. `during` is half-open (`[start, end)`), so back-to-back bookings are fine. When the constraint fires, Postgres raises SQLSTATE `23P01`. The `book` tool then reads busy time again and, if another staff member is free at that exact start, tries once more with them; otherwise it returns `slot_taken`. If two overlapping inserts arrive at the same moment, Postgres can also abort one with `40P01` (deadlock). The server retries that insert, which then fails cleanly with `23P01`.
 
 Booking state changes are conditional: `UPDATE bookings … WHERE id = … AND status = <expected>`, with the event inserted in the same statement. Of two concurrent changes to one booking, only one matches; the other writes nothing.
 
@@ -78,6 +78,7 @@ To check it worked, run `select * from services;` in the SQL editor. You should 
 
 What 0002 does to existing data:
 - Existing bookings keep their status (`confirmed` and `cancelled` are still valid). Each gets `deposit_cents` from its service's current deposit.
+- `services` gets a check that `deposit_cents <= price_cents`. It's validated against existing rows, so 0002 fails if a service already has a deposit larger than its price; fix that row first.
 - The new tables start empty, so old bookings have no events.
 - 0002 can't be run twice: the second run fails because its tables already exist.
 

@@ -3,9 +3,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Policies } from "../../types/frontdesk";
 import { fixedClock } from "../clock";
 import { SlotTakenError, type BookingStore, type IdempotencyScope, type NewBooking, type NewBookingEvent } from "./booking-store";
-import { DuplicateServiceError } from "./catalog";
+import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { SEED } from "./memory-store";
+import { DEFAULT_POLICIES } from "./policies";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
 import { book, type FrontDeskDeps } from "./service";
 
@@ -387,6 +388,65 @@ if (!url) {
       expect(await store.getPolicies(shop)).toEqual(second);
     });
 
+    it("savePolicies on a shop without a row stores the column defaults plus the patch, even when two race", async () => {
+      await sql`delete from policies where shop_slug = ${shop}`;
+      // The column defaults must match DEFAULT_POLICIES.
+      expect(await store.savePolicies(shop, { phone: "+1 555-0100" })).toEqual({ ...DEFAULT_POLICIES, phone: "+1 555-0100" });
+
+      await sql`delete from policies where shop_slug = ${shop}`;
+      await Promise.all([store.savePolicies(shop, { paused: true }), store.savePolicies(shop, { leadTimeMin: 60 })]);
+      expect(await store.getPolicies(shop)).toEqual({ ...DEFAULT_POLICIES, paused: true, leadTimeMin: 60 });
+    });
+
+    it("savePolicies keeps fields that are undefined in the patch, and phone: null clears the phone", async () => {
+      await store.savePolicies(shop, { phone: "+1 555-0100", noShowRule: "" });
+      const before = (await store.getPolicies(shop))!;
+      expect(await store.savePolicies(shop, { paused: undefined, phone: undefined, noShowRule: "n" })).toEqual({
+        ...before,
+        noShowRule: "n",
+      });
+      expect(await store.savePolicies(shop, { phone: null })).toEqual({ ...before, noShowRule: "n", phone: null });
+      expect(await store.getPolicies(shop)).toEqual({ ...before, noShowRule: "n", phone: null });
+    });
+
+    it("savePolicies: concurrent patches of different fields both take effect (the row is locked from read to write)", async () => {
+      await store.savePolicies(shop, { paused: false, leadTimeMin: 120 });
+      const before = (await store.getPolicies(shop))!;
+      // Hold the row's lock until both saves are queued behind it. Without a lock between each save's
+      // read and its write, both would read this same row and the second write would undo the first.
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      let holderPid!: (pid: number) => void;
+      const pid = new Promise<number>((resolve) => (holderPid = resolve));
+      const holder = sql.begin(async (tx) => {
+        const [row] = await tx<{ pid: number }[]>`
+          select pg_backend_pid() as pid from policies where shop_slug = ${shop} for update
+        `;
+        holderPid(row.pid);
+        await released;
+      });
+      const holding = await pid;
+      const saves = Promise.all([store.savePolicies(shop, { paused: true }), store.savePolicies(shop, { leadTimeMin: 60 })]);
+      // Wait until both are blocked, directly or behind each other, by the holder.
+      for (let waited = 0; ; waited += 20) {
+        const [{ n }] = await sql<{ n: number }[]>`
+          with recursive waiting (pid) as (
+            select pid from pg_stat_activity where ${holding}::int = any(pg_blocking_pids(pid))
+            union
+            select a.pid from pg_stat_activity a join waiting w on w.pid = any(pg_blocking_pids(a.pid))
+          )
+          select count(*)::int as n from waiting
+        `;
+        if (n >= 2) break;
+        if (waited > 5000) throw new Error(`Only ${n} of the two saves queued behind the lock.`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      release();
+      await holder;
+      await saves;
+      expect(await store.getPolicies(shop)).toEqual({ ...before, paused: true, leadTimeMin: 60 });
+    });
+
     it("creates services at the end of the list and patches only the given fields", async () => {
       const shave = { id: "shave", name: "Shave", durationMin: 20, priceCents: 2000, depositCents: 0 };
       const color = { id: "color", name: "Color", durationMin: 90, priceCents: 9000, depositCents: 2000 };
@@ -407,6 +467,33 @@ if (!url) {
       });
       expect(await store.updateService(shop, "perm", { priceCents: 1 })).toBeNull();
       expect(await store.updateService(shop, "haircut", { priceCents: 1 })).toBeNull(); // Hart's service
+    });
+
+    it("refuses a deposit larger than the price (services_deposit_le_price), even from two concurrent edits", async () => {
+      const race = { id: "deposit-race", name: "Deposit race", durationMin: 30, priceCents: 3500, depositCents: 1000 };
+      expect(await store.createService(shop, race)).toEqual(race);
+      // Each patch is fine against the stored row; together they'd leave a 3000 deposit on a 2000 price.
+      const results = await Promise.allSettled([
+        store.updateService(shop, race.id, { depositCents: 3000 }),
+        store.updateService(shop, race.id, { priceCents: 2000 }),
+      ]);
+      const fulfilled = results.filter((r) => r.status === "fulfilled");
+      expect(fulfilled).toHaveLength(1);
+      const rejected = results.filter((r) => r.status === "rejected");
+      expect(rejected).toHaveLength(1);
+      const reason = (rejected[0] as PromiseRejectedResult).reason;
+      expect(reason).toBeInstanceOf(DepositExceedsPriceError);
+      expect((reason as DepositExceedsPriceError).serviceId).toBe(race.id);
+      const stored = (await store.listServices(shop)).find((s) => s.id === race.id)!;
+      expect(stored.depositCents).toBeLessThanOrEqual(stored.priceCents);
+      expect(stored).toEqual((fulfilled[0] as PromiseFulfilledResult<unknown>).value);
+
+      const err = await store
+        .createService(shop, { id: "too-much", name: "Too much", durationMin: 20, priceCents: 2000, depositCents: 2001 })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(DepositExceedsPriceError);
+      expect((err as DepositExceedsPriceError).serviceId).toBe("too-much");
+      expect((await store.listServices(shop)).map((s) => s.id)).not.toContain("too-much");
     });
 
     it("replaces a staff member's whole week, and refuses staff outside the shop", async () => {

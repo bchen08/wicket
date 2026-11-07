@@ -9,9 +9,10 @@ import {
   type NewBooking,
   type NewBookingEvent,
 } from "./booking-store";
-import { DuplicateServiceError } from "./catalog";
+import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { createMemoryStore, SEED, type InitialBooking } from "./memory-store";
+import { DEFAULT_POLICIES } from "./policies";
 import { NOW } from "./test-support";
 
 // The in-memory ShopCatalog + BookingStore. postgres-store.test.ts checks the same behaviours
@@ -458,6 +459,33 @@ describe("owner writes", () => {
     await expect(store.savePolicies("nope", next)).rejects.toThrow();
   });
 
+  it("savePolicies merges a patch: concurrent patches of different fields both take effect", async () => {
+    const store = createMemoryStore();
+    await Promise.all([store.savePolicies("harts", { paused: true }), store.savePolicies("harts", { leadTimeMin: 60 })]);
+    expect(await store.getPolicies("harts")).toEqual({ ...SEED.policies.harts, paused: true, leadTimeMin: 60 });
+  });
+
+  it("savePolicies keeps fields that are undefined in the patch, and phone: null clears the phone", async () => {
+    const store = createMemoryStore();
+    expect(await store.savePolicies("harts", { paused: undefined, phone: undefined, noShowRule: "n" })).toEqual({
+      ...SEED.policies.harts,
+      noShowRule: "n",
+    });
+    expect(await store.savePolicies("harts", { phone: null })).toEqual({ ...SEED.policies.harts, noShowRule: "n", phone: null });
+    expect(await store.getPolicies("harts")).toEqual({ ...SEED.policies.harts, noShowRule: "n", phone: null });
+  });
+
+  it("savePolicies on a shop without a row stores the defaults plus the patch", async () => {
+    const store = createMemoryStore({ policies: null });
+    expect(await store.getPolicies("harts")).toBeNull();
+    expect(await store.savePolicies("harts", { paused: true, phone: "+1 555-0100" })).toEqual({
+      ...DEFAULT_POLICIES,
+      paused: true,
+      phone: "+1 555-0100",
+    });
+    expect(await store.getPolicies("harts")).toEqual({ ...DEFAULT_POLICIES, paused: true, phone: "+1 555-0100" });
+  });
+
   it("creates services at the end of the list and patches only the given fields", async () => {
     const store = createMemoryStore();
     const shave = { id: "shave", name: "Shave", durationMin: 20, priceCents: 2000, depositCents: 500 };
@@ -472,6 +500,31 @@ describe("owner writes", () => {
     expect((await store.listServices("harts")).find((s) => s.id === "shave")).toEqual({ ...shave, priceCents: 2500 });
     expect(await store.updateService("harts", "perm", { priceCents: 1 })).toBeNull();
     expect(await store.updateService("nope", "shave", { priceCents: 1 })).toBeNull();
+  });
+
+  it("refuses a deposit larger than the price, judged against the row as it is when the update applies", async () => {
+    const store = createMemoryStore();
+    const haircut = SEED.services.harts[0]; // 3500 price, 1000 deposit
+    // Each patch is fine against the seeded row; together they'd leave a 3000 deposit on a 2000 price.
+    const results = await Promise.allSettled([
+      store.updateService("harts", "haircut", { depositCents: 3000 }),
+      store.updateService("harts", "haircut", { priceCents: 2000 }),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(rejected).toHaveLength(1);
+    const reason = (rejected[0] as PromiseRejectedResult).reason;
+    expect(reason).toBeInstanceOf(DepositExceedsPriceError);
+    expect((reason as DepositExceedsPriceError).serviceId).toBe("haircut");
+    const stored = (await store.listServices("harts")).find((s) => s.id === "haircut")!;
+    expect(stored.depositCents).toBeLessThanOrEqual(stored.priceCents);
+    expect(stored).toEqual({ ...haircut, depositCents: 3000 }); // the first one applied, the second changed nothing
+
+    const err = await store
+      .createService("harts", { id: "shave", name: "Shave", durationMin: 20, priceCents: 2000, depositCents: 2001 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DepositExceedsPriceError);
+    expect((await store.listServices("harts")).map((s) => s.id)).toEqual(["haircut", "beard-trim", "haircut-beard"]);
   });
 
   it("replaces a staff member's whole week, sorted, and refuses staff outside the shop", async () => {

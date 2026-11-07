@@ -12,6 +12,7 @@ import {
   type NewBooking,
 } from "./booking-store";
 import {
+  DepositExceedsPriceError,
   DuplicateServiceError,
   toBlockedTime,
   type BusyInterval,
@@ -29,6 +30,8 @@ import { idempotencyConflict, nestedIdempotencyError, normalizeUuid } from "./id
 const EXCLUSION_VIOLATION = "23P01";
 /** SQLSTATE unique_violation: e.g. a services primary key clash. */
 const UNIQUE_VIOLATION = "23505";
+/** SQLSTATE check_violation. See depositError. */
+const CHECK_VIOLATION = "23514";
 /** SQLSTATE deadlock_detected. See createBooking. */
 const DEADLOCK_DETECTED = "40P01";
 /** Tries per createBooking when inserts deadlock. */
@@ -143,6 +146,20 @@ type PoliciesRow = {
   late_cancel_rule: string;
   no_show_rule: string;
 };
+
+/** `patch` without its undefined fields, so spreading it never overwrites a value with undefined. */
+function defined<T extends object>(patch: T): Partial<T> {
+  return Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+/** DepositExceedsPriceError if `err` is the services_deposit_le_price check firing, else null. */
+function depositError(err: unknown, serviceId: string): DepositExceedsPriceError | null {
+  return err instanceof postgres.PostgresError &&
+    err.code === CHECK_VIOLATION &&
+    err.constraint_name === "services_deposit_le_price"
+    ? new DepositExceedsPriceError(serviceId)
+    : null;
+}
 
 function toPolicies(r: PoliciesRow): Policies {
   return {
@@ -432,30 +449,37 @@ function catalogOn(conn: Conn): ShopCatalog {
       return rows[0] ? toPolicies(rows[0]) : null;
     },
 
-    async savePolicies(slug, p) {
-      const rows = await sql<PoliciesRow[]>`
-        insert into policies (
-          shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone,
-          deposit_rule, late_cancel_rule, no_show_rule
-        ) values (
-          ${slug}, ${p.leadTimeMin}, ${p.horizonDays}, ${p.depositHorizonDays}, ${p.cancelWindowHours}, ${p.paused},
-          ${p.phone}, ${p.depositRule}, ${p.lateCancelRule}, ${p.noShowRule}
-        )
-        on conflict (shop_slug) do update set
-          lead_time_min = excluded.lead_time_min,
-          horizon_days = excluded.horizon_days,
-          deposit_horizon_days = excluded.deposit_horizon_days,
-          cancel_window_hours = excluded.cancel_window_hours,
-          paused = excluded.paused,
-          phone = excluded.phone,
-          deposit_rule = excluded.deposit_rule,
-          late_cancel_rule = excluded.late_cancel_rule,
-          no_show_rule = excluded.no_show_rule,
-          updated_at = now()
-        returning ${policyColumns(sql)}
-      `;
-      if (!rows[0]) throw new Error("Upsert into policies returned no row.");
-      return toPolicies(rows[0]);
+    async savePolicies(slug, patch) {
+      const save = async (tx: postgres.TransactionSql) => {
+        // A shop without a row gets one with the column defaults. Then the row is locked from the read
+        // to the write, so a concurrent savePolicies waits here and merges onto this one's result.
+        await tx`insert into policies (shop_slug) values (${slug}) on conflict (shop_slug) do nothing`;
+        const [stored] = await tx<PoliciesRow[]>`
+          select ${policyColumns(tx)} from policies where shop_slug = ${slug} for update
+        `;
+        if (!stored) throw new Error("Select from policies returned no row.");
+        // Absent or undefined fields keep their stored values; phone: null clears the phone.
+        const p: Policies = { ...toPolicies(stored), ...defined(patch) };
+        const rows = await tx<PoliciesRow[]>`
+          update policies set
+            lead_time_min = ${p.leadTimeMin},
+            horizon_days = ${p.horizonDays},
+            deposit_horizon_days = ${p.depositHorizonDays},
+            cancel_window_hours = ${p.cancelWindowHours},
+            paused = ${p.paused},
+            phone = ${p.phone},
+            deposit_rule = ${p.depositRule},
+            late_cancel_rule = ${p.lateCancelRule},
+            no_show_rule = ${p.noShowRule},
+            updated_at = now()
+          where shop_slug = ${slug}
+          returning ${policyColumns(tx)}
+        `;
+        if (!rows[0]) throw new Error("Update of policies returned no row.");
+        return toPolicies(rows[0]);
+      };
+      // Atomic either way: its own transaction on the root client, a savepoint inside one.
+      return conn.kind === "root" ? conn.sql.begin(save) : conn.sql.savepoint(save);
     },
 
     async replaceWeeklyHours(slug, staffId, weekly) {
@@ -534,22 +558,28 @@ function catalogOn(conn: Conn): ShopCatalog {
         if (err instanceof postgres.PostgresError && err.code === UNIQUE_VIOLATION) {
           throw new DuplicateServiceError(service.id);
         }
-        throw err;
+        throw depositError(err, service.id) ?? err;
       }
     },
 
     async updateService(slug, id, patch) {
-      // Only the given fields change; a missing (or undefined) field keeps its value.
-      const rows = await sql<ServiceRow[]>`
-        update services set
-          name = coalesce(${patch.name ?? null}::text, name),
-          duration_min = coalesce(${patch.durationMin ?? null}::integer, duration_min),
-          price_cents = coalesce(${patch.priceCents ?? null}::integer, price_cents),
-          deposit_cents = coalesce(${patch.depositCents ?? null}::integer, deposit_cents)
-        where shop_slug = ${slug} and id = ${id}
-        returning id, name, duration_min, price_cents, deposit_cents
-      `;
-      return rows[0] ? toService(rows[0]) : null;
+      // Only the given fields change; a missing (or undefined) field keeps its value. The SET reads the
+      // row as it is when the update applies (a concurrent update's result, after its row lock), and
+      // the services_deposit_le_price check judges that merged row.
+      try {
+        const rows = await sql<ServiceRow[]>`
+          update services set
+            name = coalesce(${patch.name ?? null}::text, name),
+            duration_min = coalesce(${patch.durationMin ?? null}::integer, duration_min),
+            price_cents = coalesce(${patch.priceCents ?? null}::integer, price_cents),
+            deposit_cents = coalesce(${patch.depositCents ?? null}::integer, deposit_cents)
+          where shop_slug = ${slug} and id = ${id}
+          returning id, name, duration_min, price_cents, deposit_cents
+        `;
+        return rows[0] ? toService(rows[0]) : null;
+      } catch (err) {
+        throw depositError(err, id) ?? err;
+      }
     },
   };
 }
