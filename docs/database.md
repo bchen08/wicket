@@ -27,9 +27,11 @@ Two confirmed bookings for the same staff member can't overlap. `during` is half
 
 ## Set up a Supabase project
 
-### 1. Apply the migration, then the seed
+### 1. Apply the migrations, then the seed
 
-**Option A: Supabase SQL editor.** In the Supabase dashboard, open **SQL Editor**. Paste the whole of `supabase/migrations/0001_skeleton.sql` and click **Run**. Then do the same with `supabase/seed.sql`.
+**Don't paste migrations into the SQL editor.** Supabase keeps a migration history in `supabase_migrations.schema_migrations` and runs only the files missing from it. A migration run by hand isn't recorded, so the next deploy runs it again and fails, for example with `relation "shops" already exists`. Apply migrations one of these two ways, which both record them:
+
+**Option A: the GitHub integration (how this project is set up).** In the Supabase dashboard, **Branching → GitHub connection** links the repository, with `main` as the production branch. Every push to `main` applies the files in `supabase/migrations/` that aren't recorded yet. To run it without a new commit, open **Branches**, then the **⋯** menu on `main`, and choose **Resync branch**.
 
 **Option B: Supabase CLI.**
 
@@ -39,13 +41,34 @@ supabase link --project-ref <project-ref>
 supabase db push
 ```
 
-`db push` applies the migrations in `supabase/migrations/` that the project hasn't run yet. It doesn't load the seed. Load it from the SQL editor (Option A), or with `psql`:
+`db push` applies and records the migrations the project hasn't run yet.
+
+**Then load the seed by hand.** Neither option loads it on production; the integration's log says "Skipping seed data for protected branch". Run `supabase/seed.sql` once in the **SQL Editor**. It's safe to run again. You can also use `psql`:
 
 ```bash
 psql "<direct or session connection string>" -f supabase/seed.sql
 ```
 
-To check it worked, run `select * from services;` in the SQL editor. You should see three rows.
+To check it worked, run these in the SQL editor:
+- `select * from services;` should return three rows.
+- `select version from supabase_migrations.schema_migrations;` should list every file in `supabase/migrations/`.
+
+#### If a migration was applied by hand
+
+Record it as applied, or the next deploy runs it again and fails. With the CLI, after `supabase link`:
+
+```bash
+supabase migration repair --status applied 0001
+```
+
+Or in the SQL editor:
+
+```sql
+insert into supabase_migrations.schema_migrations (version, name, statements)
+values ('0001', 'skeleton', '{}');
+```
+
+The version is the number before the first `_` in the file name. The name is the rest, without `.sql`. Then re-run the failed deploy with **Resync branch** (Option A). Its log should say "All migrations are up to date."
 
 ### 2. Get the connection string: use the transaction pooler
 
@@ -82,7 +105,7 @@ The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/dep
 
 ## Running the Postgres tests
 
-`pnpm test` uses the in-memory store. To also run the overlap and race tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with the migration and seed applied:
+`pnpm test` uses the in-memory store. To also run the overlap and race tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with the migrations and seed applied:
 
 ```bash
 DATABASE_URL_TEST=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm test
@@ -94,10 +117,34 @@ A throwaway local database with Docker:
 
 ```bash
 docker run -d --rm --name frontdesk-pg -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:5432:5432 postgres:17-alpine
-docker exec -i frontdesk-pg psql -U postgres < supabase/migrations/0001_skeleton.sql
-docker exec -i frontdesk-pg psql -U postgres < supabase/seed.sql
+```
+
+Then apply every migration in order, followed by the seed:
+
+```bash
+for f in supabase/migrations/*.sql supabase/seed.sql; do docker exec -i frontdesk-pg psql -U postgres -v ON_ERROR_STOP=1 < "$f" || break; done
 ```
 
 ## Changing the schema
 
-Add a new numbered file, for example `supabase/migrations/0002_<what>.sql`. Never edit a migration that has already been applied to a shared database. If you change the demo data, update `SEED` in [`lib/server/frontdesk/memory-store.ts`](../lib/server/frontdesk/memory-store.ts) to match `supabase/seed.sql`.
+Every schema change is a new migration file in an ordinary PR. The GitHub integration applies it to production when the PR merges to `main`.
+
+1. **Add the next numbered file,** for example `supabase/migrations/0002_add_cancelled_at.sql`, containing only the change:
+
+   ```sql
+   alter table bookings add column cancelled_at timestamptz;
+   ```
+
+   Keep the `0001`, `0002`, … numbering. Supabase applies files in version order. `supabase migration new` names files with a timestamp (`20261108120000_x.sql`), which sorts after every numbered file, so a later `0003` would be refused as out of order.
+2. **Never edit a migration that has been merged.** Production has already run it. To fix one, add another, such as `0003_fix_…`.
+3. **Test it locally:** apply every migration and the seed to a throwaway Postgres, then run the Postgres tests. See [Running the Postgres tests](#running-the-postgres-tests).
+4. **Open a PR.** The **Supabase Preview** check is skipped on PRs unless preview branches are enabled in Supabase, so nothing touches the database before merge.
+5. **Merge.** On the push to `main`, the integration applies the new file to production and records it. To confirm, check that the **Supabase Preview** check on the merge commit is green, or look at **Branches → main → View Logs** in Supabase.
+
+**Keep each migration compatible with the code that's already deployed.** On merge, Vercel deploys the new code while Supabase applies the migration, in no guaranteed order. Only add things the current code tolerates: new tables, nullable columns or columns with a default, constraints its writes already meet. Rename or drop something in a later PR, once no deployed code uses it.
+
+**Never apply a migration in the SQL editor.** It bypasses the migration history; see [If a migration was applied by hand](#if-a-migration-was-applied-by-hand).
+
+**Demo data:** the seed doesn't run on production. If you change `supabase/seed.sql`, run it once in the SQL editor after merging; it's safe to run again. Also update `SEED` in [`lib/server/frontdesk/memory-store.ts`](../lib/server/frontdesk/memory-store.ts) to match.
+
+**Agents:** `supabase/**` isn't in Claude Code's default ownership area in AGENTS.md. An issue that needs a migration must authorize it, as #6 did.
