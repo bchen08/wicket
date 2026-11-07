@@ -20,7 +20,6 @@ A plain `curl` gets a 302 to the login page, which is not a failure.
 6. `/api/shops/nope/services` returns 404 with `{"error":{"code":"not_found",…}}`, not a 500 or an HTML page.
 7. `/api/mcp` answers a plain browser visit (`GET`) with 405. That's expected: the MCP route only takes `POST`. A 404 or 500 means the route is broken.
 
-Don't book on production as a smoke check: there's no cancel tool yet, so every test booking stays in the real database.
-The full booking loop (`book`, then the same slot again → `slot_taken`) is for the verifier on previews; see `docs/frontdesk-api.md`.
+Never book on production. The booking loop (`book`, then the same slot again → `slot_taken`) runs only on a preview whose `/api/shops/harts/services` shows "Hart's Barbers (preview)". Otherwise skip it; see `docs/VERIFIER.md` → Writes on previews.
 
 Add a line here whenever a feature ships that must never break. Keep each one a quick pass/fail check on a URL.
