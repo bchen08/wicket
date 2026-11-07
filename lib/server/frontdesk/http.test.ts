@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ApiError, BookingsResponse, ServicesResponse } from "../../types/frontdesk";
+import type { ApiError, ApiErrorCode, BookingsResponse, ServicesResponse } from "../../types/frontdesk";
 import { ConfigurationError } from "./deps";
-import { bookingsResponse, servicesResponse } from "./http";
+import { FrontDeskError } from "./errors";
+import { bookingsResponse, errorResponse, servicesResponse, STATUS } from "./http";
 import type { InitialBooking } from "./memory-store";
 import { memoryDeps } from "./test-support";
 
-// The handlers behind GET /api/shops/[shop]/services and /bookings. The route files only add
-// `await connection()` and read the [shop] param. "Now" is Sat 7 Nov 2026, noon in New York.
+// The handlers behind the public GET /api/shops/[shop]/services and /bookings (no token), and the
+// error-code → status mapping every /api/shops/* route shares. The owner routes are in owner.test.ts.
+// The route files only add `await connection()` and read the [shop] param.
+// "Now" is Mon 9 Nov 2026, noon in New York: the bookings window is 2 Nov 12:00 → 9 Dec 12:00.
 
 const booking = (start: string, end: string, extra: Partial<InitialBooking> = {}): InitialBooking => ({
   shopSlug: "harts",
@@ -50,8 +53,8 @@ describe("GET /api/shops/[shop]/bookings", () => {
         booking("2026-11-20T15:00:00-05:00", "2026-11-20T15:30:00-05:00"),
         booking("2026-11-03T10:00:00-05:00", "2026-11-03T10:30:00-05:00", { status: "cancelled" }),
         booking("2026-11-14T09:00:00-05:00", "2026-11-14T09:30:00-05:00"),
-        booking("2026-10-30T10:00:00-04:00", "2026-10-30T10:30:00-04:00"), // 8 days ago: too old
-        booking("2026-12-08T10:00:00-05:00", "2026-12-08T10:30:00-05:00"), // 31 days ahead: too far
+        booking("2026-11-02T10:00:00-05:00", "2026-11-02T10:30:00-05:00"), // 7 days and 2 hours ago: too old
+        booking("2026-12-10T10:00:00-05:00", "2026-12-10T10:30:00-05:00"), // 31 days ahead: too far
       ],
     });
 
@@ -94,5 +97,38 @@ describe("GET /api/shops/[shop]/bookings", () => {
     const body = (await res.json()) as ApiError;
     expect(body.error.code).toBe("internal");
     expect(JSON.stringify(body)).not.toContain("DATABASE_URL");
+  });
+});
+
+describe("error status mapping", () => {
+  it.each<[ApiErrorCode, number]>([
+    ["invalid_request", 400],
+    ["unauthorized", 401],
+    ["not_found", 404],
+    ["booking_not_found", 404],
+    ["slot_taken", 409],
+    ["paused", 409],
+    ["not_cancellable", 409],
+    ["idempotency_conflict", 409],
+    ["outside_hours", 422],
+    ["too_soon", 422],
+    ["too_far", 422],
+  ])("%s → %i with the ApiError envelope", async (code, status) => {
+    expect(STATUS[code]).toBe(status);
+    const res = errorResponse(new FrontDeskError(code, "Something specific went wrong.", "Do the specific thing.", { x: 1 }));
+    expect(res.status).toBe(status);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({
+      error: { code, message: "Something specific went wrong.", next_action: "Do the specific thing.", details: { x: 1 } },
+    });
+  });
+
+  it("maps an unexpected error to 500 internal without leaking it", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = errorResponse(new Error("secret stack detail"));
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as ApiError;
+    expect(body.error.code).toBe("internal");
+    expect(JSON.stringify(body)).not.toContain("secret");
   });
 });
