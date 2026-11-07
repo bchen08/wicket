@@ -1,7 +1,8 @@
 // Shared fixtures for Front Desk tests. Not imported by app code.
-import type { Booking } from "../../types/frontdesk";
+import type { Booking, Policies } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
 import type { Notifier } from "../notify/notifier";
+import type { NewBlock } from "./catalog";
 import { createMemoryStore, type InitialBooking } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
 
@@ -49,11 +50,25 @@ export function recordingNotifier(): Notifier & { alerts: Booking[] } {
   };
 }
 
-/** Deps backed by a fresh in-memory store and a fixed clock. */
+/**
+ * Deps backed by a fresh in-memory store and a fixed clock. `policies` is merged over Hart's seeded
+ * policies; `initialBookings` and `initialBlocks` exist before the first call.
+ */
 export function memoryDeps(
-  options: { clock?: Clock; notifier?: Notifier; initialBookings?: InitialBooking[] } = {},
+  options: {
+    clock?: Clock;
+    notifier?: Notifier;
+    initialBookings?: InitialBooking[];
+    policies?: Partial<Policies>;
+    initialBlocks?: NewBlock[];
+  } = {},
 ): FrontDeskDeps {
   const clock = options.clock ?? fixedClock(NOW);
-  const store = createMemoryStore({ clock, initialBookings: options.initialBookings });
+  const store = createMemoryStore({
+    clock,
+    initialBookings: options.initialBookings,
+    policies: options.policies,
+    initialBlocks: options.initialBlocks,
+  });
   return { clock, catalog: store, store, notifier: options.notifier ?? recordingNotifier() };
 }
