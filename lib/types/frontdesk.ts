@@ -1,4 +1,4 @@
-// Shared contract for Front Desk: the MCP tools at /api/mcp (and, later, the UI).
+// Shared contract for Front Desk: the MCP tools at /api/mcp and the /api/shops/* routes the UI reads.
 // The UI must import these types instead of describing the shape itself.
 // Money is always an integer number of cents. Instants are RFC 3339 strings with an offset.
 
@@ -37,7 +37,13 @@ export type Slot = {
   display: string;
 };
 
-export type ApiErrorCode = "invalid_request" | "not_found" | "internal";
+/**
+ * - `invalid_request`: the arguments are wrong; fix them as next_action says.
+ * - `not_found`: no such shop or service.
+ * - `slot_taken`: someone else booked that time first; pick another start.
+ * - `internal`: our fault; retry once.
+ */
+export type ApiErrorCode = "invalid_request" | "not_found" | "slot_taken" | "internal";
 
 /** Error envelope returned by every Front Desk API surface. */
 export type ApiError = {
@@ -81,4 +87,75 @@ export type GetAvailabilityResult = {
   slots: Slot[];
   /** true if more slots exist in the window than were returned. */
   truncated: boolean;
+};
+
+// ---- Bookings ----
+
+/**
+ * Where a booking stands. Ring 0 only creates "confirmed" bookings; "cancelled" frees the slot.
+ * Ring 1 adds "awaiting_deposit", "expired", "completed" and "no_show".
+ */
+export type BookingStatus = "confirmed" | "cancelled";
+
+/** An appointment on a shop's calendar. */
+export type Booking = {
+  /** UUID. */
+  id: string;
+  shopSlug: string;
+  /** A Service.id. */
+  serviceId: string;
+  /** The service's name, e.g. "Haircut". */
+  serviceName: string;
+  /** Staff member taking the appointment. */
+  staffId: string;
+  /** RFC 3339 with the shop's offset, e.g. "2026-11-14T14:30:00-05:00". */
+  start: string;
+  /** RFC 3339 with the shop's offset; start + the service's duration. */
+  end: string;
+  /** Human-readable start in the shop's time zone, like Slot.display: "Sat 14 Nov, 2:30 pm EST". */
+  display: string;
+  status: BookingStatus;
+  customer: {
+    /** The name the agent gave for the customer. Not verified. */
+    displayName: string;
+    /** Always false in Ring 0: nobody has proven who the customer is. */
+    verified: false;
+  };
+  agent: {
+    /** Best-effort label for the AI agent that booked, e.g. the MCP client's name. Unverified in Ring 0. */
+    name: string;
+  };
+  /** Deposit the service requires, in integer cents. NOT collected in Ring 0. 0 = no deposit. */
+  depositCents: number;
+  /** When the booking was made, RFC 3339. */
+  createdAt: string;
+};
+
+/** Input of the `book` tool. */
+export type BookInput = {
+  /** A Service.id from list_services. */
+  service_id: string;
+  /** A Slot.start returned by get_availability. RFC 3339 with offset. */
+  start: string;
+  /** Who the booking is for, 1–80 characters after trimming. */
+  customer_name: string;
+};
+
+/** structuredContent of a successful `book` call. */
+export type BookResult = {
+  booking: Booking;
+};
+
+// ---- HTTP routes for the UI ----
+
+/** GET /api/shops/[shop]/services */
+export type ServicesResponse = {
+  shop: Shop;
+  services: Service[];
+};
+
+/** GET /api/shops/[shop]/bookings. Bookings from 7 days ago to 30 days ahead, any status, sorted by start. */
+export type BookingsResponse = {
+  shop: Shop;
+  bookings: Booking[];
 };

@@ -1,7 +1,7 @@
 import type { Service, Shop } from "../../types/frontdesk";
 
-// Data access for shops. Callers depend only on this interface, so the hard-coded
-// implementation can be swapped for Postgres without touching them.
+// Data access for shops. Callers depend only on this interface. Implementations:
+// postgres-store.ts (production) and memory-store.ts (tests, local dev without a database).
 
 /** A half-open span of time [start, end). */
 export type TimeRange = {
@@ -19,9 +19,11 @@ export type WeeklyHours = {
   close: string;
 };
 
-/** When a staff member normally works. */
+/** When a staff member normally works. A break (e.g. lunch) is a gap between two windows on the same day. */
 export type StaffHours = {
   staffId: string;
+  /** Display name, e.g. "Dana". Used in booking confirmations; falls back to staffId. */
+  staffName?: string;
   weekly: WeeklyHours[];
 };
 
@@ -39,6 +41,6 @@ export interface ShopCatalog {
   listServices(slug: string): Promise<Service[]>;
   /** Regular weekly hours for each staff member. Empty if the shop doesn't exist. */
   getStaffHours(slug: string): Promise<StaffHours[]>;
-  /** Busy intervals that overlap `range` (half-open on both sides). */
+  /** Busy intervals (confirmed bookings) that overlap `range` (half-open on both sides). */
   getBusyIntervals(slug: string, range: TimeRange): Promise<BusyInterval[]>;
 }

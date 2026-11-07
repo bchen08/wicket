@@ -1,20 +1,35 @@
 import type {
+  BookInput,
+  BookingsResponse,
+  BookResult,
   GetAvailabilityInput,
   GetAvailabilityResult,
   ListServicesResult,
+  Service,
+  Shop,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
-import { computeAvailability, validateRequest } from "../engine/availability";
+import {
+  computeAvailability,
+  MAX_LIMIT,
+  validateRequest,
+  type AvailabilityInput,
+} from "../engine/availability";
+import type { Notifier } from "../notify/notifier";
+import { SlotTakenError, type BookingStore } from "./booking-store";
 import type { ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { parseRfc3339 } from "./time";
 
-// Transport-agnostic use cases behind the MCP tools. They take their dependencies as
-// arguments so tests can pass a fixed clock and the next slice can pass a Postgres catalog.
+// Transport-agnostic use cases behind the MCP tools and the UI routes. They take their
+// dependencies as arguments so tests can pass a fixed clock and the in-memory store.
+// Production wiring lives in deps.ts.
 
 export type FrontDeskDeps = {
   catalog: ShopCatalog;
   clock: Clock;
+  store: BookingStore;
+  notifier: Notifier;
 };
 
 function shopNotFound(slug: string): FrontDeskError {
@@ -124,15 +139,27 @@ export async function getAvailability(
     );
   }
 
+  const { result } = await findSlots(deps, shop, service, { from, to, limit: input.limit });
+  return result;
+}
+
+/** Run the engine for one service over [from, to). Also returns the staff hours it used. */
+async function findSlots(
+  deps: FrontDeskDeps,
+  shop: Shop,
+  service: Service,
+  window: { from: Date; to: Date; limit?: number },
+) {
+  const { from, to, limit } = window;
   // A slot may start just before `to` and run past it, so fetch busy time up to
   // to + duration; otherwise a booking right after the window could be missed.
   const busyUntil = new Date(to.getTime() + service.durationMin * 60_000);
   const [staffHours, busy] = await Promise.all([
-    deps.catalog.getStaffHours(shopSlug),
-    deps.catalog.getBusyIntervals(shopSlug, { start: from, end: busyUntil }),
+    deps.catalog.getStaffHours(shop.slug),
+    deps.catalog.getBusyIntervals(shop.slug, { start: from, end: busyUntil }),
   ]);
 
-  return computeAvailability({
+  const input: AvailabilityInput = {
     timezone: shop.timezone,
     durationMin: service.durationMin,
     staffHours,
@@ -140,6 +167,198 @@ export async function getAvailability(
     from,
     to,
     now: deps.clock.now(),
-    limit: input.limit,
+    limit,
+  };
+  return { result: computeAvailability(input), staffHours, input };
+}
+
+// ---- Booking ----
+
+/** Longest customer_name accepted, after trimming. Matches the bookings.customer_name check. */
+export const MAX_CUSTOMER_NAME = 80;
+/** Longest agent label stored. Longer client names are cut. */
+const MAX_AGENT_NAME = 80;
+export const UNKNOWN_AGENT = "unknown agent";
+
+/**
+ * Check raw `book` tool arguments (any JSON) and narrow them to BookInput, in the same style as
+ * parseGetAvailabilityArgs: missing fields and wrong JSON types become invalid_request errors.
+ * customer_name is returned trimmed.
+ */
+export function parseBookArgs(raw: unknown): BookInput {
+  const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const { service_id, start, customer_name } = args;
+
+  if (typeof service_id !== "string" || service_id.trim() === "") {
+    throw invalidField(
+      "service_id",
+      "service_id is required and must be a non-empty string.",
+      'Call list_services and pass one of its service ids, e.g. "haircut".',
+      service_id,
+    );
+  }
+  if (typeof start !== "string") {
+    throw invalidField(
+      "start",
+      "start is required and must be an RFC 3339 date-time string.",
+      "Call get_availability and pass one of the returned slot starts exactly, e.g. 2026-11-14T14:30:00-05:00.",
+      start,
+    );
+  }
+  const name = typeof customer_name === "string" ? customer_name.trim() : "";
+  if (name.length < 1 || name.length > MAX_CUSTOMER_NAME) {
+    throw invalidField(
+      "customer_name",
+      `customer_name is required and must be 1–${MAX_CUSTOMER_NAME} characters after trimming spaces.`,
+      `Ask the user what name the booking should be under (at most ${MAX_CUSTOMER_NAME} characters), then retry with it as customer_name.`,
+      customer_name,
+    );
+  }
+
+  return { service_id, start, customer_name: name };
+}
+
+/** What book() hands back: the contract's BookResult, plus the staff name for the text summary. */
+export type BookOutcome = BookResult & { staffName: string };
+
+/**
+ * Book `input.start` for `input.service_id`, immediately and confirmed.
+ *
+ * 1. Validate the input.
+ * 2. Recompute availability over [start, start + duration) with the current clock and require
+ *    `start` to be one of the returned slots. The staff member comes from the matching slot.
+ *    Off-grid, out-of-hours and past starts are invalid_request. A start that is only blocked by
+ *    an existing booking is slot_taken, so booking the same slot twice says "taken" either way.
+ * 3. Store it. If another booking got there first (SlotTakenError, i.e. the database's
+ *    no_overlap constraint), fail with slot_taken. The database is the final word even when
+ *    step 2 passed.
+ * 4. Alert the owner. A failing notifier is logged and never fails the booking.
+ *
+ * TODO(ring-1): deposits. Booking.depositCents shows what the service requires; nothing is collected.
+ * TODO(ring-1): idempotency keys, so an agent can safely retry a book call that timed out.
+ * TODO(ring-2): verified customer identity. customer.verified is always false.
+ */
+export async function book(
+  deps: FrontDeskDeps,
+  shopSlug: string,
+  input: BookInput,
+  agentName: string,
+): Promise<BookOutcome> {
+  const args = parseBookArgs(input);
+
+  const start = parseRfc3339(args.start);
+  if (!start) {
+    throw invalidField(
+      "start",
+      "start is not an RFC 3339 date-time with an offset.",
+      "Call get_availability and pass one of the returned slot starts exactly, e.g. 2026-11-14T14:30:00-05:00.",
+      args.start,
+    );
+  }
+
+  const shop = await deps.catalog.getShop(shopSlug);
+  if (!shop) throw shopNotFound(shopSlug);
+
+  const services = await deps.catalog.listServices(shopSlug);
+  const service = services.find((s) => s.id === args.service_id);
+  if (!service) {
+    throw new FrontDeskError(
+      "invalid_request",
+      `No service with id "${args.service_id}" at ${shop.name}.`,
+      "Call list_services to get valid service ids, then call get_availability for that service and book one of its starts.",
+      { field: "service_id", value: args.service_id, valid_service_ids: services.map((s) => s.id) },
+    );
+  }
+
+  const end = new Date(start.getTime() + service.durationMin * 60_000);
+  const { result, staffHours, input: engineInput } = await findSlots(deps, shop, service, {
+    from: start,
+    to: end,
+    limit: MAX_LIMIT,
   });
+  const isStart = (s: { start: string }) => parseRfc3339(s.start)?.getTime() === start.getTime();
+  const slot = result.slots.find(isStart);
+  if (!slot) {
+    // Would it be free if nobody had booked? Then it's taken, not invalid.
+    const freeWithoutBookings = computeAvailability({ ...engineInput, busy: [] }).slots.some(isStart);
+    if (freeWithoutBookings) throw slotTaken(args.start, service.id);
+    throw new FrontDeskError(
+      "invalid_request",
+      "That start time isn't available.",
+      "Call get_availability and choose one of the returned starts.",
+      { field: "start", value: args.start, service_id: service.id },
+    );
+  }
+
+  let booking;
+  try {
+    booking = await deps.store.createBooking({
+      shopSlug: shop.slug,
+      serviceId: service.id,
+      staffId: slot.staffId,
+      start,
+      end,
+      customerName: args.customer_name,
+      agentName: cleanAgentName(agentName),
+    });
+  } catch (err) {
+    // Another booking won the race between step 2 and the insert.
+    if (err instanceof SlotTakenError) throw slotTaken(args.start, service.id);
+    throw err;
+  }
+
+  try {
+    await deps.notifier.alertOwner(booking);
+  } catch (err) {
+    // The booking is already stored; failing now would make the agent retry into slot_taken.
+    console.error(
+      JSON.stringify({
+        event: "booking.notify_failed",
+        id: booking.id,
+        shop: booking.shopSlug,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+
+  const staffName = staffHours.find((s) => s.staffId === slot.staffId)?.staffName ?? slot.staffId;
+  return { booking, staffName };
+}
+
+function slotTaken(start: string, serviceId: string): FrontDeskError {
+  return new FrontDeskError(
+    "slot_taken",
+    "That time is already booked.",
+    "Someone just took that time. Call get_availability again and choose another start.",
+    { start, service_id: serviceId },
+  );
+}
+
+function cleanAgentName(name: string): string {
+  const trimmed = name.trim().slice(0, MAX_AGENT_NAME);
+  return trimmed === "" ? UNKNOWN_AGENT : trimmed;
+}
+
+// ---- Bookings list (UI) ----
+
+/** The bookings window the UI sees: this far back and ahead of now. */
+export const BOOKINGS_PAST_DAYS = 7;
+export const BOOKINGS_FUTURE_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The shop and its bookings (confirmed and cancelled) from 7 days ago to 30 days ahead, sorted
+ * by start.
+ *
+ * TODO(ring-2): owner sign-in. Until then anyone with the URL can read customer names.
+ */
+export async function listShopBookings(deps: FrontDeskDeps, shopSlug: string): Promise<BookingsResponse> {
+  const shop = await deps.catalog.getShop(shopSlug);
+  if (!shop) throw shopNotFound(shopSlug);
+  const now = deps.clock.now().getTime();
+  const bookings = await deps.store.listBookings(shopSlug, {
+    start: new Date(now - BOOKINGS_PAST_DAYS * DAY_MS),
+    end: new Date(now + BOOKINGS_FUTURE_DAYS * DAY_MS),
+  });
+  return { shop, bookings };
 }
