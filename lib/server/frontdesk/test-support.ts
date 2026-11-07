@@ -5,8 +5,11 @@ import type { Notifier } from "../notify/notifier";
 import { createMemoryStore, type InitialBooking } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
 
-/** "Now" in most tests: Saturday 7 Nov 2026, noon in New York. The coming Saturday is 14 Nov. */
-export const NOW = new Date("2026-11-07T12:00:00-05:00");
+/**
+ * "Now" in most tests: Monday 9 Nov 2026, noon in New York (Hart's is closed on Mondays). The coming
+ * Saturday is 14 Nov, 5 days ahead: inside both the 30-day horizon and the 6-day deposit horizon.
+ */
+export const NOW = new Date("2026-11-09T12:00:00-05:00");
 
 /** The whole of Saturday 14 Nov in New York. */
 export const SAT = { from: "2026-11-14T00:00:00-05:00", to: "2026-11-15T00:00:00-05:00" };

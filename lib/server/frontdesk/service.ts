@@ -1,10 +1,14 @@
 import type {
   BookInput,
+  Booking,
+  BookingEventType,
   BookingsResponse,
+  BookingTransitionResult,
   BookResult,
   GetAvailabilityInput,
   GetAvailabilityResult,
   ListServicesResult,
+  Policies,
   Service,
   Shop,
 } from "../../types/frontdesk";
@@ -15,10 +19,12 @@ import {
   validateRequest,
   type AvailabilityInput,
 } from "../engine/availability";
+import { decide, type LifecycleAction, type LifecycleActor } from "../engine/lifecycle";
 import type { Notifier } from "../notify/notifier";
 import { SlotTakenError, type BookingStore } from "./booking-store";
 import type { ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
+import { DEFAULT_POLICIES } from "./policies";
 import { parseRfc3339 } from "./time";
 
 // Transport-agnostic use cases behind the MCP tools and the UI routes. They take their
@@ -32,13 +38,87 @@ export type FrontDeskDeps = {
   notifier: Notifier;
 };
 
-function shopNotFound(slug: string): FrontDeskError {
+export function shopNotFound(slug: string): FrontDeskError {
   return new FrontDeskError(
     "not_found",
     `No shop with slug "${slug}".`,
     "Check the shop slug. Front Desk currently serves one shop: harts.",
     { shop: slug },
   );
+}
+
+/** The shop, or a not_found FrontDeskError. */
+export async function requireShop(deps: FrontDeskDeps, shopSlug: string): Promise<Shop> {
+  const shop = await deps.catalog.getShop(shopSlug);
+  if (!shop) throw shopNotFound(shopSlug);
+  return shop;
+}
+
+/** The shop's policies; DEFAULT_POLICIES if it has no row. Doesn't check that the shop exists. */
+export async function policiesFor(deps: FrontDeskDeps, shopSlug: string): Promise<Policies> {
+  return (await deps.catalog.getPolicies(shopSlug)) ?? { ...DEFAULT_POLICIES };
+}
+
+export function bookingNotFound(bookingId: string): FrontDeskError {
+  return new FrontDeskError(
+    "booking_not_found",
+    `No booking with id "${bookingId}" at this shop.`,
+    "Check the booking id. It is the booking.id (a UUID) that book returned.",
+    { booking_id: bookingId },
+  );
+}
+
+/** The booking if it exists and belongs to `shopSlug`; otherwise booking_not_found. */
+export async function requireBooking(deps: FrontDeskDeps, shopSlug: string, bookingId: string): Promise<Booking> {
+  const booking = await deps.store.getBooking(bookingId);
+  if (!booking || booking.shopSlug !== shopSlug) throw bookingNotFound(bookingId);
+  return booking;
+}
+
+const EVENT_FOR: Record<LifecycleAction, BookingEventType> = {
+  cancel: "cancelled",
+  complete: "completed",
+  mark_no_show: "no_show",
+};
+
+/** How many times transitionBooking re-reads and re-decides after losing a race. */
+const MAX_TRANSITION_ATTEMPTS = 3;
+
+/**
+ * Apply a lifecycle action to a booking: decide() against the shop's policies and the clock, then
+ * store.transition() conditionally on the status it decided from, writing one event.
+ * If another transition got there first (transition returns null), re-read the booking and decide
+ * again, so the loser gets the right error (e.g. not_cancellable) instead of a stale success.
+ * Throws not_found (shop), booking_not_found, or decide()'s FrontDeskError.
+ * TODO(ring-1c): move real money. depositEffect is what the policy decides; nothing is collected.
+ * TODO(ring-1b): anyone holding a booking id can cancel it until customer consent ships.
+ */
+export async function transitionBooking(
+  deps: FrontDeskDeps,
+  shopSlug: string,
+  bookingId: string,
+  action: LifecycleAction,
+  actor: LifecycleActor,
+): Promise<BookingTransitionResult> {
+  await requireShop(deps, shopSlug);
+  const policies = await policiesFor(deps, shopSlug);
+  for (let attempt = 1; attempt <= MAX_TRANSITION_ATTEMPTS; attempt++) {
+    const booking = await requireBooking(deps, shopSlug, bookingId);
+    const decision = decide(booking, { type: action, actor }, deps.clock.now(), policies);
+    if (decision instanceof FrontDeskError) throw decision;
+    const updated = await deps.store.transition(booking.id, booking.status, decision.nextStatus, {
+      actor,
+      type: EVENT_FOR[action],
+      data: {
+        from: booking.status,
+        to: decision.nextStatus,
+        depositEffect: decision.depositEffect,
+        depositCollected: false,
+      },
+    });
+    if (updated) return { booking: updated, depositEffect: decision.depositEffect, depositCollected: false };
+  }
+  throw new Error(`Booking ${bookingId} kept changing status during ${action}; gave up after ${MAX_TRANSITION_ATTEMPTS} attempts.`);
 }
 
 /** The shop and everything it sells. */
@@ -300,6 +380,7 @@ export async function book(
       end,
       customerName: args.customer_name,
       agentName: cleanAgentName(agentName),
+      depositCents: service.depositCents,
     });
   } catch (err) {
     // Another booking won the race between step 2 and the insert.
