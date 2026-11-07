@@ -33,7 +33,7 @@ export function SiteHeader() {
             Why Front Desk
           </a>
           <Button asChild>
-            <a href="#get-started">
+            <a href="/console">
               Get started{" "}
               <ArrowRight data-icon="inline-end" aria-hidden="true" />
             </a>

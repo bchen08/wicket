@@ -39,7 +39,7 @@ export function Hero() {
         </p>
         <div className="mt-8 flex flex-wrap items-center gap-5">
           <Button asChild size="lg">
-            <a href="#get-started">
+            <a href="/console">
               Get started{" "}
               <ArrowRight data-icon="inline-end" aria-hidden="true" />
             </a>
