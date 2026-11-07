@@ -2,16 +2,27 @@ import { DateTime } from "luxon";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Policies } from "../../types/frontdesk";
 import { fixedClock } from "../clock";
-import { SlotTakenError, type BookingStore, type IdempotencyScope, type NewBooking, type NewBookingEvent } from "./booking-store";
+import { sha256Hex } from "../consent/crypto";
+import {
+  expiredEventData,
+  SlotTakenError,
+  type BookingStore,
+  type ChallengeRecord,
+  type IdempotencyScope,
+  type NewBooking,
+  type NewBookingEvent,
+} from "./booking-store";
 import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { SEED } from "./memory-store";
 import { DEFAULT_POLICIES } from "./policies";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
-import { book, type FrontDeskDeps } from "./service";
+import { book } from "./service";
+import { holdFields, withConsent } from "./test-support";
 
 // Runs against a real Postgres only when DATABASE_URL_TEST points at a database with
-// supabase/migrations/0001_skeleton.sql, 0002_rules.sql and supabase/seed.sql applied (see docs/database.md).
+// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql and supabase/seed.sql applied
+// (see docs/database.md).
 // Use a scratch database. Other test files may share it, so this file only adds rows of its own and
 // deletes them afterwards: bookings in 2099, idempotency keys with a random prefix, and a throwaway
 // shop (with its own staff member and service) for the lifecycle, idempotency and owner-write tests,
@@ -32,6 +43,8 @@ if (!url) {
     // A random day in 2099, so parallel or repeated runs don't collide with each other or real data.
     const day = new Date(Date.UTC(2099, 0, 1) + Math.floor(Math.random() * 300) * 86_400_000);
     const at = (h: number, m = 0) => new Date(day.getTime() + (h * 60 + m) * 60_000);
+    /** Every hold createBooking makes in this file lapses here (two days later) unless a test says otherwise. */
+    const HELD_UNTIL = at(48);
     const input = (start: Date, end: Date, serviceId = "haircut"): NewBooking => ({
       shopSlug: "harts",
       serviceId,
@@ -41,6 +54,7 @@ if (!url) {
       customerName: "Postgres Test",
       agentName: "vitest",
       depositCents: 1000,
+      ...holdFields(HELD_UNTIL),
     });
 
     // The throwaway shop. Deleting it cascades to its staff, hours, services, policies and blocks.
@@ -58,12 +72,13 @@ if (!url) {
       customerName: "Postgres Test",
       agentName: "vitest",
       depositCents,
+      ...holdFields(HELD_UNTIL),
     });
     const DAY = { start: at(0), end: at(24) };
     const cancelEvent = (actor: NewBookingEvent["actor"] = "agent"): NewBookingEvent => ({
       actor,
       type: "cancelled",
-      data: { from: "confirmed", to: "cancelled", depositEffect: "released", depositCollected: false },
+      data: { from: "awaiting_approval", to: "cancelled", depositEffect: "released", depositCollected: false },
     });
     const keyRows = (name: string) => sql`select key from idempotency_keys where key = ${key(name)} and tool = 'book'`;
 
@@ -77,6 +92,12 @@ if (!url) {
     });
 
     afterAll(async () => {
+      // Customers aren't cascaded from bookings: delete the ones this file's approvals made.
+      await sql`
+        delete from customers where id in (
+          select customer_id from bookings where customer_id is not null and (shop_slug = ${shop} or id = any(${created}::uuid[]))
+        )
+      `;
       if (created.length > 0) {
         await sql`delete from bookings where id = any(${created}::uuid[])`;
       }
@@ -106,7 +127,8 @@ if (!url) {
     it("stores a booking, then refuses an overlapping one with SlotTakenError (23P01)", async () => {
       const first = await store.createBooking(input(at(15), at(15, 30)));
       created.push(first.id);
-      expect(first).toMatchObject({ status: "confirmed", serviceName: "Haircut", depositCents: 1000, staffId: "dana" });
+      // A hold awaiting approval holds the time like a confirmed booking (the no_overlap constraint).
+      expect(first).toMatchObject({ status: "awaiting_approval", serviceName: "Haircut", depositCents: 1000, staffId: "dana" });
 
       // haircut-beard 14:45–15:30 overlaps 15:00–15:30.
       await expect(store.createBooking(input(at(14, 45), at(15, 30), "haircut-beard"))).rejects.toBeInstanceOf(
@@ -120,6 +142,7 @@ if (!url) {
       const busy = await store.getBusyIntervals("harts", { start: at(15, 10), end: at(15, 40) });
       expect(busy.map((b) => b.start.getTime())).toEqual([at(15).getTime(), at(15, 30).getTime()]);
       expect(busy.map((b) => b.kind)).toEqual(["booking", "booking"]);
+      expect(busy.map((b) => b.heldUntil?.getTime())).toEqual([HELD_UNTIL.getTime(), HELD_UNTIL.getTime()]);
 
       const listed = await store.listBookings("harts", { start: at(0), end: at(24) });
       expect(listed.map((b) => b.id)).toEqual([first.id, next.id]);
@@ -143,12 +166,12 @@ if (!url) {
         .plus({ weeks: Math.floor(Math.random() * 4) })
         .set({ weekday: 6 });
       const start = saturday.set({ hour: 13, minute: 15 }).toISO()!;
-      const deps: FrontDeskDeps = {
+      const deps = withConsent({
         catalog: store,
         store,
         clock: fixedClock(saturday.minus({ days: 1 }).toJSDate()),
         notifier: { alertOwner: async () => {} },
-      };
+      });
       const [keyA, keyB] = [crypto.randomUUID(), crypto.randomUUID()];
       bookKeys.push(keyA, keyB);
       const results = await Promise.allSettled([
@@ -157,6 +180,10 @@ if (!url) {
       ]);
       for (const r of results) if (r.status === "fulfilled") created.push(r.value.booking.id);
       expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      // The winner holds the slot, awaiting approval.
+      expect((results.find((r) => r.status === "fulfilled") as PromiseFulfilledResult<{ booking: { status: string } }>).value.booking.status).toBe(
+        "awaiting_approval",
+      );
       const reason = (results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason;
       expect(reason).toBeInstanceOf(FrontDeskError);
       expect((reason as FrontDeskError).code).toBe("slot_taken");
@@ -164,9 +191,17 @@ if (!url) {
 
     // ---- Lifecycle (the throwaway shop) ----
 
-    it("createBooking stores the deposit snapshot and writes a booked event in the same statement", async () => {
-      const booking = await store.createBooking(ours(at(1), at(1, 30), 777));
-      expect(booking).toMatchObject({ shopSlug: shop, serviceName: "Trim", depositCents: 777, status: "confirmed" });
+    it("createBooking stores the hold, its deposit snapshot, its approval and a booked event in the same statement", async () => {
+      const fields = ours(at(1), at(1, 30), 777);
+      const booking = await store.createBooking(fields);
+      expect(booking).toMatchObject({
+        shopSlug: shop,
+        serviceName: "Trim",
+        depositCents: 777,
+        status: "awaiting_approval",
+        customer: { displayName: "Postgres Test", verified: false },
+      });
+      expect(booking).not.toHaveProperty("approval"); // book adds the link; the store never knows the token
       const events = await store.listEvents(booking.id);
       expect(events).toEqual([
         {
@@ -175,9 +210,20 @@ if (!url) {
           at: expect.stringMatching(/-0[45]:00$/), // New York time
           actor: "agent",
           type: "booked",
-          data: { status: "confirmed", agentName: "vitest" },
+          data: { status: "awaiting_approval", agentName: "vitest" },
         },
       ]);
+      const [row] = await sql<{ approve_by: Date; mandate: unknown; customer_id: string | null; token_hash: string; decision: string | null }[]>`
+        select b.approve_by, b.mandate, b.customer_id, a.token_hash, a.decision
+        from bookings b join approvals a on a.booking_id = b.id where b.id = ${booking.id}::uuid
+      `;
+      expect(row).toEqual({
+        approve_by: HELD_UNTIL,
+        mandate: null,
+        customer_id: null,
+        token_hash: fields.approvalTokenHash,
+        decision: null,
+      });
       expect(await store.getBooking(booking.id)).toEqual(booking);
       expect(await store.getBooking(booking.id.toUpperCase())).toEqual(booking);
       expect(await store.getBooking(crypto.randomUUID())).toBeNull();
@@ -185,9 +231,18 @@ if (!url) {
       expect(await store.listEvents("not-a-uuid")).toEqual([]);
     });
 
+    it("createBooking stores the mandate as jsonb and puts it in the booked event", async () => {
+      const mandate = { priceCapCents: 2500, window: { from: at(0).toISOString(), to: at(24).toISOString() } };
+      const booking = await store.createBooking({ ...ours(at(6, 30), at(7)), mandate });
+      const [event] = await store.listEvents(booking.id);
+      expect(event.data).toEqual({ status: "awaiting_approval", agentName: "vitest", mandate });
+      const [row] = await sql<{ mandate: unknown }[]>`select mandate from bookings where id = ${booking.id}::uuid`;
+      expect(row.mandate).toEqual(mandate);
+    });
+
     it("transition() moves the status, writes its event and stamps the time, all in one statement", async () => {
       const booking = await store.createBooking(ours(at(2), at(2, 30)));
-      const cancelled = await store.transition(booking.id, "confirmed", "cancelled", cancelEvent("owner"));
+      const cancelled = await store.transition(booking.id, "awaiting_approval", "cancelled", cancelEvent("owner"));
       expect(cancelled).toEqual({ ...booking, status: "cancelled" });
 
       const events = await store.listEvents(booking.id);
@@ -206,14 +261,15 @@ if (!url) {
       expect(row.completed_at).toBeNull();
 
       // The slot is free again: a new booking over it succeeds.
-      await expect(store.createBooking(ours(at(2), at(2, 30)))).resolves.toMatchObject({ status: "confirmed" });
+      await expect(store.createBooking(ours(at(2), at(2, 30)))).resolves.toMatchObject({ status: "awaiting_approval" });
     });
 
     it("transition() stamps completed_at and no_show_at", async () => {
       const a = await store.createBooking(ours(at(3), at(3, 30)));
       const b = await store.createBooking(ours(at(3, 30), at(4)));
-      await store.transition(a.id, "confirmed", "completed", { actor: "owner", type: "completed", data: {} });
-      await store.transition(b.id, "confirmed", "no_show", { actor: "owner", type: "no_show", data: {} });
+      // The store doesn't judge transitions (decide() does): it moves whatever status it's told.
+      await store.transition(a.id, "awaiting_approval", "completed", { actor: "owner", type: "completed", data: {} });
+      await store.transition(b.id, "awaiting_approval", "no_show", { actor: "owner", type: "no_show", data: {} });
       const rows = await sql<{ id: string; status: string; completed_at: Date | null; no_show_at: Date | null; cancelled_by: string | null }[]>`
         select id::text as id, status, completed_at, no_show_at, cancelled_by from bookings
         where id in (${a.id}::uuid, ${b.id}::uuid)
@@ -225,18 +281,18 @@ if (!url) {
 
     it("transition() returns null and writes nothing when the status isn't the expected one", async () => {
       const booking = await store.createBooking(ours(at(4, 30), at(5)));
-      expect(await store.transition(booking.id, "awaiting_deposit", "cancelled", cancelEvent())).toBeNull();
-      expect((await store.getBooking(booking.id))?.status).toBe("confirmed");
+      expect(await store.transition(booking.id, "confirmed", "cancelled", cancelEvent())).toBeNull();
+      expect((await store.getBooking(booking.id))?.status).toBe("awaiting_approval");
       expect(await store.listEvents(booking.id)).toHaveLength(1);
-      expect(await store.transition(crypto.randomUUID(), "confirmed", "cancelled", cancelEvent())).toBeNull();
-      expect(await store.transition("not-a-uuid", "confirmed", "cancelled", cancelEvent())).toBeNull();
+      expect(await store.transition(crypto.randomUUID(), "awaiting_approval", "cancelled", cancelEvent())).toBeNull();
+      expect(await store.transition("not-a-uuid", "awaiting_approval", "cancelled", cancelEvent())).toBeNull();
     });
 
     it("of two concurrent transitions exactly one wins, with exactly one event", async () => {
       const booking = await store.createBooking(ours(at(5, 30), at(6)));
       const results = await Promise.all([
-        store.transition(booking.id, "confirmed", "cancelled", cancelEvent()),
-        store.transition(booking.id, "confirmed", "no_show", { actor: "owner", type: "no_show", data: {} }),
+        store.transition(booking.id, "awaiting_approval", "cancelled", cancelEvent()),
+        store.transition(booking.id, "awaiting_approval", "no_show", { actor: "owner", type: "no_show", data: {} }),
       ]);
       expect(results.filter((r) => r !== null)).toHaveLength(1);
       const events = await store.listEvents(booking.id);
@@ -244,9 +300,9 @@ if (!url) {
       expect(events[1].type).toBe(results[0] ? "cancelled" : "no_show");
     });
 
-    it("getBusyIntervals() returns awaiting_deposit and confirmed bookings and blocked times, not final ones", async () => {
+    it("getBusyIntervals() returns holds (with their deadline), awaiting_deposit and confirmed bookings and blocked times, not final ones", async () => {
       const statuses = ["awaiting_deposit", "expired", "completed", "no_show", "cancelled"];
-      // 18:00, 18:30, … one per status, inserted directly (the store only creates confirmed bookings).
+      // 18:00, 18:30, … one per status, inserted directly (the store only creates holds).
       const rows = await sql<{ id: string }[]>`
         insert into bookings (shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents)
         select ${shop}, 'trim', ${staffId},
@@ -257,18 +313,26 @@ if (!url) {
         returning id::text as id
       `;
       expect(rows).toHaveLength(5);
-      const confirmed = await store.createBooking(ours(at(21), at(21, 30)));
+      const hold = await store.createBooking(ours(at(21), at(21, 30)));
+      const [confirmed] = await sql<{ id: string }[]>`
+        insert into bookings (shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents)
+        values (${shop}, 'trim', ${staffId}, tstzrange(${at(21, 30).toISOString()}::timestamptz, ${at(22).toISOString()}::timestamptz, '[)'),
+                'confirmed', 'Postgres Test', 'vitest', 0)
+        returning id::text as id
+      `;
       const block = await store.createBlock(shop, { staffId, start: at(20), end: at(21), reason: "Dentist" });
       expect(block).not.toBeNull();
 
       const busy = await store.getBusyIntervals(shop, { start: at(17), end: at(22) });
-      expect(busy.map((b) => [b.kind, b.start.getTime(), b.end.getTime()])).toEqual([
-        ["booking", at(18).getTime(), at(18, 30).getTime()], // awaiting_deposit
-        ["block", at(20).getTime(), at(21).getTime()],
-        ["booking", at(21).getTime(), at(21, 30).getTime()], // confirmed
+      expect(busy.map((b) => [b.kind, b.start.getTime(), b.end.getTime(), b.heldUntil?.getTime()])).toEqual([
+        ["booking", at(18).getTime(), at(18, 30).getTime(), undefined], // awaiting_deposit
+        ["block", at(20).getTime(), at(21).getTime(), undefined],
+        ["booking", at(21).getTime(), at(21, 30).getTime(), HELD_UNTIL.getTime()], // awaiting_approval: a hold
+        ["booking", at(21, 30).getTime(), at(22).getTime(), undefined], // confirmed
       ]);
       expect(busy[1].reason).toBe(`block ${block!.id}`);
-      expect(busy[2].reason).toBe(`booking ${confirmed.id}`);
+      expect(busy[2].reason).toBe(`booking ${hold.id}`);
+      expect(busy[3].reason).toBe(`booking ${confirmed.id}`);
       expect(busy.every((b) => b.staffId === staffId)).toBe(true);
 
       // Blocks of another shop's staff don't count.
@@ -365,6 +429,239 @@ if (!url) {
         store.idempotent(scope("outer"), (s) => s.idempotent(scope("inner"), async () => 1)),
       ).rejects.toThrow(/can't be nested/);
       expect(await keyRows("outer")).toHaveLength(0);
+    });
+
+    // ---- Consent (Ring 1b): lazy expiry, approvals, codes (the throwaway shop, on the next day) ----
+
+    /** A hold in the throwaway shop at `h`:00 the next day (30 minutes), lapsing at `approveBy`. */
+    const holdAt = (h: number, approveBy: Date, extra: Partial<NewBooking> = {}) =>
+      store.createBooking({ ...ours(at(24 + h), at(24 + h, 30)), approveBy, ...extra });
+    const statusOf = async (id: string) => (await store.getBooking(id))?.status;
+    const eventsOf = async (id: string) => (await store.listEvents(id)).map((e) => [e.type, e.actor]);
+    /** A distinct 64-hex phone HMAC for this run. */
+    const hmac = (name: string) => sha256Hex(`${run}:${name}`);
+    const DEADLINE = at(30);
+    const LIMITS = { perPhone: 3, perBooking: 10, windowMs: 60 * 60 * 1000 };
+    const challenge = (bookingId: string, phoneHmac: string, now: Date, limits = LIMITS) =>
+      store.createChallenge({
+        bookingId,
+        phoneHmac,
+        phoneLast4: "4321",
+        codeHash: sha256Hex(`code-${Math.random()}`),
+        expiresAt: new Date(now.getTime() + 10 * 60_000),
+        now,
+        limits,
+      });
+
+    it("refreshBooking() expires a lapsed hold (one expired event by the system) and reads it, in one statement", async () => {
+      const hold = await holdAt(1, DEADLINE);
+      expect(await store.refreshBooking(hold.id, new Date(DEADLINE.getTime() - 1))).toEqual(hold);
+      expect(await eventsOf(hold.id)).toEqual([["booked", "agent"]]);
+
+      const expired = await store.refreshBooking(hold.id.toUpperCase(), DEADLINE); // the deadline itself counts
+      expect(expired).toEqual({ ...hold, status: "expired" });
+      const events = await store.listEvents(hold.id);
+      expect(events.map((e) => [e.type, e.actor])).toEqual([
+        ["booked", "agent"],
+        ["expired", "system"],
+      ]);
+      expect(events[1].data).toEqual(expiredEventData(500));
+
+      // Reading it again expires nothing more.
+      expect(await store.refreshBooking(hold.id, at(40))).toEqual({ ...hold, status: "expired" });
+      expect(await store.listEvents(hold.id)).toHaveLength(2);
+      expect(await store.refreshBooking(crypto.randomUUID(), DEADLINE)).toBeNull();
+      expect(await store.refreshBooking("not-a-uuid", DEADLINE)).toBeNull();
+
+      // The expired hold frees its time.
+      await expect(store.createBooking({ ...ours(at(25), at(25, 30)), approveBy: at(40) })).resolves.toMatchObject({
+        status: "awaiting_approval",
+      });
+    });
+
+    it("refreshBooking() leaves a booking that isn't a hold alone, whatever the time", async () => {
+      const hold = await holdAt(2, DEADLINE);
+      await store.transition(hold.id, "awaiting_approval", "confirmed", { actor: "customer", type: "approved", data: {} });
+      expect((await store.refreshBooking(hold.id, at(40)))?.status).toBe("confirmed");
+      expect(await eventsOf(hold.id)).toEqual([
+        ["booked", "agent"],
+        ["approved", "customer"],
+      ]);
+    });
+
+    it("expireStaleHolds() expires only this shop's lapsed holds in the range, each once even when two run together", async () => {
+      const lapsed = await holdAt(3, DEADLINE);
+      const live = await holdAt(4, new Date(DEADLINE.getTime() + 1));
+      const outside = await holdAt(8, DEADLINE);
+      const range = { start: at(24 + 3), end: at(24 + 5) };
+
+      const counts = await Promise.all([
+        store.expireStaleHolds(shop, range, DEADLINE),
+        store.expireStaleHolds(shop, range, DEADLINE),
+      ]);
+      expect(counts.sort()).toEqual([0, 1]);
+      expect(await statusOf(lapsed.id)).toBe("expired");
+      expect(await eventsOf(lapsed.id)).toEqual([
+        ["booked", "agent"],
+        ["expired", "system"],
+      ]);
+      expect(await statusOf(live.id)).toBe("awaiting_approval");
+      expect(await statusOf(outside.id)).toBe("awaiting_approval");
+
+      // Another shop's call doesn't touch these.
+      await store.expireStaleHolds("harts", { start: at(24 + 8), end: at(24 + 9) }, at(40));
+      expect(await statusOf(outside.id)).toBe("awaiting_approval");
+      expect(await store.expireStaleHolds(shop, { start: at(24 + 8), end: at(24 + 9) }, DEADLINE)).toBe(1);
+    });
+
+    it("findApproval() finds a hold's approval by its token hash, with the deadline and the mandate", async () => {
+      const tokenHash = sha256Hex(`token-${run}-find`);
+      const mandate = { depositCapCents: 500 };
+      const hold = await holdAt(5, DEADLINE, { approvalTokenHash: tokenHash, mandate });
+      expect(await store.findApproval(tokenHash)).toEqual({ bookingId: hold.id, decision: null, approveBy: DEADLINE, mandate });
+      expect(await store.findApproval(sha256Hex(`token-${run}-nobody`))).toBeNull();
+    });
+
+    it("createChallenge() enforces the per-booking and per-phone limits over a sliding window, with retryAfterMs", async () => {
+      const a = await holdAt(6, DEADLINE);
+      const b = await holdAt(7, DEADLINE);
+      const phone = hmac("limits");
+      const t0 = at(28);
+      const minute = 60_000;
+      for (let i = 0; i < 3; i++) {
+        const sent = await challenge(i < 2 ? a.id : b.id, phone, new Date(t0.getTime() + i * minute));
+        expect(sent.ok).toBe(true);
+      }
+      // A 4th code to the same phone within the hour, for either booking → limited until the 1st ages out.
+      const now = new Date(t0.getTime() + 10 * minute);
+      expect(await challenge(b.id, phone, now)).toEqual({ ok: false, limit: "phone", retryAfterMs: 50 * minute });
+      // Exactly an hour after the first send, it no longer counts.
+      expect((await challenge(b.id, phone, new Date(t0.getTime() + 60 * minute))).ok).toBe(true);
+
+      // Per booking: at most 2 here, whatever the phone.
+      const tight = { ...LIMITS, perBooking: 2 };
+      expect(await challenge(a.id, hmac("other"), now, tight)).toEqual({ ok: false, limit: "booking", retryAfterMs: 50 * minute });
+
+      const latest = await store.latestChallenge(b.id);
+      expect(latest).toMatchObject({ bookingId: b.id, phoneHmac: phone, phoneLast4: "4321", attempts: 0, consumedAt: null });
+      expect(latest!.createdAt).toEqual(new Date(t0.getTime() + 60 * minute));
+      expect(await store.latestChallenge(crypto.randomUUID())).toBeNull();
+      expect(await store.latestChallenge("not-a-uuid")).toBeNull();
+    });
+
+    it("recordCodeAttempt() counts attempts only while the code is usable", async () => {
+      const hold = await holdAt(9, DEADLINE);
+      const now = at(28);
+      const sent = await challenge(hold.id, hmac("attempts"), now);
+      if (!sent.ok) throw new Error("expected a challenge");
+      const id = sent.challenge.id;
+      for (let n = 1; n <= 5; n++) expect(await store.recordCodeAttempt(id, now, 5)).toBe(n);
+      expect(await store.recordCodeAttempt(id, now, 5)).toBeNull();
+      const [row] = await sql<{ attempts: number }[]>`select attempts from otp_challenges where id = ${id}::bigint`;
+      expect(row.attempts).toBe(5);
+
+      const fresh = await challenge(hold.id, hmac("attempts-2"), now);
+      if (!fresh.ok) throw new Error("expected a challenge");
+      expect(await store.recordCodeAttempt(fresh.challenge.id, fresh.challenge.expiresAt, 5)).toBeNull(); // expired
+      expect(await store.recordCodeAttempt("not-an-id", now, 5)).toBeNull();
+    });
+
+    it("answerApproval(): approve consumes the code, upserts the customer, links it and confirms, in one transaction", async () => {
+      const hold = await holdAt(10, DEADLINE);
+      const now = at(28);
+      const phone = hmac("approve");
+      const sent = (await challenge(hold.id, phone, now)) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
+      const answer = (bookingId: string, c: ChallengeRecord, displayName = "Postgres Test") =>
+        store.answerApproval({
+          bookingId,
+          decision: "approved",
+          nextStatus: "confirmed",
+          now,
+          challengeId: c.id,
+          customer: { phoneHmac: phone, phoneLast4: "4321", displayName },
+          event: { actor: "customer", type: "approved", data: { phoneLast4: "4321" } },
+        });
+
+      const result = await answer(hold.id, sent.challenge);
+      expect(result).toEqual({
+        ok: true,
+        booking: { ...hold, status: "confirmed", customer: { displayName: "Postgres Test", verified: true, phoneLast4: "4321" } },
+      });
+      const [row] = await sql<{ customer_id: string; phone_hmac: string; phone_last4: string; display_name: string; consumed_at: Date; decision: string; decided_at: Date }[]>`
+        select c.id::text as customer_id, c.phone_hmac, c.phone_last4, c.display_name, o.consumed_at, a.decision, a.decided_at
+        from bookings b
+        join customers c on c.id = b.customer_id
+        join otp_challenges o on o.booking_id = b.id
+        join approvals a on a.booking_id = b.id
+        where b.id = ${hold.id}::uuid
+      `;
+      expect(row).toMatchObject({ phone_hmac: phone, phone_last4: "4321", display_name: "Postgres Test", consumed_at: now, decision: "approved", decided_at: now });
+      expect(await eventsOf(hold.id)).toEqual([
+        ["booked", "agent"],
+        ["approved", "customer"],
+      ]);
+
+      // The same code again: refused, nothing written. (Postgres checks the approval row first, so this
+      // already-answered booking reads as not_pending; a used code on a pending booking is code_used, below.)
+      expect(await answer(hold.id, sent.challenge)).toMatchObject({ ok: false });
+      expect(await store.listEvents(hold.id)).toHaveLength(2);
+
+      // A used code on a booking still awaiting approval: code_used, and nothing written.
+      const pending = await holdAt(14, DEADLINE);
+      const used = (await challenge(pending.id, phone, now)) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
+      await sql`update otp_challenges set consumed_at = ${now.toISOString()}::timestamptz where id = ${used.challenge.id}::bigint`;
+      expect(await answer(pending.id, used.challenge)).toEqual({ ok: false, reason: "code_used" });
+      expect(await statusOf(pending.id)).toBe("awaiting_approval");
+      expect(await eventsOf(pending.id)).toEqual([["booked", "agent"]]);
+      expect((await sql<{ decision: string | null }[]>`select decision from approvals where booking_id = ${pending.id}::uuid`)[0].decision).toBeNull();
+
+      // The same phone approving another hold under another name: the same customer, its name updated.
+      const second = await holdAt(11, DEADLINE);
+      const sent2 = (await challenge(second.id, phone, now)) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
+      expect((await answer(second.id, sent2.challenge, "Renamed Test")).ok).toBe(true);
+      const customers = await sql<{ id: string; display_name: string }[]>`
+        select id::text as id, display_name from customers where phone_hmac = ${phone}
+      `;
+      expect(customers).toEqual([{ id: row.customer_id, display_name: "Renamed Test" }]);
+    });
+
+    it("answerApproval(): a lapsed hold or an answered approval is not_pending, and nothing is written", async () => {
+      const lapsed = await holdAt(12, DEADLINE);
+      const sent = (await challenge(lapsed.id, hmac("lapsed"), at(28))) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
+      const result = await store.answerApproval({
+        bookingId: lapsed.id,
+        decision: "approved",
+        nextStatus: "confirmed",
+        now: DEADLINE,
+        challengeId: sent.challenge.id,
+        customer: { phoneHmac: hmac("lapsed"), phoneLast4: "4321", displayName: "Postgres Test" },
+        event: { actor: "customer", type: "approved", data: {} },
+      });
+      expect(result).toEqual({ ok: false, reason: "not_pending" });
+      expect((await store.latestChallenge(lapsed.id))?.consumedAt).toBeNull();
+      expect(await store.findApproval((await sql<{ token_hash: string }[]>`select token_hash from approvals where booking_id = ${lapsed.id}::uuid`)[0].token_hash)).toMatchObject({ decision: null });
+      expect(await sql`select 1 from customers where phone_hmac = ${hmac("lapsed")}`).toHaveLength(0);
+
+      // Decline: cancelled by the customer; a second answer is not_pending.
+      const hold = await holdAt(13, DEADLINE);
+      const decline = () =>
+        store.answerApproval({
+          bookingId: hold.id,
+          decision: "declined",
+          nextStatus: "cancelled",
+          now: at(28),
+          event: { actor: "customer", type: "declined", data: { from: "awaiting_approval", to: "cancelled" } },
+        });
+      expect(await decline()).toEqual({ ok: true, booking: { ...hold, status: "cancelled" } });
+      const [row] = await sql<{ cancelled_by: string; cancelled_at: Date | null; decision: string }[]>`
+        select b.cancelled_by, b.cancelled_at, a.decision from bookings b join approvals a on a.booking_id = b.id where b.id = ${hold.id}::uuid
+      `;
+      expect(row).toMatchObject({ cancelled_by: "customer", cancelled_at: expect.any(Date), decision: "declined" });
+      expect(await decline()).toEqual({ ok: false, reason: "not_pending" });
+      expect(await eventsOf(hold.id)).toEqual([
+        ["booked", "agent"],
+        ["declined", "customer"],
+      ]);
     });
 
     // ---- Owner writes (the throwaway shop) ----

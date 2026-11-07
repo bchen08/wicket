@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Booking, CancelInput } from "../../types/frontdesk";
 import type { Clock } from "../clock";
+import { declineBooking } from "../consent/approvals";
 import { FrontDeskError } from "./errors";
 import { SEED } from "./memory-store";
 import {
@@ -11,11 +12,12 @@ import {
   getPolicies,
   type FrontDeskDeps,
 } from "./service";
-import { memoryDeps, NOW, SAT, withCatalog } from "./test-support";
+import { approvalToken, approveAsCustomer, memoryDeps, NOW, SAT, withCatalog } from "./test-support";
 
 // The agent's cancel, get_booking and get_policies use cases against the in-memory store. "Now" is
 // Mon 9 Nov 2026, noon in New York. Hart's cancel window is 24 hours; haircut has a $10 deposit,
-// beard-trim none.
+// beard-trim none. book places a 10-minute hold; the cancellation policy applies once the person has
+// approved it (confirmedAt), while a hold can be cancelled any time.
 
 const at = (hhmm: string) => `2026-11-14T${hhmm}:00-05:00`;
 const key = () => crypto.randomUUID();
@@ -42,7 +44,8 @@ async function rejection(promise: Promise<unknown>): Promise<FrontDeskError> {
   throw new Error("expected a FrontDeskError");
 }
 
-async function bookAt(deps: FrontDeskDeps, start: string, service_id = "haircut"): Promise<Booking> {
+/** book's result: a hold awaiting approval, with its approval link. */
+async function holdAt(deps: FrontDeskDeps, start: string, service_id = "haircut"): Promise<Booking> {
   const { booking } = await book(
     deps,
     "harts",
@@ -50,6 +53,27 @@ async function bookAt(deps: FrontDeskDeps, start: string, service_id = "haircut"
     "test-agent",
   );
   return booking;
+}
+
+/** The booking without its approval link, as every read after book shows it. */
+function withoutLink(booking: Booking): Booking {
+  const rest = { ...booking };
+  delete rest.approval;
+  return rest;
+}
+
+/** A hold awaiting approval, as reads show it (no link). */
+async function bookAt(deps: FrontDeskDeps, start: string, service_id = "haircut"): Promise<Booking> {
+  return withoutLink(await holdAt(deps, start, service_id));
+}
+
+let phoneSeq = 0;
+/** A fresh phone number per approval, so the 3-codes-per-phone-per-hour limit never gets in the way. */
+const nextPhone = () => `+1401555${String(1000 + (phoneSeq++ % 9000))}`;
+
+/** A booking the person approved: confirmed, with a verified customer. */
+async function confirmedAt(deps: FrontDeskDeps, start: string, service_id = "haircut"): Promise<Booking> {
+  return approveAsCustomer(deps, await holdAt(deps, start, service_id), nextPhone());
 }
 
 const cancel = (deps: FrontDeskDeps, booking_id: string, idempotency_key = key()) =>
@@ -68,7 +92,7 @@ function withSecondShop(deps: FrontDeskDeps): FrontDeskDeps {
 describe("cancelBooking", () => {
   it("cancels more than 24 hours ahead: cancelled, deposit released, nothing collected, slot offered again", async () => {
     const deps = memoryDeps();
-    const booking = await bookAt(deps, at("14:30"));
+    const booking = await confirmedAt(deps, at("14:30"));
     const starts = async () =>
       (await getAvailability(deps, "harts", { service_id: "haircut", ...SAT, limit: 50 })).slots.map((s) => s.start);
     expect(await starts()).not.toContain(at("14:30"));
@@ -87,7 +111,7 @@ describe("cancelBooking", () => {
 
   it("captures the deposit when cancelling inside 24 hours (but before the start)", async () => {
     const deps = memoryDeps();
-    const booking = await bookAt(deps, "2026-11-10T10:00:00-05:00"); // 22 hours ahead
+    const booking = await confirmedAt(deps, "2026-11-10T10:00:00-05:00"); // 22 hours ahead
     const result = await cancel(deps, booking.id);
     expect(result.booking.status).toBe("cancelled");
     expect(result.depositEffect).toBe("captured");
@@ -97,8 +121,8 @@ describe("cancelBooking", () => {
   it("releases at exactly 24 hours ahead and captures a minute later", async () => {
     const clock = mutableClock();
     const deps = memoryDeps({ clock });
-    const onTime = await bookAt(deps, at("14:30"));
-    const late = await bookAt(deps, at("16:00"));
+    const onTime = await confirmedAt(deps, at("14:30"));
+    const late = await confirmedAt(deps, at("16:00"));
     clock.set("2026-11-13T14:30:00-05:00");
     expect((await cancel(deps, onTime.id)).depositEffect).toBe("released");
     clock.set("2026-11-13T16:01:00-05:00");
@@ -108,7 +132,7 @@ describe("cancelBooking", () => {
   it("is not_cancellable once the appointment has started", async () => {
     const clock = mutableClock();
     const deps = memoryDeps({ clock });
-    const booking = await bookAt(deps, at("14:30"));
+    const booking = await confirmedAt(deps, at("14:30"));
     clock.set(at("14:30"));
     const err = await rejection(cancel(deps, booking.id));
     expect(err.code).toBe("not_cancellable");
@@ -120,10 +144,52 @@ describe("cancelBooking", () => {
 
   it("reports depositEffect none for a service without a deposit, inside or outside the window", async () => {
     const deps = memoryDeps();
-    const early = await bookAt(deps, at("14:30"), "beard-trim");
-    const soon = await bookAt(deps, "2026-11-10T10:00:00-05:00", "beard-trim");
+    const early = await confirmedAt(deps, at("14:30"), "beard-trim");
+    const soon = await confirmedAt(deps, "2026-11-10T10:00:00-05:00", "beard-trim");
     expect((await cancel(deps, early.id)).depositEffect).toBe("none");
     expect((await cancel(deps, soon.id)).depositEffect).toBe("none");
+  });
+
+  it("cancels a hold awaiting approval any time, even inside the window: released, and the slot is free", async () => {
+    const deps = memoryDeps();
+    const soon = await bookAt(deps, "2026-11-10T10:00:00-05:00"); // 22 hours ahead: inside the window
+    const result = await cancel(deps, soon.id);
+    expect(result).toEqual({
+      booking: { ...soon, status: "cancelled" },
+      depositEffect: "released",
+      depositCollected: false,
+      replayed: false,
+    });
+    const trim = await bookAt(deps, at("14:30"), "beard-trim");
+    expect((await cancel(deps, trim.id)).depositEffect).toBe("none");
+    const starts = (
+      await getAvailability(deps, "harts", { service_id: "haircut", from: "2026-11-10T00:00:00-05:00", to: "2026-11-11T00:00:00-05:00" })
+    ).slots.map((s) => s.start);
+    expect(starts).toContain("2026-11-10T10:00:00-05:00");
+  });
+
+  it("cancels a hold even after its start, like an awaiting-deposit booking", async () => {
+    // With no lead time a hold can be for right now; it's still the agent's to drop.
+    const clock = mutableClock(new Date("2026-11-10T09:55:00-05:00"));
+    const deps = memoryDeps({ clock, policies: { leadTimeMin: 0 } });
+    const booking = await bookAt(deps, "2026-11-10T10:00:00-05:00");
+    clock.set("2026-11-10T10:01:00-05:00"); // started, hold still on until 10:05
+    expect((await cancel(deps, booking.id)).booking.status).toBe("cancelled");
+  });
+
+  it("is not_cancellable for a hold that ran out: it reads as expired", async () => {
+    const clock = mutableClock();
+    const deps = memoryDeps({ clock });
+    const booking = await bookAt(deps, at("14:30"));
+    clock.set(new Date(NOW.getTime() + 10 * 60_000).toISOString()); // the hold's deadline
+    const err = await rejection(cancel(deps, booking.id));
+    expect(err.code).toBe("not_cancellable");
+    expect(err.message).toBe("This booking has already expired.");
+    expect(err.details).toMatchObject({ status: "expired" });
+    expect((await deps.store.listEvents(booking.id)).map((e) => [e.type, e.actor])).toEqual([
+      ["booked", "agent"],
+      ["expired", "system"],
+    ]);
   });
 
   it("is not_cancellable for a booking that is already cancelled (with a new key)", async () => {
@@ -158,7 +224,7 @@ describe("cancelBooking", () => {
     const viaGet = await rejection(getBooking(deps, "elsewhere", { booking_id: booking.id }));
     expect(viaCancel.code).toBe("booking_not_found");
     expect(viaGet.code).toBe("booking_not_found");
-    expect((await getBooking(deps, "harts", { booking_id: booking.id })).booking.status).toBe("confirmed");
+    expect((await getBooking(deps, "harts", { booking_id: booking.id })).booking.status).toBe("awaiting_approval");
   });
 
   it("is not_found for an unknown shop", async () => {
@@ -207,7 +273,7 @@ describe("cancelBooking", () => {
     const err = await rejection(cancel(deps, two.id, "cancel-key-0001"));
     expect(err.code).toBe("idempotency_conflict");
     expect(err.details).toEqual({ idempotency_key: "cancel-key-0001", tool: "cancel" });
-    expect((await getBooking(deps, "harts", { booking_id: two.id })).booking.status).toBe("confirmed");
+    expect((await getBooking(deps, "harts", { booking_id: two.id })).booking.status).toBe("awaiting_approval");
   });
 
   it("keeps book and cancel keys apart: the same key can book and then cancel", async () => {
@@ -238,10 +304,11 @@ describe("cancelBooking", () => {
     expect(cancelled).toHaveLength(1);
   });
 
-  it("records the history: booked by the agent, then cancelled by the agent with the deposit effect", async () => {
+  it("records the history: booked by the agent, approved by the person, then cancelled by the agent with the deposit effect", async () => {
     const clock = mutableClock();
     const deps = memoryDeps({ clock });
-    const booking = await bookAt(deps, at("14:30"));
+    const booking = await holdAt(deps, at("14:30"));
+    await approveAsCustomer(deps, booking, "+14015550123");
     clock.set(new Date(NOW.getTime() + 3 * HOUR_MS).toISOString());
     await cancel(deps, booking.id);
 
@@ -252,7 +319,15 @@ describe("cancelBooking", () => {
         at: "2026-11-09T12:00:00-05:00",
         actor: "agent",
         type: "booked",
-        data: { status: "confirmed", agentName: "test-agent" },
+        data: { status: "awaiting_approval", agentName: "test-agent" },
+      },
+      {
+        id: expect.any(String),
+        bookingId: booking.id,
+        at: "2026-11-09T12:00:00-05:00",
+        actor: "customer",
+        type: "approved",
+        data: { from: "awaiting_approval", to: "confirmed", depositEffect: "none", depositCollected: false, phoneLast4: "0123" },
       },
       {
         id: expect.any(String),
@@ -264,15 +339,55 @@ describe("cancelBooking", () => {
       },
     ]);
   });
+
+  it("records a hold's cancellation from awaiting approval", async () => {
+    const deps = memoryDeps();
+    const booking = await bookAt(deps, at("14:30"));
+    await cancel(deps, booking.id);
+    const events = await deps.store.listEvents(booking.id);
+    expect(events.map((e) => [e.type, e.actor])).toEqual([
+      ["booked", "agent"],
+      ["cancelled", "agent"],
+    ]);
+    expect(events[1].data).toEqual({ from: "awaiting_approval", to: "cancelled", depositEffect: "released", depositCollected: false });
+  });
 });
 
 describe("getBooking", () => {
-  it("returns the booking as book returned it", async () => {
+  it("returns the booking as book returned it, without the approval link", async () => {
     const deps = memoryDeps();
-    const booking = await bookAt(deps, at("14:30"));
-    expect(await getBooking(deps, "harts", { booking_id: booking.id })).toEqual({ booking });
+    const held = await holdAt(deps, at("14:30"));
+    const booking = withoutLink(held);
+    expect(held.approval).toBeDefined();
+    expect(await getBooking(deps, "harts", { booking_id: booking.id })).toEqual({ booking, declined: false });
     // Ids are UUIDs: case and surrounding spaces don't matter.
-    expect(await getBooking(deps, "harts", { booking_id: ` ${booking.id.toUpperCase()} ` })).toEqual({ booking });
+    expect(await getBooking(deps, "harts", { booking_id: ` ${booking.id.toUpperCase()} ` })).toEqual({ booking, declined: false });
+  });
+
+  it("reports what the person did: approved → confirmed and verified, declined → cancelled, lapsed → expired", async () => {
+    const clock = mutableClock();
+    const deps = memoryDeps({ clock });
+    const approved = await holdAt(deps, at("10:00"));
+    const declined = await holdAt(deps, at("11:00"));
+    const cancelledByAgent = await bookAt(deps, at("13:00"));
+    const lapsed = await bookAt(deps, at("14:00"));
+
+    await approveAsCustomer(deps, approved, "+14015550123");
+    await declineBooking(deps, approvalToken(declined));
+    await cancel(deps, cancelledByAgent.id);
+    clock.set(new Date(NOW.getTime() + 10 * 60_000).toISOString());
+
+    const read = (id: string) => getBooking(deps, "harts", { booking_id: id });
+    expect(await read(approved.id)).toMatchObject({
+      booking: { status: "confirmed", customer: { displayName: "Maya", verified: true, phoneLast4: "0123" } },
+      declined: false,
+    });
+    expect(await read(declined.id)).toMatchObject({ booking: { status: "cancelled", customer: { verified: false } }, declined: true });
+    expect(await read(cancelledByAgent.id)).toMatchObject({ booking: { status: "cancelled" }, declined: false });
+    expect(await read(lapsed.id)).toMatchObject({ booking: { status: "expired" }, declined: false });
+    // The read itself recorded the lapse, once.
+    await read(lapsed.id);
+    expect((await deps.store.listEvents(lapsed.id)).map((e) => e.type)).toEqual(["booked", "expired"]);
   });
 
   it("is invalid_request for an empty booking_id", async () => {

@@ -19,13 +19,13 @@ const booking: Booking = {
 };
 
 describe("log notifier", () => {
-  it("writes one booking.created JSON line with the customer's first name only", async () => {
+  it("writes one booking.confirmed JSON line with the customer's first name only", async () => {
     const lines: string[] = [];
     await createLogNotifier((line) => lines.push(line)).alertOwner(booking);
 
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0])).toEqual({
-      event: "booking.created",
+      event: "booking.confirmed",
       id: booking.id,
       shop: "harts",
       service: "haircut",

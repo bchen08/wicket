@@ -1,7 +1,12 @@
 // Shared fixtures for Front Desk tests. Not imported by app code.
 import type { Booking, Policies } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
+import { approveBooking, sendApprovalCode } from "../consent/approvals";
+import type { CodeMessage, CodeSender } from "../consent/code-sender";
+import type { ConsentConfig } from "../consent/config";
+import { newApprovalToken, sha256Hex } from "../consent/crypto";
 import type { Notifier } from "../notify/notifier";
+import type { NewBooking } from "./booking-store";
 import type { NewBlock, ShopCatalog } from "./catalog";
 import { createMemoryStore, type InitialBooking } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
@@ -39,6 +44,69 @@ export const EXAMPLE_BOOKINGS: InitialBooking[] = [
   },
 ];
 
+/** The consent settings tests use: localhost links, a fixed pepper, no dev codes. */
+export const TEST_CONSENT: ConsentConfig = Object.freeze({
+  publicBaseUrl: "http://localhost:3000",
+  phonePepper: "test-pepper-0123456789abcdef0123456789abcdef",
+  devCodes: false,
+});
+
+/** The Origin the approval POSTs must carry with TEST_CONSENT. */
+export const TEST_ORIGIN = "http://localhost:3000";
+
+/** A test phone number (E.164) and another one. */
+export const PHONE_E164 = "+14015550123";
+export const OTHER_PHONE_E164 = "+14015550199";
+
+/** A code sender that remembers every code it was asked to send. */
+export function recordingCodeSender(): CodeSender & { sent: CodeMessage[] } {
+  const sent: CodeMessage[] = [];
+  return {
+    sent,
+    async send(message) {
+      sent.push({ ...message });
+    },
+  };
+}
+
+/** `base` with the Ring 1b consent deps (TEST_CONSENT and a recording code sender) unless it has them. */
+export function withConsent(
+  base: Omit<FrontDeskDeps, "consent" | "codeSender"> & Partial<Pick<FrontDeskDeps, "consent" | "codeSender">>,
+): FrontDeskDeps {
+  return { consent: TEST_CONSENT, codeSender: recordingCodeSender(), ...base };
+}
+
+/** The consent fields createBooking needs, for tests that call the store directly. */
+export function holdFields(approveBy: Date): Pick<NewBooking, "approveBy" | "approvalTokenHash" | "mandate"> {
+  return { approveBy, approvalTokenHash: sha256Hex(newApprovalToken()), mandate: null };
+}
+
+/** The token in a booking's approval link (book's result only). */
+export function approvalToken(booking: Booking): string {
+  const url = booking.approval?.url;
+  if (!url) throw new Error(`Booking ${booking.id} has no approval link.`);
+  return url.slice(url.lastIndexOf("/") + 1);
+}
+
+/** The last code `deps.codeSender` was asked to send (it must be a recordingCodeSender). */
+export function lastSentCode(deps: FrontDeskDeps): string {
+  const sent = (deps.codeSender as Partial<ReturnType<typeof recordingCodeSender>>).sent;
+  const last = sent?.at(-1);
+  if (!last) throw new Error("No code was sent (or deps.codeSender doesn't record).");
+  return last.code;
+}
+
+/**
+ * Approve a booking the way the person would, through the approval API's use cases: send a code to
+ * `phone`, then approve with it. `booking` must be book's result (it carries the link). Returns the
+ * confirmed booking.
+ */
+export async function approveAsCustomer(deps: FrontDeskDeps, booking: Booking, phone = PHONE_E164): Promise<Booking> {
+  const token = approvalToken(booking);
+  await sendApprovalCode(deps, token, { phone });
+  return (await approveBooking(deps, token, { code: lastSentCode(deps) })).booking;
+}
+
 /** A notifier that remembers what it was told. */
 export function recordingNotifier(): Notifier & { alerts: Booking[] } {
   const alerts: Booking[] = [];
@@ -72,7 +140,8 @@ export function withCatalog(
 
 /**
  * Deps backed by a fresh in-memory store and a fixed clock. `policies` is merged over Hart's seeded
- * policies; `initialBookings` and `initialBlocks` exist before the first call.
+ * policies; `initialBookings` and `initialBlocks` exist before the first call. Consent: TEST_CONSENT
+ * (merged with `consent`) and a recording code sender.
  */
 export function memoryDeps(
   options: {
@@ -81,6 +150,8 @@ export function memoryDeps(
     initialBookings?: InitialBooking[];
     policies?: Partial<Policies>;
     initialBlocks?: NewBlock[];
+    consent?: Partial<ConsentConfig>;
+    codeSender?: CodeSender;
   } = {},
 ): FrontDeskDeps {
   const clock = options.clock ?? fixedClock(NOW);
@@ -90,5 +161,12 @@ export function memoryDeps(
     policies: options.policies,
     initialBlocks: options.initialBlocks,
   });
-  return { clock, catalog: store, store, notifier: options.notifier ?? recordingNotifier() };
+  return {
+    clock,
+    catalog: store,
+    store,
+    notifier: options.notifier ?? recordingNotifier(),
+    consent: { ...TEST_CONSENT, ...options.consent },
+    codeSender: options.codeSender ?? recordingCodeSender(),
+  };
 }

@@ -1,14 +1,16 @@
-import type { BlockedTime, BookingStatus, Policies, Service, Shop } from "../../types/frontdesk";
+import type { BlockedTime, BookingStatus, Mandate, Policies, Service, Shop } from "../../types/frontdesk";
 import type { Clock } from "../clock";
 import {
   ACTIVE_STATUSES,
   byStart,
+  expiredEventData,
   IDEMPOTENCY_TTL_MS,
   SlotTakenError,
   toBooking,
   toBookingEvent,
   type BookingRecord,
   type BookingStore,
+  type ChallengeRecord,
   type IdempotencyScope,
   type IdempotentStore,
   type NewBooking,
@@ -89,13 +91,18 @@ export const SEED: {
  * A booking to preload, for tests (e.g. a cancelled one). Preloaded bookings get no events and
  * aren't checked for overlaps.
  */
-export type InitialBooking = Omit<NewBooking, "depositCents"> & {
+export type InitialBooking = Omit<NewBooking, "depositCents" | "approveBy" | "approvalTokenHash" | "mandate"> & {
   /** Defaults to "confirmed". */
   status?: BookingStatus;
   /** Defaults to the store clock's now. */
   createdAt?: Date;
   /** The deposit snapshot. Defaults to the service's current deposit. */
   depositCents?: number;
+  /** When the hold lapses. Required for status awaiting_approval. */
+  approveBy?: Date;
+  /** With it, the booking gets an undecided approval request with this token hash. */
+  approvalTokenHash?: string;
+  mandate?: Mandate | null;
 };
 
 export type MemoryStoreOptions = {
@@ -112,19 +119,43 @@ export type MemoryStoreOptions = {
 /** The lifecycle times transition() stamps. A Booking doesn't show them; tests read them here. */
 export type LifecycleStamps = {
   cancelledAt: Date | null;
-  cancelledBy: "agent" | "owner" | null;
+  cancelledBy: "agent" | "owner" | "customer" | null;
   completedAt: Date | null;
   noShowAt: Date | null;
 };
 
-/** What createMemoryStore returns: both interfaces plus a read-only hook for tests. */
+/** A stored customer (the customers table). */
+export type StoredCustomer = { id: string; phoneHmac: string; phoneLast4: string; displayName: string; createdAt: Date };
+
+/** A stored approval request (the approvals table). */
+export type StoredApproval = {
+  bookingId: string;
+  tokenHash: string;
+  createdAt: Date;
+  decidedAt: Date | null;
+  decision: "approved" | "declined" | null;
+};
+
+/** Copies of the consent tables, for tests (e.g. to check that no raw phone number is stored). */
+export type ConsentRows = {
+  customers: StoredCustomer[];
+  approvals: StoredApproval[];
+  challenges: ChallengeRecord[];
+  /** Each booking's consent columns: approve_by, customer_id, mandate. */
+  bookings: { id: string; approveBy: Date | null; customerId: string | null; mandate: Mandate | null }[];
+};
+
+/** What createMemoryStore returns: both interfaces plus read-only hooks for tests. */
 export type MemoryStore = ShopCatalog &
   BookingStore & {
     /** The lifecycle times stamped on a booking, or null if there's no such booking. For tests. */
     lifecycleStamps(bookingId: string): LifecycleStamps | null;
+    /** Copies of the consent rows. For tests. */
+    consentRows(): ConsentRows;
   };
 
-type StoredBooking = Omit<BookingRecord, "serviceName" | "timezone"> & LifecycleStamps;
+type StoredBooking = Omit<BookingRecord, "serviceName" | "timezone" | "customerPhoneLast4"> &
+  LifecycleStamps & { approveBy: Date | null; customerId: string | null; mandate: Mandate | null };
 
 type StoredEvent = NewBookingEvent & { seq: number; bookingId: string; at: Date };
 
@@ -207,6 +238,12 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   /** Settles when the call running that (tool, key) finishes. Never rejects. */
   const inFlight = new Map<string, Promise<void>>();
   let eventSeq = 0;
+  // Ring 1b consent tables.
+  const customers: StoredCustomer[] = [];
+  /** Keyed by booking id. */
+  const approvals = new Map<string, StoredApproval>();
+  const challenges: ChallengeRecord[] = [];
+  let challengeSeq = 0;
 
   const shopOf = (slug: string) => shops.find((s) => s.slug === slug);
   const staffInShop = (slug: string, staffId: string) => staff.find((s) => s.id === staffId && s.shopSlug === slug);
@@ -239,6 +276,8 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       customerName: b.customerName,
       agentName: b.agentName,
       createdAt: copyDate(b.createdAt),
+      // Like the Postgres left join on customers.
+      customerPhoneLast4: customers.find((c) => c.id === b.customerId)?.phoneLast4 ?? null,
       timezone: shop.timezone,
     };
   }
@@ -250,6 +289,12 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       throw new Error(`Unknown shop or service: ${input.shopSlug}/${input.serviceId}`);
     }
     if (!staff.some((s) => s.id === input.staffId)) throw new Error(`Unknown staff member: ${input.staffId}`);
+    const status = input.status ?? "confirmed";
+    // The bookings_hold_has_deadline and bookings_mandate_is_object checks, and approvals.token_hash unique.
+    if (status === "awaiting_approval" && !input.approveBy) throw new Error("A booking awaiting approval needs approveBy.");
+    if (input.approvalTokenHash && [...approvals.values()].some((a) => a.tokenHash === input.approvalTokenHash)) {
+      throw new Error("approvals.token_hash must be unique.");
+    }
     const stored: StoredBooking = {
       id: crypto.randomUUID(),
       shopSlug: input.shopSlug,
@@ -257,7 +302,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       staffId: input.staffId,
       start: copyDate(input.start),
       end: copyDate(input.end),
-      status: input.status ?? "confirmed",
+      status,
       customerName: input.customerName,
       agentName: input.agentName,
       depositCents: input.depositCents ?? service.depositCents,
@@ -266,10 +311,31 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       cancelledBy: null,
       completedAt: null,
       noShowAt: null,
+      approveBy: input.approveBy ? copyDate(input.approveBy) : null,
+      customerId: null,
+      mandate: input.mandate ? jsonCopy(input.mandate) : null,
     };
     bookings.push(stored);
+    if (input.approvalTokenHash) {
+      approvals.set(stored.id, { bookingId: stored.id, tokenHash: input.approvalTokenHash, createdAt: at, decidedAt: null, decision: null });
+    }
     return stored;
   }
+
+  /** Expire one lapsed hold (decide()'s expire row), with its "expired" event. True if it expired. */
+  function expireIfLapsed(b: StoredBooking, at: Date): boolean {
+    if (b.status !== "awaiting_approval" || !b.approveBy || b.approveBy.getTime() > at.getTime()) return false;
+    b.status = "expired";
+    addEvent(b.id, { actor: "system", type: "expired", data: expiredEventData(b.depositCents) }, now());
+    return true;
+  }
+
+  const copyChallenge = (c: ChallengeRecord): ChallengeRecord => ({
+    ...c,
+    expiresAt: copyDate(c.expiresAt),
+    consumedAt: c.consumedAt && copyDate(c.consumedAt),
+    createdAt: copyDate(c.createdAt),
+  });
 
   function addEvent(bookingId: string, event: NewBookingEvent, at: Date): void {
     events.push({ seq: ++eventSeq, bookingId, at, actor: event.actor, type: event.type, data: jsonCopy(event.data) });
@@ -318,12 +384,20 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
     },
 
     async getBusyIntervals(slug, range): Promise<BusyInterval[]> {
-      type Tagged = { id: string; kind: "booking" | "block"; staffId: string; start: Date; end: Date };
+      type Tagged = { id: string; kind: "booking" | "block"; staffId: string; start: Date; end: Date; heldUntil?: Date };
       const busy: Tagged[] = [
-        // Mirrors the no_overlap constraint: awaiting_deposit and confirmed bookings hold time.
+        // Mirrors the no_overlap constraint: awaiting_approval, awaiting_deposit and confirmed bookings
+        // hold time. A hold carries its deadline (lapsed ones included, like Postgres).
         ...bookings
           .filter((b) => b.shopSlug === slug && ACTIVE_STATUSES.includes(b.status) && overlaps(b, range))
-          .map((b) => ({ ...b, kind: "booking" as const })),
+          .map((b) => ({
+            id: b.id,
+            staffId: b.staffId,
+            start: b.start,
+            end: b.end,
+            kind: "booking" as const,
+            ...(b.status === "awaiting_approval" && b.approveBy ? { heldUntil: b.approveBy } : {}),
+          })),
         ...blocks
           .filter((b) => staffInShop(slug, b.staffId) && overlaps(b, range))
           .map((b) => ({ ...b, kind: "block" as const })),
@@ -336,6 +410,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
         end: copyDate(b.end),
         kind: b.kind,
         reason: `${b.kind} ${b.id}`,
+        ...(b.heldUntil ? { heldUntil: copyDate(b.heldUntil) } : {}),
       }));
     },
 
@@ -408,15 +483,28 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
     async createBooking(input) {
       if (!(input.start < input.end)) throw new Error("A booking must end after it starts.");
       // Mirrors: exclude using gist (staff_id with =, during with &&)
-      //          where (status in ('awaiting_deposit', 'confirmed'))
+      //          where (status in ('awaiting_approval', 'awaiting_deposit', 'confirmed'))
+      // A lapsed hold that nobody expired still clashes, as in Postgres: book expires them first.
       const clash = bookings.some(
         (b) => ACTIVE_STATUSES.includes(b.status) && b.staffId === input.staffId && overlaps(b, input),
       );
       if (clash) throw new SlotTakenError();
       const at = now();
-      // Always confirmed and stamped now, like the Postgres insert, whatever extra fields `input` carries.
-      const stored = insertBooking({ ...input, status: "confirmed", createdAt: undefined }, at);
-      addEvent(stored.id, { actor: "agent", type: "booked", data: { status: "confirmed", agentName: input.agentName } }, at);
+      // Always awaiting approval and stamped now, like the Postgres insert, whatever extra fields `input` carries.
+      const stored = insertBooking({ ...input, status: "awaiting_approval", createdAt: undefined }, at);
+      addEvent(
+        stored.id,
+        {
+          actor: "agent",
+          type: "booked",
+          data: {
+            status: "awaiting_approval",
+            agentName: input.agentName,
+            ...(stored.mandate ? { mandate: stored.mandate } : {}),
+          },
+        },
+        at,
+      );
       return toBooking(record(stored));
     },
 
@@ -432,20 +520,36 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       return b ? toBooking(record(b)) : null;
     },
 
+    async refreshBooking(id, at) {
+      // One synchronous step, like Postgres' single statement.
+      const b = findBooking(id);
+      if (!b) return null;
+      expireIfLapsed(b, at);
+      return toBooking(record(b));
+    },
+
+    async expireStaleHolds(shopSlug, range, at) {
+      let expired = 0;
+      for (const b of bookings) {
+        if (b.shopSlug === shopSlug && overlaps(b, range) && expireIfLapsed(b, at)) expired++;
+      }
+      return expired;
+    },
+
     async transition(id, expectedStatus, nextStatus, event) {
       // Check and set in one synchronous step (no await in this method), so of two concurrent
       // transitions from the same status exactly one sees expectedStatus.
       const b = findBooking(id);
       if (!b || b.status !== expectedStatus) return null;
       if (nextStatus === "cancelled" && event.actor === "system") {
-        // bookings.cancelled_by allows only 'agent' and 'owner'.
-        throw new Error('Only an "agent" or "owner" can cancel a booking.');
+        // bookings.cancelled_by allows only 'agent', 'owner' and 'customer'.
+        throw new Error('Only an "agent", "owner" or "customer" can cancel a booking.');
       }
       const at = now();
       b.status = nextStatus;
       if (nextStatus === "cancelled") {
         b.cancelledAt = at;
-        b.cancelledBy = event.actor as "agent" | "owner";
+        b.cancelledBy = event.actor as "agent" | "owner" | "customer";
       } else if (nextStatus === "completed") {
         b.completedAt = at;
       } else if (nextStatus === "no_show") {
@@ -511,6 +615,104 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
         release();
       }
     },
+
+    // ---- Ring 1b: consent. Each method checks and writes in one synchronous step (no await), so it
+    // is atomic like its Postgres transaction, and it checks everything before writing anything. ----
+
+    async findApproval(tokenHash) {
+      const approval = [...approvals.values()].find((a) => a.tokenHash === tokenHash);
+      const b = approval && bookings.find((x) => x.id === approval.bookingId);
+      if (!approval || !b?.approveBy) return null;
+      return {
+        bookingId: b.id,
+        decision: approval.decision,
+        approveBy: copyDate(b.approveBy),
+        mandate: b.mandate && jsonCopy(b.mandate),
+      };
+    },
+
+    async latestChallenge(bookingId) {
+      const key = normalizeUuid(bookingId);
+      let latest: ChallengeRecord | undefined;
+      for (const c of challenges) if (c.bookingId === key && (!latest || Number(c.id) > Number(latest.id))) latest = c;
+      return latest ? copyChallenge(latest) : null;
+    },
+
+    async createChallenge(input) {
+      const b = findBooking(input.bookingId);
+      if (!b || !approvals.has(b.id)) throw new Error(`No approval for booking ${input.bookingId}.`); // the foreign key
+      const windowStart = input.now.getTime() - input.limits.windowMs;
+      const inWindow = (c: ChallengeRecord) => c.createdAt.getTime() > windowStart && c.createdAt.getTime() <= input.now.getTime();
+      const limited = (rows: ChallengeRecord[], max: number) => {
+        if (rows.length < max) return null;
+        const oldest = Math.min(...rows.map((c) => c.createdAt.getTime()));
+        return oldest + input.limits.windowMs - input.now.getTime();
+      };
+      const byBooking = limited(challenges.filter((c) => c.bookingId === b.id && inWindow(c)), input.limits.perBooking);
+      if (byBooking !== null) return { ok: false, limit: "booking", retryAfterMs: byBooking };
+      const byPhone = limited(challenges.filter((c) => c.phoneHmac === input.phoneHmac && inWindow(c)), input.limits.perPhone);
+      if (byPhone !== null) return { ok: false, limit: "phone", retryAfterMs: byPhone };
+      const challenge: ChallengeRecord = {
+        id: String(++challengeSeq),
+        bookingId: b.id,
+        phoneHmac: input.phoneHmac,
+        phoneLast4: input.phoneLast4,
+        codeHash: input.codeHash,
+        expiresAt: copyDate(input.expiresAt),
+        attempts: 0,
+        consumedAt: null,
+        createdAt: copyDate(input.now),
+      };
+      challenges.push(challenge);
+      return { ok: true, challenge: copyChallenge(challenge) };
+    },
+
+    async recordCodeAttempt(challengeId, at, maxAttempts) {
+      const c = challenges.find((x) => x.id === challengeId);
+      if (!c || c.consumedAt !== null || c.expiresAt.getTime() <= at.getTime() || c.attempts >= maxAttempts) return null;
+      c.attempts += 1;
+      return c.attempts;
+    },
+
+    async answerApproval(input) {
+      const b = findBooking(input.bookingId);
+      const approval = b && approvals.get(b.id);
+      const challenge = input.challengeId === undefined ? undefined : challenges.find((c) => c.id === input.challengeId);
+      // Check everything first: there is no rollback here. Same order as the Postgres transaction:
+      // the approval, then the code, then the booking.
+      if (!b || !approval || approval.decision !== null) return { ok: false, reason: "not_pending" };
+      if (input.decision === "approved" && (!challenge || challenge.bookingId !== b.id || challenge.consumedAt !== null)) {
+        return { ok: false, reason: "code_used" };
+      }
+      if (b.status !== "awaiting_approval" || !b.approveBy || b.approveBy.getTime() <= input.now.getTime()) {
+        return { ok: false, reason: "not_pending" };
+      }
+      if (input.nextStatus === "cancelled" && input.event.actor === "system") {
+        throw new Error('Only an "agent", "owner" or "customer" can cancel a booking.');
+      }
+      const at = now();
+      if (input.decision === "approved" && challenge && input.customer) {
+        challenge.consumedAt = copyDate(input.now);
+        const { phoneHmac, phoneLast4, displayName } = input.customer;
+        let customer = customers.find((c) => c.phoneHmac === phoneHmac);
+        if (customer) {
+          Object.assign(customer, { phoneLast4, displayName });
+        } else {
+          customer = { id: crypto.randomUUID(), phoneHmac, phoneLast4, displayName, createdAt: at };
+          customers.push(customer);
+        }
+        b.customerId = customer.id;
+      }
+      b.status = input.nextStatus;
+      if (input.nextStatus === "cancelled") {
+        b.cancelledAt = at;
+        b.cancelledBy = "customer";
+      }
+      addEvent(b.id, input.event, at);
+      approval.decision = input.decision;
+      approval.decidedAt = copyDate(input.now);
+      return { ok: true, booking: toBooking(record(b)) };
+    },
   };
 
   /** The store an idempotent action gets: the same data, but idempotent() can't nest (as in Postgres). */
@@ -533,6 +735,23 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
         cancelledBy: b.cancelledBy,
         completedAt: b.completedAt && copyDate(b.completedAt),
         noShowAt: b.noShowAt && copyDate(b.noShowAt),
+      };
+    },
+    consentRows() {
+      return {
+        customers: customers.map((c) => ({ ...c, createdAt: copyDate(c.createdAt) })),
+        approvals: [...approvals.values()].map((a) => ({
+          ...a,
+          createdAt: copyDate(a.createdAt),
+          decidedAt: a.decidedAt && copyDate(a.decidedAt),
+        })),
+        challenges: challenges.map(copyChallenge),
+        bookings: bookings.map((b) => ({
+          id: b.id,
+          approveBy: b.approveBy && copyDate(b.approveBy),
+          customerId: b.customerId,
+          mandate: b.mandate && jsonCopy(b.mandate),
+        })),
       };
     },
   };

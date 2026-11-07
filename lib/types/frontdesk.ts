@@ -52,6 +52,14 @@ export type Slot = {
  * - `not_cancellable`: the booking is already final, or its start has passed. details.status.
  * - `idempotency_conflict`: the idempotency_key was already used with different arguments.
  * - `unauthorized`: an owner route without a valid `Authorization: Bearer` token.
+ * - `outside_mandate`: book refused a booking outside the person's mandate. details.field is
+ *   "price_cap", "deposit_cap" or "window".
+ * - `approval_expired`: the 10-minute hold lapsed before the person approved; the slot is free again.
+ * - `approval_closed`: the approval request was already answered, or the booking was cancelled.
+ * - `code_invalid`: the phone code is wrong (details.attemptsLeft), already used, or none was sent yet.
+ * - `code_expired`: the phone code is more than 10 minutes old. Request a new one.
+ * - `too_many_attempts`: 5 wrong codes for one code request. Request a new code.
+ * - `rate_limited`: too many code requests. details.retryAfter is in seconds.
  * - `internal`: our fault; retry once.
  */
 export type ApiErrorCode =
@@ -66,6 +74,13 @@ export type ApiErrorCode =
   | "not_cancellable"
   | "idempotency_conflict"
   | "unauthorized"
+  | "outside_mandate"
+  | "approval_expired"
+  | "approval_closed"
+  | "code_invalid"
+  | "code_expired"
+  | "too_many_attempts"
+  | "rate_limited"
   | "internal";
 
 /** Error envelope returned by every Front Desk API surface. */
@@ -184,15 +199,26 @@ export type GetAvailabilityResult = {
 
 /**
  * Where a booking stands.
+ * - `awaiting_approval`: the slot is held; the person hasn't approved yet. book creates every booking in
+ *   this status, held for 10 minutes. Approving makes it confirmed; declining cancels it; letting the
+ *   hold lapse expires it.
  * - `awaiting_deposit`: holds the slot until the deposit is paid. Not produced until Ring 1c.
- * - `confirmed`: the appointment is on.
- * - `cancelled`: cancelled by the agent or the owner. Frees the slot.
- * - `expired`: the deposit wasn't paid in time. Frees the slot. Not produced until Ring 1c.
+ * - `confirmed`: the appointment is on: the person approved it.
+ * - `cancelled`: cancelled by the agent or the owner, or declined by the person. Frees the slot.
+ * - `expired`: the person didn't approve within the 10-minute hold. Frees the slot. (Ring 1c: also a
+ *   deposit that wasn't paid in time.)
  * - `completed`: the owner marked it done, after the start.
  * - `no_show`: the owner marked that the customer didn't come, after the start.
- * `awaiting_deposit` and `confirmed` hold the time; the other four are final.
+ * `awaiting_approval`, `awaiting_deposit` and `confirmed` hold the time; the other four are final.
  */
-export type BookingStatus = "awaiting_deposit" | "confirmed" | "cancelled" | "expired" | "completed" | "no_show";
+export type BookingStatus =
+  | "awaiting_approval"
+  | "awaiting_deposit"
+  | "confirmed"
+  | "cancelled"
+  | "expired"
+  | "completed"
+  | "no_show";
 
 /** What the shop's policy does with the deposit when a booking changes state. */
 export type DepositEffect =
@@ -203,11 +229,17 @@ export type DepositEffect =
   /** The shop keeps the deposit (a late cancellation or a no-show). */
   | "captured";
 
-/** Who did something to a booking. `system` is for automatic changes (Ring 1c: deposit expiry). */
-export type BookingActor = "agent" | "owner" | "system";
+/**
+ * Who did something to a booking. `customer` is the person approving or declining through the
+ * approval link. `system` is for automatic changes (a hold that lapsed; Ring 1c: deposit expiry).
+ */
+export type BookingActor = "agent" | "owner" | "customer" | "system";
 
-/** What happened to a booking. Ring 1b/1c add more. */
-export type BookingEventType = "booked" | "cancelled" | "completed" | "no_show";
+/**
+ * What happened to a booking. `booked`: the agent placed the hold. `approved` / `declined`: the person
+ * answered the approval request. `expired`: the hold lapsed. Ring 1c adds more.
+ */
+export type BookingEventType = "booked" | "approved" | "declined" | "expired" | "cancelled" | "completed" | "no_show";
 
 /** One step in a booking's history. Every state change writes exactly one. */
 export type BookingEvent = {
@@ -219,9 +251,24 @@ export type BookingEvent = {
   actor: BookingActor;
   type: BookingEventType;
   /**
-   * Specifics. `booked`: { status, agentName }. A transition: { from, to, depositEffect, depositCollected }.
+   * Specifics. `booked`: { status, agentName, mandate? }. A transition: { from, to, depositEffect,
+   * depositCollected }; `approved` adds phoneLast4.
    */
   data: Record<string, unknown>;
+};
+
+/**
+ * The person's limits, sent by their agent with book. The server refuses a booking outside them
+ * (outside_mandate). Every field is optional; an absent field sets no limit.
+ * TODO(ring-2): require a mandate once agents sign in.
+ */
+export type Mandate = {
+  /** The most the service may cost, in integer cents. */
+  priceCapCents?: number;
+  /** The largest deposit the service may require, in integer cents. */
+  depositCapCents?: number;
+  /** The appointment, [start, end), must lie inside this window. RFC 3339 with offsets; from < to. */
+  window?: { from: string; to: string };
 };
 
 /** An appointment on a shop's calendar. */
@@ -243,10 +290,12 @@ export type Booking = {
   display: string;
   status: BookingStatus;
   customer: {
-    /** The name the agent gave for the customer. Not verified. */
+    /** The name the agent gave for the customer. */
     displayName: string;
-    /** Always false until Ring 1b: nobody has proven who the customer is. */
-    verified: false;
+    /** true once the person approved the booking with a code sent to their phone. */
+    verified: boolean;
+    /** Last 4 digits of the verified phone number, e.g. "0123". Present only when verified. */
+    phoneLast4?: string;
   };
   agent: {
     /** Best-effort label for the AI agent that booked, e.g. the MCP client's name. Unverified. */
@@ -256,6 +305,18 @@ export type Booking = {
   depositCents: number;
   /** When the booking was made, RFC 3339. */
   createdAt: string;
+  /**
+   * The link the person opens to approve or decline, and when the hold lapses. Present only while status
+   * is awaiting_approval, and only in book's result (and its idempotent replay): the link carries a
+   * secret token the server keeps only as a hash, so get_booking, the bookings list and the owner API
+   * never include it.
+   */
+  approval?: {
+    /** `${PUBLIC_BASE_URL}/approve/<token>`. Send it to the person; anyone holding it can answer. */
+    url: string;
+    /** When the hold lapses (book time + 10 minutes), RFC 3339 with the shop's offset. */
+    expiresAt: string;
+  };
 };
 
 /** Input of the `book` tool. */
@@ -271,9 +332,11 @@ export type BookInput = {
    * and the same arguments returns the first result instead of booking twice.
    */
   idempotency_key: string;
+  /** The person's limits. The server refuses a booking outside them (outside_mandate). Optional for now. */
+  mandate?: Mandate;
 };
 
-/** structuredContent of a successful `book` call. */
+/** structuredContent of a successful `book` call. booking.status is awaiting_approval, with booking.approval set. */
 export type BookResult = {
   booking: Booking;
 };
@@ -400,4 +463,86 @@ export type BookingDetailResponse = {
   booking: Booking;
   /** Oldest first. */
   events: BookingEvent[];
+};
+
+// ---- Approval page (public; the token in the path is the credential) ----
+// The page at /approve/[token] reads ApprovalView, asks for the person's phone number, sends a code
+// (SendCodeRequest), then approves (ApproveRequest) or declines. Every POST must carry an Origin header
+// equal to PUBLIC_BASE_URL's origin (the page's own origin), or it gets 403 invalid_request.
+
+/**
+ * GET /api/approvals/[token]. Unknown token → 404 booking_not_found.
+ * status:
+ * - `pending`: the hold is on and the person can approve or decline.
+ * - `approved`: the person approved; the booking was confirmed.
+ * - `declined`: the person declined; the booking was cancelled.
+ * - `expired`: the hold lapsed, or the agent or shop cancelled the booking, before the person answered.
+ */
+export type ApprovalView = {
+  status: "pending" | "approved" | "declined" | "expired";
+  shop: Shop;
+  serviceName: string;
+  /** Human-readable start in the shop's time zone, e.g. "Sat 14 Nov, 2:30 pm EST". */
+  display: string;
+  /** RFC 3339 with the shop's offset. */
+  start: string;
+  /** RFC 3339 with the shop's offset. */
+  end: string;
+  /** The service's price, in integer cents. */
+  priceCents: number;
+  /** The deposit the booking requires, in integer cents. 0 = none. Not collected until Ring 1c. */
+  depositCents: number;
+  /** The shop's rules to show before the person approves. */
+  policies: Pick<Policies, "cancelWindowHours" | "depositRule" | "lateCancelRule" | "noShowRule">;
+  /** Who asked for the booking: the agent's self-reported name. Unverified. */
+  agentName: string;
+  /** The name the agent booked under. */
+  customerName: string;
+  /** The limits the agent sent with book, if any. */
+  mandate?: Mandate;
+  /** When the hold lapses, RFC 3339 with the shop's offset. */
+  expiresAt: string;
+  /**
+   * Last 4 digits of the phone the latest code went to, while that code can still be used (unexpired,
+   * unused, attempts left). Absent otherwise.
+   */
+  codeSentTo?: string;
+};
+
+/**
+ * POST /api/approvals/[token]/code body. Only while the approval is pending. Spaces, dashes, dots and
+ * parentheses are ignored. Limits: 3 codes per phone number per hour, 10 per link per hour
+ * (rate_limited, details.retryAfter in seconds). A new code replaces the previous one.
+ */
+export type SendCodeRequest = {
+  /** E.164, e.g. "+14015550123". */
+  phone: string;
+};
+
+/** POST /api/approvals/[token]/code response. */
+export type SendCodeResponse = {
+  /** Last 4 digits of the phone the code went to, e.g. "0123". */
+  sentTo: string;
+  /** When the code stops working (10 minutes after sending), RFC 3339 with the shop's offset. */
+  expiresAt: string;
+  /** The code itself, only on local demos (FRONTDESK_DEV_CODES=1 outside Vercel production). Never in production. */
+  devCode?: string;
+};
+
+/**
+ * POST /api/approvals/[token]/approve body. The 6 digits of the latest code. 5 attempts per code
+ * (then too_many_attempts: request a new one); a code works once and for 10 minutes.
+ */
+export type ApproveRequest = {
+  code: string;
+};
+
+/** POST /api/approvals/[token]/approve response: the booking, now confirmed with a verified customer. */
+export type ApproveResponse = {
+  booking: Booking;
+};
+
+/** POST /api/approvals/[token]/decline response (no body needed): the booking, now cancelled. */
+export type DeclineResponse = {
+  booking: Booking;
 };

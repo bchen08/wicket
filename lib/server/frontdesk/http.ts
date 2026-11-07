@@ -10,7 +10,7 @@ import type {
   ServiceResponse,
   ServicesResponse,
 } from "../../types/frontdesk";
-import type { LifecycleAction } from "../engine/lifecycle";
+import type { ManageAction } from "../engine/lifecycle";
 import { FrontDeskError, toApiError } from "./errors";
 import {
   createShopBlock,
@@ -45,20 +45,33 @@ export const STATUS: Record<ApiErrorCode, number> = {
   outside_hours: 422,
   too_soon: 422,
   too_far: 422,
+  outside_mandate: 422,
+  approval_closed: 409,
+  approval_expired: 410,
+  code_invalid: 422,
+  code_expired: 410,
+  too_many_attempts: 429,
+  rate_limited: 429,
   internal: 500,
 };
 
 // Live data that may include customer names: never cache it anywhere.
-const NO_STORE = { "cache-control": "no-store" };
+export const NO_STORE = { "cache-control": "no-store" };
 
-/** Any thrown value as an ApiError response with a matching status. Unexpected errors are logged. */
+/**
+ * Any thrown value as an ApiError response with a matching status. Unexpected errors are logged.
+ * rate_limited also carries a Retry-After header (details.retryAfter, in seconds).
+ */
 export function errorResponse(err: unknown): Response {
   const body = toApiError(err);
   if (body.error.code === "internal") console.error("[frontdesk/http] internal error", err);
-  return Response.json(body, { status: STATUS[body.error.code], headers: NO_STORE });
+  const retryAfter = body.error.code === "rate_limited" ? body.error.details?.retryAfter : undefined;
+  const headers = typeof retryAfter === "number" ? { ...NO_STORE, "retry-after": String(retryAfter) } : NO_STORE;
+  return Response.json(body, { status: STATUS[body.error.code], headers });
 }
 
-async function respond<T>(run: () => Promise<T>, status = 200): Promise<Response> {
+/** Run a use case and answer JSON (`status` on success), or the ApiError envelope. */
+export async function respond<T>(run: () => Promise<T>, status = 200): Promise<Response> {
   try {
     return Response.json(await run(), { status, headers: NO_STORE });
   } catch (err) {
@@ -106,9 +119,9 @@ async function ownerRespond<T>(
 
 /**
  * The request's JSON body. An empty or malformed body is invalid_request (field "body"). Call it
- * inside ownerRespond's `run`, so the error becomes a 400 envelope.
+ * inside respond's `run`, so the error becomes a 400 envelope.
  */
-async function readJson(request: Request): Promise<unknown> {
+export async function readJson(request: Request): Promise<unknown> {
   const text = await request.text();
   const fail = (message: string) =>
     new FrontDeskError("invalid_request", message, "Send a JSON object as the request body, with Content-Type: application/json.", {
@@ -243,7 +256,7 @@ export function bookingActionPost(
   request: Request,
   shopSlug: string,
   bookingId: string,
-  action: LifecycleAction,
+  action: ManageAction,
   options?: OwnerOptions,
 ): Promise<Response> {
   return ownerRespond<OwnerBookingActionResponse>(getDeps, request, options, (deps) =>

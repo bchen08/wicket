@@ -5,6 +5,7 @@ import type {
   BlocksResponse,
   Booking,
   BookingDetailResponse,
+  BookingsResponse,
   HoursResponse,
   OwnerBookingActionResponse,
   PoliciesResponse,
@@ -12,7 +13,10 @@ import type {
   ServicesResponse,
   WeeklyHours,
 } from "../../types/frontdesk";
-import type { LifecycleAction } from "../engine/lifecycle";
+import type { Clock } from "../clock";
+import { approveBooking, sendApprovalCode } from "../consent/approvals";
+import { newApprovalToken, sha256Hex } from "../consent/crypto";
+import type { ManageAction } from "../engine/lifecycle";
 import { DepositExceedsPriceError } from "./catalog";
 import { ConfigurationError } from "./deps";
 import {
@@ -21,6 +25,7 @@ import {
   blocksPost,
   bookingActionPost,
   bookingDetailGet,
+  bookingsResponse,
   hoursGet,
   hoursPut,
   policiesGet,
@@ -31,7 +36,7 @@ import {
   type OwnerOptions,
 } from "./http";
 import type { FrontDeskDeps } from "./service";
-import { memoryDeps } from "./test-support";
+import { lastSentCode, memoryDeps, NOW } from "./test-support";
 
 // The owner routes, through the http.ts handlers the route files call (the routes only add
 // `await connection()` and read params). In-memory store; "now" is Mon 9 Nov 2026, noon in New York.
@@ -104,14 +109,20 @@ async function invalid(response: Promise<Response>, field: string) {
   return error;
 }
 
-/** A stored booking with dana, made through the store so it has its "booked" event. */
-function createBooking(
+type BookingExtra = { minutes?: number; serviceId?: string; depositCents?: number };
+
+/**
+ * A hold with dana awaiting approval, made through the store so it has its "booked" event, with a
+ * 10-minute deadline from the clock. Returns it and its approval token.
+ */
+async function createHold(
   deps: FrontDeskDeps,
   start: string,
-  extra: { minutes?: number; serviceId?: string; depositCents?: number } = {},
-): Promise<Booking> {
+  extra: BookingExtra = {},
+): Promise<{ booking: Booking; token: string }> {
   const s = new Date(start);
-  return deps.store.createBooking({
+  const token = newApprovalToken();
+  const booking = await deps.store.createBooking({
     shopSlug: SHOP,
     serviceId: extra.serviceId ?? "haircut",
     staffId: "dana",
@@ -120,12 +131,48 @@ function createBooking(
     customerName: "Pat Owner-Test",
     agentName: "test agent",
     depositCents: extra.depositCents ?? 1000,
+    approveBy: new Date(deps.clock.now().getTime() + 10 * 60_000),
+    approvalTokenHash: sha256Hex(token),
+    mandate: null,
   });
+  return { booking, token };
 }
 
-const PATH_FOR: Record<LifecycleAction, string> = { cancel: "cancel", complete: "complete", mark_no_show: "no-show" };
+let phoneSeq = 0;
+/** A fresh phone per approval, so the 3-codes-per-phone-per-hour limit never gets in the way. */
+const nextPhone = () => `+1401555${String(1000 + (phoneSeq++ % 9000))}`;
 
-function act(deps: FrontDeskDeps, bookingId: string, action: LifecycleAction, shop = SHOP) {
+/** The person approves through the approval use cases (send a code, approve with it). */
+async function approve(deps: FrontDeskDeps, token: string, phone = nextPhone()): Promise<Booking> {
+  await sendApprovalCode(deps, token, { phone });
+  return (await approveBooking(deps, token, { code: lastSentCode(deps) })).booking;
+}
+
+/** A confirmed booking with dana: a hold the person approved (events: booked, approved). */
+async function createBooking(deps: FrontDeskDeps, start: string, extra: BookingExtra = {}): Promise<Booking> {
+  return approve(deps, (await createHold(deps, start, extra)).token);
+}
+
+/** The events every confirmed booking starts with. */
+const BOOKED_THEN_APPROVED = [
+  ["booked", "agent"],
+  ["approved", "customer"],
+];
+
+/** A clock tests can move. */
+function movableClock(start: Date = NOW): Clock & { advance(ms: number): void } {
+  let t = start.getTime();
+  return {
+    now: () => new Date(t),
+    advance(ms) {
+      t += ms;
+    },
+  };
+}
+
+const PATH_FOR: Record<ManageAction, string> = { cancel: "cancel", complete: "complete", mark_no_show: "no-show" };
+
+function act(deps: FrontDeskDeps, bookingId: string, action: ManageAction, shop = SHOP) {
   return bookingActionPost(
     () => deps,
     request("POST", `/bookings/${bookingId}/${PATH_FOR[action]}`),
@@ -754,11 +801,13 @@ describe("POST /api/shops/[shop]/services and PATCH /api/shops/[shop]/services/[
 // ---- Booking detail and actions ----
 
 describe("GET /api/shops/[shop]/bookings/[id]", () => {
-  it("returns the booking and its booked event", async () => {
+  it("returns a hold awaiting approval, unverified, with its booked event", async () => {
     const deps = memoryDeps();
-    const booking = await createBooking(deps, FUTURE);
+    const { booking } = await createHold(deps, FUTURE);
     const body = await call<BookingDetailResponse>(detail(deps, booking.id));
     expect(body.booking).toEqual(booking);
+    expect(body.booking).toMatchObject({ status: "awaiting_approval", customer: { displayName: "Pat Owner-Test", verified: false } });
+    expect(body.booking).not.toHaveProperty("approval");
     expect(body.events).toEqual([
       {
         id: expect.any(String),
@@ -766,8 +815,42 @@ describe("GET /api/shops/[shop]/bookings/[id]", () => {
         at: "2026-11-09T12:00:00-05:00",
         actor: "agent",
         type: "booked",
-        data: { status: "confirmed", agentName: "test agent" },
+        data: { status: "awaiting_approval", agentName: "test agent" },
       },
+    ]);
+  });
+
+  it("shows the verified customer once the person approved", async () => {
+    const deps = memoryDeps();
+    const { booking, token } = await createHold(deps, FUTURE);
+    await approve(deps, token, "+14015550123");
+    const body = await call<BookingDetailResponse>(detail(deps, booking.id));
+    expect(body.booking).toEqual({
+      ...booking,
+      status: "confirmed",
+      customer: { displayName: "Pat Owner-Test", verified: true, phoneLast4: "0123" },
+    });
+    expect(body.events.map((e) => [e.type, e.actor, e.data])).toEqual([
+      ["booked", "agent", { status: "awaiting_approval", agentName: "test agent" }],
+      [
+        "approved",
+        "customer",
+        { from: "awaiting_approval", to: "confirmed", depositEffect: "none", depositCollected: false, phoneLast4: "0123" },
+      ],
+    ]);
+  });
+
+  it("expires a hold that ran out when it's read, with one expired event", async () => {
+    const clock = movableClock();
+    const deps = memoryDeps({ clock });
+    const { booking } = await createHold(deps, FUTURE);
+    clock.advance(10 * 60_000);
+    const body = await call<BookingDetailResponse>(detail(deps, booking.id));
+    expect(body.booking.status).toBe("expired");
+    await call<BookingDetailResponse>(detail(deps, booking.id));
+    expect((await call<BookingDetailResponse>(detail(deps, booking.id))).events.map((e) => [e.type, e.actor])).toEqual([
+      ["booked", "agent"],
+      ["expired", "system"],
     ]);
   });
 
@@ -781,16 +864,17 @@ describe("GET /api/shops/[shop]/bookings/[id]", () => {
     await call(act(deps, noShow.id, "mark_no_show"));
 
     const history = async (id: string) => (await call<BookingDetailResponse>(detail(deps, id))).events;
-    expect((await history(cancelled.id)).map((e) => [e.type, e.actor, e.data])).toEqual([
-      ["booked", "agent", { status: "confirmed", agentName: "test agent" }],
+    const afterApproval = async (id: string) => (await history(id)).slice(2).map((e) => [e.type, e.actor, e.data]);
+    for (const id of [cancelled.id, completed.id, noShow.id]) {
+      expect((await history(id)).slice(0, 2).map((e) => [e.type, e.actor])).toEqual(BOOKED_THEN_APPROVED);
+    }
+    expect(await afterApproval(cancelled.id)).toEqual([
       ["cancelled", "owner", { from: "confirmed", to: "cancelled", depositEffect: "released", depositCollected: false }],
     ]);
-    expect((await history(completed.id)).map((e) => [e.type, e.actor, e.data])).toEqual([
-      ["booked", "agent", { status: "confirmed", agentName: "test agent" }],
+    expect(await afterApproval(completed.id)).toEqual([
       ["completed", "owner", { from: "confirmed", to: "completed", depositEffect: "released", depositCollected: false }],
     ]);
-    expect((await history(noShow.id)).map((e) => [e.type, e.actor, e.data])).toEqual([
-      ["booked", "agent", { status: "confirmed", agentName: "test agent" }],
+    expect(await afterApproval(noShow.id)).toEqual([
       ["no_show", "owner", { from: "confirmed", to: "no_show", depositEffect: "captured", depositCollected: false }],
     ]);
   });
@@ -857,7 +941,7 @@ describe("POST /api/shops/[shop]/bookings/[id]/cancel, /complete and /no-show (o
     const booking = await createBooking(deps, FUTURE);
     await apiError(act(deps, booking.id, action), 400, "invalid_request");
     expect((await deps.store.getBooking(booking.id))?.status).toBe("confirmed");
-    expect(await deps.store.listEvents(booking.id)).toHaveLength(1);
+    expect(await deps.store.listEvents(booking.id)).toHaveLength(2);
   });
 
   it('marks a past booking no_show: deposit "captured", not collected; the detail shows both events', async () => {
@@ -870,10 +954,7 @@ describe("POST /api/shops/[shop]/bookings/[id]/cancel, /complete and /no-show (o
 
     const history = await call<BookingDetailResponse>(detail(deps, booking.id));
     expect(history.booking.status).toBe("no_show");
-    expect(history.events.map((e) => [e.type, e.actor])).toEqual([
-      ["booked", "agent"],
-      ["no_show", "owner"],
-    ]);
+    expect(history.events.map((e) => [e.type, e.actor])).toEqual([...BOOKED_THEN_APPROVED, ["no_show", "owner"]]);
   });
 
   it("marks a started booking completed: deposit released", async () => {
@@ -889,7 +970,7 @@ describe("POST /api/shops/[shop]/bookings/[id]/cancel, /complete and /no-show (o
     await call(act(deps, noShow.id, "mark_no_show"));
     const error = await apiError(act(deps, noShow.id, action), 400, "invalid_request");
     expect(error.details).toMatchObject({ status: "no_show", action });
-    expect(await deps.store.listEvents(noShow.id)).toHaveLength(2);
+    expect(await deps.store.listEvents(noShow.id)).toHaveLength(3);
 
     // A booking preloaded as cancelled, in the future (so the start isn't what blocks it).
     const preloaded = memoryDeps({
@@ -913,6 +994,40 @@ describe("POST /api/shops/[shop]/bookings/[id]/cancel, /complete and /no-show (o
     await apiError(act(preloaded, cancelled.id, action), 400, "invalid_request");
   });
 
+  it("cancels a hold awaiting approval any time, even after its start: released, and the approval link is closed", async () => {
+    const deps = memoryDeps();
+    const future = await createHold(deps, FUTURE);
+    const started = await createHold(deps, PAST);
+    const body = await call<OwnerBookingActionResponse>(act(deps, future.booking.id, "cancel"));
+    expect(body).toEqual({ booking: { ...future.booking, status: "cancelled" }, depositEffect: "released", depositCollected: false });
+    expect((await call<OwnerBookingActionResponse>(act(deps, started.booking.id, "cancel"))).booking.status).toBe("cancelled");
+    expect((await deps.store.listEvents(future.booking.id)).map((e) => [e.type, e.actor])).toEqual([
+      ["booked", "agent"],
+      ["cancelled", "owner"],
+    ]);
+    // The person can no longer approve it.
+    await expect(sendApprovalCode(deps, future.token, { phone: nextPhone() })).rejects.toMatchObject({ code: "approval_closed" });
+  });
+
+  it.each(["complete", "mark_no_show"] as const)("can't %s a hold awaiting approval (400 invalid_request)", async (action) => {
+    const deps = memoryDeps();
+    const { booking } = await createHold(deps, PAST);
+    const error = await apiError(act(deps, booking.id, action), 400, "invalid_request");
+    expect(error.details).toMatchObject({ status: "awaiting_approval", action });
+    expect(error.message).toMatch(/awaiting approval/);
+    expect((await deps.store.getBooking(booking.id))?.status).toBe("awaiting_approval");
+    expect(await deps.store.listEvents(booking.id)).toHaveLength(1);
+  });
+
+  it("can't cancel a hold that ran out: it reads as expired (400 invalid_request)", async () => {
+    const clock = movableClock();
+    const deps = memoryDeps({ clock });
+    const { booking } = await createHold(deps, FUTURE);
+    clock.advance(10 * 60_000);
+    const error = await apiError(act(deps, booking.id, "cancel"), 400, "invalid_request");
+    expect(error.details).toMatchObject({ status: "expired", action: "cancel" });
+  });
+
   it.each(["cancel", "complete", "mark_no_show"] as const)("%s: 404 booking_not_found for an unknown id", async (action) => {
     await apiError(act(memoryDeps(), RANDOM_UUID, action), 404, "booking_not_found");
   });
@@ -930,7 +1045,29 @@ describe("POST /api/shops/[shop]/bookings/[id]/cancel, /complete and /no-show (o
     expect(loser.error.details).toMatchObject({ status: winner.booking.status });
 
     const events = await deps.store.listEvents(booking.id);
-    expect(events.filter((e) => e.type !== "booked")).toHaveLength(1);
+    expect(events.filter((e) => e.type !== "booked" && e.type !== "approved")).toHaveLength(1);
     expect((await deps.store.getBooking(booking.id))?.status).toBe(winner.booking.status);
+  });
+});
+
+describe("GET /api/shops/[shop]/bookings (the owner's list)", () => {
+  it("shows holds awaiting approval, verified customers with their phone's last 4 digits, and expires lapsed holds", async () => {
+    const clock = movableClock();
+    const deps = memoryDeps({ clock });
+    const lapsing = await createHold(deps, "2026-11-14T09:00:00-05:00");
+    clock.advance(5 * 60_000);
+    const live = await createHold(deps, FUTURE);
+    const confirmed = await createHold(deps, "2026-11-14T11:00:00-05:00");
+    await approve(deps, confirmed.token, "+14015550123");
+    clock.advance(5 * 60_000); // the first hold's deadline; the second still has 5 minutes
+
+    const body = await call<BookingsResponse>(bookingsResponse(() => deps, SHOP));
+    expect(body.bookings.map((b) => [b.id, b.status, b.customer])).toEqual([
+      [lapsing.booking.id, "expired", { displayName: "Pat Owner-Test", verified: false }],
+      [live.booking.id, "awaiting_approval", { displayName: "Pat Owner-Test", verified: false }],
+      [confirmed.booking.id, "confirmed", { displayName: "Pat Owner-Test", verified: true, phoneLast4: "0123" }],
+    ]);
+    expect(body.bookings.every((b) => !("approval" in b))).toBe(true);
+    expect((await deps.store.listEvents(lapsing.booking.id)).map((e) => e.type)).toEqual(["booked", "expired"]);
   });
 });

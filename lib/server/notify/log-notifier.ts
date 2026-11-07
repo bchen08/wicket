@@ -8,15 +8,15 @@ export function firstName(displayName: string): string {
 }
 
 /**
- * Ring 0 notifier: one structured JSON log line per booking, readable in Vercel's logs.
- * Logs no customer details beyond the first name.
+ * Ring 0 notifier: one structured JSON log line per approved booking (event "booking.confirmed"),
+ * readable in Vercel's logs. Logs no customer details beyond the first name.
  */
 export function createLogNotifier(log: (line: string) => void = console.log): Notifier {
   return {
     async alertOwner(booking) {
       log(
         JSON.stringify({
-          event: "booking.created",
+          event: "booking.confirmed",
           id: booking.id,
           shop: booking.shopSlug,
           service: booking.serviceId,

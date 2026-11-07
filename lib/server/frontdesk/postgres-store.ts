@@ -1,12 +1,23 @@
 import postgres from "postgres";
-import type { BlockedTime, Booking, BookingActor, BookingEventType, BookingStatus, Policies, Service } from "../../types/frontdesk";
+import type {
+  BlockedTime,
+  Booking,
+  BookingActor,
+  BookingEventType,
+  BookingStatus,
+  Mandate,
+  Policies,
+  Service,
+} from "../../types/frontdesk";
 import {
   IDEMPOTENCY_TTL_MS,
   SlotTakenError,
   toBooking,
   toBookingEvent,
+  type AnswerApprovalResult,
   type BookingRecord,
   type BookingStore,
+  type ChallengeRecord,
   type IdempotencyScope,
   type IdempotentStore,
   type NewBooking,
@@ -24,7 +35,7 @@ import {
 import { idempotencyConflict, nestedIdempotencyError, normalizeUuid } from "./idempotency-errors";
 
 // Postgres ShopCatalog + BookingStore (postgres.js), for the schema in
-// supabase/migrations/0001_skeleton.sql and 0002_rules.sql.
+// supabase/migrations/0001_skeleton.sql, 0002_rules.sql and 0003_consent.sql.
 
 /** SQLSTATE exclusion_violation: the bookings.no_overlap constraint fired. */
 const EXCLUSION_VIOLATION = "23P01";
@@ -86,6 +97,7 @@ type BookingRow = {
   customer_name: string;
   agent_name: string;
   created_at: Date;
+  customer_phone_last4: string | null;
   timezone: string;
 };
 
@@ -103,8 +115,52 @@ function toRecord(r: BookingRow): BookingRecord {
     customerName: r.customer_name,
     agentName: r.agent_name,
     createdAt: r.created_at,
+    customerPhoneLast4: r.customer_phone_last4,
     timezone: r.timezone,
   };
+}
+
+type ChallengeRow = {
+  id: string;
+  booking_id: string;
+  phone_hmac: string;
+  phone_last4: string;
+  code_hash: string;
+  expires_at: Date;
+  attempts: number;
+  consumed_at: Date | null;
+  created_at: Date;
+};
+
+function toChallenge(r: ChallengeRow): ChallengeRecord {
+  return {
+    id: r.id,
+    bookingId: r.booking_id,
+    phoneHmac: r.phone_hmac,
+    phoneLast4: r.phone_last4,
+    codeHash: r.code_hash,
+    expiresAt: r.expires_at,
+    attempts: r.attempts,
+    consumedAt: r.consumed_at,
+    createdAt: r.created_at,
+  };
+}
+
+const challengeColumns = (db: Db) => db`
+  id::text as id, booking_id::text as booking_id, phone_hmac, phone_last4, code_hash, expires_at, attempts,
+  consumed_at, created_at
+`;
+
+/** An otp_challenges id (a bigint), or null if `id` can't be one. */
+function challengeKey(id: string): string | null {
+  return /^[1-9]\d{0,18}$/.test(id) ? id : null;
+}
+
+/** Thrown inside answerApproval's transaction to roll it back with a reason. */
+class AnswerRollback extends Error {
+  constructor(readonly reason: "code_used" | "not_pending") {
+    super(reason);
+  }
 }
 
 type EventRow = {
@@ -183,16 +239,26 @@ const tstzrange = (db: Db, range: TimeRange) =>
 
 /**
  * The columns of a Booking. `b` is bookings or a CTE with the same columns; depositCents is the
- * booking's own snapshot, and the service name is joined in by bookingJoins.
+ * booking's own snapshot, and the service name and verified customer are joined in by bookingJoins.
  */
 const bookingColumns = (db: Db) => db`
   b.id::text as id, b.shop_slug, b.service_id, sv.name as service_name, b.deposit_cents,
   b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at, b.status,
-  b.customer_name, b.agent_name, b.created_at, sh.timezone
+  b.customer_name, b.agent_name, b.created_at, c.phone_last4 as customer_phone_last4, sh.timezone
 `;
 const bookingJoins = (db: Db) => db`
   join services sv on sv.shop_slug = b.shop_slug and sv.id = b.service_id
   join shops sh on sh.slug = b.shop_slug
+  left join customers c on c.id = b.customer_id
+`;
+
+/** An "expired" event's data for an expiring row `x` (see expiredEventData in booking-store.ts, which the memory store uses). */
+const expiredEventJson = (db: Db) => db`
+  jsonb_build_object(
+    'from', 'awaiting_approval', 'to', 'expired',
+    'depositEffect', case when x.deposit_cents > 0 then 'released' else 'none' end,
+    'depositCollected', false
+  )
 `;
 
 const policyColumns = (db: Db) => db`
@@ -201,21 +267,30 @@ const policyColumns = (db: Db) => db`
 `;
 
 /**
- * One statement: insert the booking with its deposit snapshot and its "booked" event (data-modifying
- * CTEs), and return the joined Booking.
+ * One statement: insert the held booking with its deposit snapshot, deadline and mandate, its approval
+ * request and its "booked" event (data-modifying CTEs), and return the joined Booking.
  */
 async function insertBooking(db: Db, input: NewBooking): Promise<Booking> {
+  const mandate = input.mandate ? db.json(input.mandate as postgres.JSONValue) : null;
   const rows = await db<BookingRow[]>`
     with b as (
-      insert into bookings (shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents)
+      insert into bookings (
+        shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents, approve_by, mandate
+      )
       values (
         ${input.shopSlug}, ${input.serviceId}, ${input.staffId}, ${tstzrange(db, input)},
-        'confirmed', ${input.customerName}, ${input.agentName}, ${input.depositCents}
+        'awaiting_approval', ${input.customerName}, ${input.agentName}, ${input.depositCents},
+        ${input.approveBy.toISOString()}::timestamptz, ${mandate}::jsonb
       )
       returning *
+    ), a as (
+      insert into approvals (booking_id, token_hash) select id, ${input.approvalTokenHash}::text from b
     ), e as (
       insert into events (booking_id, actor, type, data)
-      select id, 'agent', 'booked', jsonb_build_object('status', status, 'agentName', agent_name) from b
+      select id, 'agent', 'booked',
+             jsonb_build_object('status', status, 'agentName', agent_name)
+               || case when mandate is null then '{}'::jsonb else jsonb_build_object('mandate', mandate) end
+      from b
     )
     select ${bookingColumns(db)} from b ${bookingJoins(db)}
   `;
@@ -270,6 +345,45 @@ function bookingStoreOn(conn: Conn): BookingStore {
         select ${bookingColumns(db)} from bookings b ${bookingJoins(db)} where b.id = ${key}::uuid
       `;
       return rows[0] ? toBooking(toRecord(rows[0])) : null;
+    },
+
+    async refreshBooking(id, now) {
+      const key = normalizeUuid(id);
+      if (key === null) return null;
+      // One statement, so the expiry, its event and the read are atomic. The second branch reads the
+      // row only when the first expired nothing (a data-modifying CTE's changes aren't visible to the
+      // rest of the statement, so it would show the old status).
+      const rows = await db<BookingRow[]>`
+        with x as (
+          update bookings set status = 'expired'
+          where id = ${key}::uuid and status = 'awaiting_approval' and approve_by <= ${now.toISOString()}::timestamptz
+          returning *
+        ), e as (
+          insert into events (booking_id, actor, type, data) select x.id, 'system', 'expired', ${expiredEventJson(db)} from x
+        )
+        select ${bookingColumns(db)} from x b ${bookingJoins(db)}
+        union all
+        select ${bookingColumns(db)} from bookings b ${bookingJoins(db)}
+        where b.id = ${key}::uuid and not exists (select 1 from x)
+      `;
+      return rows[0] ? toBooking(toRecord(rows[0])) : null;
+    },
+
+    async expireStaleHolds(shopSlug, range, now) {
+      // Of two concurrent expiries the second waits for the first's row locks, re-checks the status
+      // and skips the rows already expired, so each hold gets exactly one event.
+      const [row] = await db<{ n: number }[]>`
+        with x as (
+          update bookings set status = 'expired'
+          where shop_slug = ${shopSlug} and status = 'awaiting_approval'
+            and approve_by <= ${now.toISOString()}::timestamptz and during && ${tstzrange(db, range)}
+          returning id, deposit_cents
+        ), e as (
+          insert into events (booking_id, actor, type, data) select x.id, 'system', 'expired', ${expiredEventJson(db)} from x
+        )
+        select count(*)::int as n from x
+      `;
+      return row?.n ?? 0;
     },
 
     async transition(id, expectedStatus, nextStatus, event) {
@@ -362,6 +476,144 @@ function bookingStoreOn(conn: Conn): BookingStore {
       });
       return outcome as { result: T; replayed: boolean };
     },
+
+    // ---- Ring 1b: consent ----
+
+    async findApproval(tokenHash) {
+      const rows = await db<{ booking_id: string; decision: "approved" | "declined" | null; approve_by: Date | null; mandate: Mandate | null }[]>`
+        select a.booking_id::text as booking_id, a.decision, b.approve_by, b.mandate
+        from approvals a join bookings b on b.id = a.booking_id
+        where a.token_hash = ${tokenHash}
+      `;
+      const r = rows[0];
+      if (!r || !r.approve_by) return null;
+      return { bookingId: r.booking_id, decision: r.decision, approveBy: r.approve_by, mandate: r.mandate };
+    },
+
+    async latestChallenge(bookingId) {
+      const key = normalizeUuid(bookingId);
+      if (key === null) return null;
+      const rows = await db<ChallengeRow[]>`
+        select ${challengeColumns(db)} from otp_challenges where booking_id = ${key}::uuid order by id desc limit 1
+      `;
+      return rows[0] ? toChallenge(rows[0]) : null;
+    },
+
+    async createChallenge(input) {
+      const key = normalizeUuid(input.bookingId);
+      if (key === null) throw new Error(`Not a booking id: ${input.bookingId}`);
+      const now = input.now.toISOString();
+      const windowStart = new Date(input.now.getTime() - input.limits.windowMs).toISOString();
+      const create = async (tx: postgres.TransactionSql) => {
+        // Serialize sends per link (the approval row) and per phone (an advisory lock), so counting and
+        // inserting can't interleave with another send. Always in this order, so they can't deadlock.
+        const locked = await tx`select booking_id from approvals where booking_id = ${key}::uuid for update`;
+        if (locked.length === 0) throw new Error(`No approval for booking ${key}.`);
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`otp:${input.phoneHmac}`}, 0))`;
+        const [counts] = await tx<{ booking_count: number; booking_oldest: Date | null; phone_count: number; phone_oldest: Date | null }[]>`
+          select
+            count(*) filter (where booking_id = ${key}::uuid)::int as booking_count,
+            min(created_at) filter (where booking_id = ${key}::uuid) as booking_oldest,
+            count(*) filter (where phone_hmac = ${input.phoneHmac})::int as phone_count,
+            min(created_at) filter (where phone_hmac = ${input.phoneHmac}) as phone_oldest
+          from otp_challenges
+          where (booking_id = ${key}::uuid or phone_hmac = ${input.phoneHmac})
+            and created_at > ${windowStart}::timestamptz and created_at <= ${now}::timestamptz
+        `;
+        const retryAfter = (oldest: Date | null) =>
+          (oldest?.getTime() ?? input.now.getTime()) + input.limits.windowMs - input.now.getTime();
+        if (counts.booking_count >= input.limits.perBooking) {
+          return { ok: false as const, limit: "booking" as const, retryAfterMs: retryAfter(counts.booking_oldest) };
+        }
+        if (counts.phone_count >= input.limits.perPhone) {
+          return { ok: false as const, limit: "phone" as const, retryAfterMs: retryAfter(counts.phone_oldest) };
+        }
+        const [row] = await tx<ChallengeRow[]>`
+          insert into otp_challenges (booking_id, phone_hmac, phone_last4, code_hash, expires_at, created_at)
+          values (
+            ${key}::uuid, ${input.phoneHmac}, ${input.phoneLast4}, ${input.codeHash},
+            ${input.expiresAt.toISOString()}::timestamptz, ${now}::timestamptz
+          )
+          returning ${challengeColumns(tx)}
+        `;
+        if (!row) throw new Error("Insert into otp_challenges returned no row.");
+        return { ok: true as const, challenge: toChallenge(row) };
+      };
+      return conn.kind === "root" ? conn.sql.begin(create) : conn.sql.savepoint(create);
+    },
+
+    async recordCodeAttempt(challengeId, now, maxAttempts) {
+      const key = challengeKey(challengeId);
+      if (key === null) return null;
+      const rows = await db<{ attempts: number }[]>`
+        update otp_challenges set attempts = attempts + 1
+        where id = ${key}::bigint and consumed_at is null
+          and expires_at > ${now.toISOString()}::timestamptz and attempts < ${maxAttempts}
+        returning attempts
+      `;
+      return rows[0]?.attempts ?? null;
+    },
+
+    async answerApproval(input) {
+      const key = normalizeUuid(input.bookingId);
+      if (key === null) return { ok: false, reason: "not_pending" };
+      const now = input.now.toISOString();
+      const answer = async (tx: postgres.TransactionSql): Promise<Booking> => {
+        // The approval row first, like createChallenge, so the two can't deadlock.
+        const decided = await tx`
+          update approvals set decision = ${input.decision}, decided_at = ${now}::timestamptz
+          where booking_id = ${key}::uuid and decided_at is null
+          returning booking_id
+        `;
+        if (decided.length === 0) throw new AnswerRollback("not_pending");
+        let customerId: string | null = null;
+        if (input.decision === "approved") {
+          const challenge = input.challengeId === undefined ? null : challengeKey(input.challengeId);
+          const consumed =
+            challenge === null
+              ? []
+              : await tx`
+                  update otp_challenges set consumed_at = ${now}::timestamptz
+                  where id = ${challenge}::bigint and booking_id = ${key}::uuid and consumed_at is null
+                  returning id
+                `;
+          if (consumed.length === 0) throw new AnswerRollback("code_used");
+          if (!input.customer) throw new Error("answerApproval: an approval needs the customer.");
+          const [customer] = await tx<{ id: string }[]>`
+            insert into customers (phone_hmac, phone_last4, display_name)
+            values (${input.customer.phoneHmac}, ${input.customer.phoneLast4}, ${input.customer.displayName})
+            on conflict (phone_hmac) do update
+              set phone_last4 = excluded.phone_last4, display_name = excluded.display_name
+            returning id::text as id
+          `;
+          customerId = customer?.id ?? null;
+        }
+        const rows = await tx<BookingRow[]>`
+          with t as (
+            update bookings set
+              status = ${input.nextStatus},
+              customer_id = coalesce(${customerId}::uuid, customer_id),
+              cancelled_at = case when ${input.nextStatus === "cancelled"} then now() else cancelled_at end,
+              cancelled_by = case when ${input.nextStatus === "cancelled"} then 'customer' else cancelled_by end
+            where id = ${key}::uuid and status = 'awaiting_approval' and approve_by > ${now}::timestamptz
+            returning *
+          ), e as (
+            insert into events (booking_id, actor, type, data)
+            select id, ${input.event.actor}::text, ${input.event.type}::text, ${tx.json(input.event.data as postgres.JSONValue)}::jsonb from t
+          )
+          select ${bookingColumns(tx)} from t b ${bookingJoins(tx)}
+        `;
+        if (!rows[0]) throw new AnswerRollback("not_pending");
+        return toBooking(toRecord(rows[0]));
+      };
+      try {
+        const booking = await (conn.kind === "root" ? conn.sql.begin(answer) : conn.sql.savepoint(answer));
+        return { ok: true, booking } satisfies AnswerApprovalResult;
+      } catch (err) {
+        if (err instanceof AnswerRollback) return { ok: false, reason: err.reason };
+        throw err;
+      }
+    },
   };
   return store;
 }
@@ -416,19 +668,21 @@ function catalogOn(conn: Conn): ShopCatalog {
 
     async getBusyIntervals(slug, range): Promise<BusyInterval[]> {
       // Weekly hours already leave out lunch, so busy time is bookings that hold time (the statuses
-      // in the no_overlap constraint) plus blocked times. Ordered by start, then kind, then id.
+      // in the no_overlap constraint; a hold carries its deadline) plus blocked times. Ordered by
+      // start, then kind, then id.
       const rows = await sql<
-        { kind: "booking" | "block"; id: string; staff_id: string; start_at: Date; end_at: Date }[]
+        { kind: "booking" | "block"; id: string; staff_id: string; start_at: Date; end_at: Date; held_until: Date | null }[]
       >`
-        select busy.kind, busy.id::text as id, busy.staff_id, busy.start_at, busy.end_at
+        select busy.kind, busy.id::text as id, busy.staff_id, busy.start_at, busy.end_at, busy.held_until
         from (
-          select 'booking' as kind, b.id, b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at
+          select 'booking' as kind, b.id, b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at,
+                 case when b.status = 'awaiting_approval' then b.approve_by end as held_until
           from bookings b
           where b.shop_slug = ${slug}
-            and b.status in ('awaiting_deposit', 'confirmed')
+            and b.status in ('awaiting_approval', 'awaiting_deposit', 'confirmed')
             and b.during && ${tstzrange(sql, range)}
           union all
-          select 'block', bt.id, bt.staff_id, lower(bt.during), upper(bt.during)
+          select 'block', bt.id, bt.staff_id, lower(bt.during), upper(bt.during), null
           from blocked_times bt
           join staff s on s.id = bt.staff_id
           where s.shop_slug = ${slug} and bt.during && ${tstzrange(sql, range)}
@@ -441,6 +695,7 @@ function catalogOn(conn: Conn): ShopCatalog {
         end: r.end_at,
         kind: r.kind,
         reason: `${r.kind} ${r.id}`,
+        ...(r.held_until ? { heldUntil: r.held_until } : {}),
       }));
     },
 
