@@ -11,7 +11,7 @@ import {
   getPolicies,
   type FrontDeskDeps,
 } from "./service";
-import { memoryDeps, NOW, SAT } from "./test-support";
+import { memoryDeps, NOW, SAT, withCatalog } from "./test-support";
 
 // The agent's cancel, get_booking and get_policies use cases against the in-memory store. "Now" is
 // Mon 9 Nov 2026, noon in New York. Hart's cancel window is 24 hours; haircut has a $10 deposit,
@@ -57,16 +57,12 @@ const cancel = (deps: FrontDeskDeps, booking_id: string, idempotency_key = key()
 
 /** Deps that also know a second shop, "elsewhere", with no bookings of its own. */
 function withSecondShop(deps: FrontDeskDeps): FrontDeskDeps {
-  return {
-    ...deps,
-    catalog: {
-      ...deps.catalog,
-      getShop: async (slug) =>
-        slug === "elsewhere"
-          ? { slug: "elsewhere", name: "Elsewhere Cuts", timezone: "America/New_York" }
-          : deps.catalog.getShop(slug),
-    },
-  };
+  return withCatalog(deps, (catalog) => ({
+    getShop: async (slug: string) =>
+      slug === "elsewhere"
+        ? { slug: "elsewhere", name: "Elsewhere Cuts", timezone: "America/New_York" }
+        : catalog.getShop(slug),
+  }));
 }
 
 describe("cancelBooking", () => {

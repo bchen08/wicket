@@ -416,15 +416,16 @@ export async function book(
       customer_name: args.customer_name,
     }),
   };
-  const { result, replayed } = await deps.store.idempotent(scope, (store) =>
-    bookOnce({ ...deps, store }, shopSlug, args, start, cleanAgentName(agentName)),
+  // The action reads and writes through the store it's given (in Postgres, the key's transaction).
+  const { result, replayed } = await deps.store.idempotent(scope, (tx) =>
+    bookOnce({ ...deps, catalog: tx, store: tx }, shopSlug, args, start, cleanAgentName(agentName)),
   );
 
   if (!replayed) await alertOwner(deps.notifier, result.booking);
   return { ...result, replayed };
 }
 
-/** Steps 3 and 4 of book(): check the start and store the booking. `deps.store` is the idempotent action's store. */
+/** Steps 3 and 4 of book(): check the start and store the booking. `deps.catalog` and `deps.store` are the idempotent action's store. */
 async function bookOnce(
   deps: FrontDeskDeps,
   shopSlug: string,
@@ -668,8 +669,8 @@ export async function cancelBooking(
     // A UUID in either case is the same booking, so the same request.
     requestHash: requestHash({ shop: shopSlug, booking_id: normalizeUuid(args.booking_id) ?? args.booking_id }),
   };
-  const { result, replayed } = await deps.store.idempotent(scope, (store) =>
-    transitionBooking({ ...deps, store }, shopSlug, args.booking_id, "cancel", "agent"),
+  const { result, replayed } = await deps.store.idempotent(scope, (tx) =>
+    transitionBooking({ ...deps, catalog: tx, store: tx }, shopSlug, args.booking_id, "cancel", "agent"),
   );
   return { ...result, replayed };
 }

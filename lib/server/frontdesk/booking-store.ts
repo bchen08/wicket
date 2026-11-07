@@ -7,7 +7,7 @@ import type {
   BookingStatus,
 } from "../../types/frontdesk";
 import { formatDisplay } from "../engine/availability";
-import type { TimeRange } from "./catalog";
+import type { ShopCatalog, TimeRange } from "./catalog";
 import { toRfc3339 } from "./time";
 
 // Data access for bookings. Implementations: postgres-store.ts and memory-store.ts.
@@ -48,6 +48,14 @@ export type IdempotencyScope = {
 /** How long a key is remembered. After this it may be reused. TODO(ring-2): a job that deletes old keys. */
 export const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * What an idempotent action works with: the bookings AND the shop catalog, both bound to the
+ * idempotency transaction in Postgres. The action must read through it (not deps.catalog): reads on
+ * the root client would each need a second pooled connection while the transaction holds one, so
+ * as many concurrent writes as the pool has connections could wait on each other forever.
+ */
+export type IdempotentStore = BookingStore & ShopCatalog;
+
 export interface BookingStore {
   /**
    * Store a confirmed booking and its "booked" event (actor "agent", data { status: "confirmed",
@@ -87,12 +95,13 @@ export interface BookingStore {
    * - Same key, different requestHash: throws FrontDeskError("idempotency_conflict").
    * Concurrent calls with the same key are serialized: the second waits for the first to finish,
    * then replays (or, if the first threw, runs). `T` must survive a JSON round trip.
-   * Postgres: one transaction; `action` gets a store bound to it, so the action's writes commit or
-   * roll back together with the key.
+   * Postgres: one transaction; `action` gets a store (bookings and catalog) bound to it, so the
+   * action's writes commit or roll back together with the key, and its reads use the connection the
+   * transaction already holds (see IdempotentStore).
    */
   idempotent<T>(
     scope: IdempotencyScope,
-    action: (store: BookingStore) => Promise<T>,
+    action: (store: IdempotentStore) => Promise<T>,
   ): Promise<{ result: T; replayed: boolean }>;
 }
 

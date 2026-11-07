@@ -12,7 +12,7 @@ import type {
 import { agentNameFrom, createFrontDeskMcpHandler } from "./mcp";
 import { SEED } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
-import { EXAMPLE_BOOKINGS, memoryDeps } from "./test-support";
+import { EXAMPLE_BOOKINGS, memoryDeps, withCatalog } from "./test-support";
 
 // End to end through the real MCP handler (the same one /api/mcp mounts), speaking
 // stateless Streamable HTTP JSON-RPC. "Now" is Mon 9 Nov 2026, noon in New York, so the coming
@@ -317,16 +317,10 @@ describe("MCP book tool", () => {
   it("returns slot_taken through the envelope when the database refuses an overlap", async () => {
     expect((await callTool("book", bookArgs())).isError).toBeFalsy();
     // Simulate a race: this call's availability check misses the booking above; the store has it.
-    const base = deps;
     let reads = 0;
-    deps = {
-      ...base,
-      catalog: {
-        ...base.catalog,
-        getBusyIntervals: async (slug, range) =>
-          reads++ === 0 ? [] : base.catalog.getBusyIntervals(slug, range),
-      },
-    };
+    deps = withCatalog(deps, (catalog) => ({
+      getBusyIntervals: async (slug, range) => (reads++ === 0 ? [] : catalog.getBusyIntervals(slug, range)),
+    }));
     const error = envelopeOf(await callTool("book", bookArgs({ customer_name: "Jo" })));
     expect(error.code).toBe("slot_taken");
     expect(error.next_action).toMatch(/^Someone just took that time\. Call get_availability again/);

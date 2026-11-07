@@ -10,6 +10,7 @@ import {
   type BookingRecord,
   type BookingStore,
   type IdempotencyScope,
+  type IdempotentStore,
   type NewBooking,
   type NewBookingEvent,
 } from "./booking-store";
@@ -470,7 +471,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
      */
     async idempotent<T>(
       scope: IdempotencyScope,
-      action: (store: BookingStore) => Promise<T>,
+      action: (store: IdempotentStore) => Promise<T>,
     ): Promise<{ result: T; replayed: boolean }> {
       // Keys are visible ASCII without spaces, so "<tool> <key>" can't collide.
       const id = `${scope.tool} ${scope.key}`;
@@ -499,7 +500,8 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   };
 
   /** The store an idempotent action gets: the same data, but idempotent() can't nest (as in Postgres). */
-  const actionStore: BookingStore = {
+  const actionStore: IdempotentStore = {
+    ...catalog,
     ...bookingStore,
     async idempotent() {
       throw nestedIdempotencyError();

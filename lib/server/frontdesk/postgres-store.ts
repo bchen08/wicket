@@ -8,6 +8,7 @@ import {
   type BookingRecord,
   type BookingStore,
   type IdempotencyScope,
+  type IdempotentStore,
   type NewBooking,
 } from "./booking-store";
 import {
@@ -305,7 +306,7 @@ function bookingStoreOn(conn: Conn): BookingStore {
 
     async idempotent<T>(
       scope: IdempotencyScope,
-      action: (store: BookingStore) => Promise<T>,
+      action: (store: IdempotentStore) => Promise<T>,
     ): Promise<{ result: T; replayed: boolean }> {
       if (conn.kind === "tx") throw nestedIdempotencyError();
       const outcome = await conn.sql.begin(async (tx) => {
@@ -320,8 +321,10 @@ function bookingStoreOn(conn: Conn): BookingStore {
           returning key
         `;
         if (claimed.length > 0) {
-          // A throw here rolls back the whole transaction: the action's writes and the key.
-          const result = await action(bookingStoreOn({ kind: "tx", sql: tx }));
+          // A throw here rolls back the whole transaction: the action's writes and the key. The
+          // action reads through the same transaction too (see IdempotentStore).
+          const txConn: Conn = { kind: "tx", sql: tx };
+          const result = await action({ ...catalogOn(txConn), ...bookingStoreOn(txConn) });
           await tx`
             update idempotency_keys set response = ${tx.json(result as postgres.JSONValue)}::jsonb
             where key = ${scope.key} and tool = ${scope.tool}
@@ -346,8 +349,12 @@ function bookingStoreOn(conn: Conn): BookingStore {
   return store;
 }
 
-/** The ShopCatalog methods. Always on the root client: replaceWeeklyHours begins its own transaction. */
-function catalogOn(sql: postgres.Sql): ShopCatalog {
+/**
+ * The ShopCatalog methods over `conn`: the root client, or the transaction an idempotent action runs
+ * in (so its reads use the connection that transaction already holds).
+ */
+function catalogOn(conn: Conn): ShopCatalog {
+  const sql: Db = conn.sql;
   return {
     async getShop(slug) {
       const rows = await sql<{ slug: string; name: string; timezone: string }[]>`
@@ -452,7 +459,7 @@ function catalogOn(sql: postgres.Sql): ShopCatalog {
     },
 
     async replaceWeeklyHours(slug, staffId, weekly) {
-      return sql.begin(async (tx) => {
+      const replace = async (tx: postgres.TransactionSql) => {
         // Locking the staff row serializes concurrent replacements of the same week.
         const member = await tx`select id from staff where id = ${staffId} and shop_slug = ${slug} for update`;
         if (member.length === 0) return false;
@@ -462,7 +469,9 @@ function catalogOn(sql: postgres.Sql): ShopCatalog {
           await tx`insert into weekly_hours ${tx(rows, "staff_id", "weekday", "opens", "closes")}`;
         }
         return true;
-      });
+      };
+      // Atomic either way: its own transaction on the root client, a savepoint inside one.
+      return conn.kind === "root" ? conn.sql.begin(replace) : conn.sql.savepoint(replace);
     },
 
     async listBlocks(slug, range) {
@@ -546,6 +555,6 @@ function catalogOn(sql: postgres.Sql): ShopCatalog {
 }
 
 export function createPostgresStore(url: string): ShopCatalog & BookingStore {
-  const sql = getPostgresClient(url);
-  return { ...catalogOn(sql), ...bookingStoreOn({ kind: "root", sql }) };
+  const root: Conn = { kind: "root", sql: getPostgresClient(url) };
+  return { ...catalogOn(root), ...bookingStoreOn(root) };
 }

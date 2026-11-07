@@ -4,7 +4,7 @@ import { fixedClock, type Clock } from "../clock";
 import type { NewBlock } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { book, getAvailability, type FrontDeskDeps } from "./service";
-import { memoryDeps, NOW, recordingNotifier, SAT } from "./test-support";
+import { memoryDeps, NOW, recordingNotifier, SAT, withCatalog } from "./test-support";
 
 // book() against the in-memory store with a fixed clock: Mon 9 Nov 2026, noon in New York (Hart's is
 // closed on Mondays). Dana works Tue–Sat 09:00–12:00 and 12:30–17:00. Saturday 14 Nov (5 days ahead)
@@ -58,16 +58,12 @@ async function saturdayStarts(deps: FrontDeskDeps, service_id = "haircut"): Prom
  */
 function staleOnce(deps: FrontDeskDeps): FrontDeskDeps {
   let reads = 0;
-  return {
-    ...deps,
-    catalog: {
-      ...deps.catalog,
-      getBusyIntervals: async (slug, range) =>
-        reads++ === 0
-          ? (await deps.catalog.getBusyIntervals(slug, range)).filter((b) => b.kind === "block")
-          : deps.catalog.getBusyIntervals(slug, range),
-    },
-  };
+  return withCatalog(deps, (catalog) => ({
+    getBusyIntervals: async (slug, range) =>
+      reads++ === 0
+        ? (await catalog.getBusyIntervals(slug, range)).filter((b) => b.kind === "block")
+        : catalog.getBusyIntervals(slug, range),
+  }));
 }
 
 const slot = (start: string, end: string): Slot => ({

@@ -2,7 +2,7 @@
 import type { Booking, Policies } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
 import type { Notifier } from "../notify/notifier";
-import type { NewBlock } from "./catalog";
+import type { NewBlock, ShopCatalog } from "./catalog";
 import { createMemoryStore, type InitialBooking } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
 
@@ -46,6 +46,26 @@ export function recordingNotifier(): Notifier & { alerts: Booking[] } {
     alerts,
     async alertOwner(booking) {
       alerts.push(booking);
+    },
+  };
+}
+
+/**
+ * `deps` with some catalog methods replaced, both where use cases read deps.catalog and inside
+ * idempotent actions (book, cancel), which read the catalog through the store they're given.
+ * `overrides` gets the catalog it replaces methods on; close over shared state (e.g. a counter)
+ * outside it.
+ */
+export function withCatalog(
+  deps: FrontDeskDeps,
+  overrides: (catalog: ShopCatalog) => Partial<ShopCatalog>,
+): FrontDeskDeps {
+  return {
+    ...deps,
+    catalog: { ...deps.catalog, ...overrides(deps.catalog) },
+    store: {
+      ...deps.store,
+      idempotent: (scope, action) => deps.store.idempotent(scope, (tx) => action({ ...tx, ...overrides(tx) })),
     },
   };
 }
