@@ -1,3 +1,4 @@
+import Link from "next/link";
 import {
   ArrowDown,
   ArrowRight,
@@ -39,10 +40,10 @@ export function Hero() {
         </p>
         <div className="mt-8 flex flex-wrap items-center gap-5">
           <Button asChild size="lg">
-            <a href="/console">
+            <Link href="/console">
               Get started{" "}
               <ArrowRight data-icon="inline-end" aria-hidden="true" />
-            </a>
+            </Link>
           </Button>
           <a
             href="#how-it-works"
@@ -52,6 +53,9 @@ export function Hero() {
             <ArrowDown className="size-3.5" aria-hidden="true" />
           </a>
         </div>
+        <Link href="/harts" className="mt-3 inline-flex min-h-11 items-center text-sm font-medium text-primary underline underline-offset-4">
+          See a shop&apos;s booking page
+        </Link>
         <p className="mt-5 flex items-center gap-2 text-xs text-muted-foreground">
           <Check className="size-3.5 text-primary" aria-hidden="true" /> Your
           business. Your hours. Your rules.
