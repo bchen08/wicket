@@ -348,19 +348,16 @@ describe("getAvailability under the shop's rules", () => {
 describe("tool argument parsing", () => {
   const book = { service_id: "haircut", start: "2026-11-14T14:30:00-05:00", customer_name: " Maya " };
 
-  it("parseBookArgs trims the name and requires an idempotency_key", () => {
-    expect(parseBookArgs({ ...book, idempotency_key: "abcd-1234" })).toEqual({
-      ...book,
-      customer_name: "Maya",
-      idempotency_key: "abcd-1234",
-    });
-    expect(() => parseBookArgs(book)).toThrow(FrontDeskError);
+  it("parseBookArgs trims the name, needs no idempotency_key, and ignores one an old client still sends", () => {
+    expect(parseBookArgs(book)).toEqual({ ...book, customer_name: "Maya" });
+    expect(parseBookArgs({ ...book, idempotency_key: "abcd-1234" })).toEqual({ ...book, customer_name: "Maya" });
+    expect(() => parseBookArgs({ ...book, customer_name: "  " })).toThrow(FrontDeskError);
   });
 
   it("parseBookArgs refuses a customer_name containing NUL (Postgres text can't hold U+0000)", () => {
     let caught: unknown;
     try {
-      parseBookArgs({ ...book, customer_name: "Ma\u0000ya", idempotency_key: "abcd-1234" });
+      parseBookArgs({ ...book, customer_name: "Ma\u0000ya" });
     } catch (err) {
       caught = err;
     }
@@ -369,16 +366,13 @@ describe("tool argument parsing", () => {
     expect((caught as FrontDeskError).details).toEqual({ field: "customer_name", value: "Ma\u0000ya" });
   });
 
-  it("parseGetBookingArgs and parseCancelArgs require a booking_id; cancel also an idempotency_key", () => {
+  it("parseGetBookingArgs and parseCancelArgs require a booking_id, and nothing else", () => {
     expect(parseGetBookingArgs({ booking_id: " abc " })).toEqual({ booking_id: "abc" });
-    expect(parseCancelArgs({ booking_id: "abc", idempotency_key: "abcd-1234" })).toEqual({
-      booking_id: "abc",
-      idempotency_key: "abcd-1234",
-    });
+    expect(parseCancelArgs({ booking_id: "abc" })).toEqual({ booking_id: "abc" });
+    expect(parseCancelArgs({ booking_id: "abc", idempotency_key: "abcd-1234" })).toEqual({ booking_id: "abc" });
     for (const [parse, raw, field] of [
       [parseGetBookingArgs, {}, "booking_id"],
       [parseCancelArgs, { idempotency_key: "abcd-1234" }, "booking_id"],
-      [parseCancelArgs, { booking_id: "abc" }, "idempotency_key"],
     ] as const) {
       let caught: unknown;
       try {

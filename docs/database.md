@@ -1,11 +1,12 @@
 # Database (Supabase Postgres)
 
-Front Desk stores shops, services, staff hours, booking rules, blocked time, bookings and their history in Postgres, hosted on Supabase.
+Front Desk stores shops, services, staff hours, booking rules, blocked time, bookings and their history, and people's approvals, in Postgres, hosted on Supabase.
 
 | File | What it is |
 |---|---|
 | [`supabase/migrations/0001_skeleton.sql`](../supabase/migrations/0001_skeleton.sql) | Ring 0: shops, services, staff, weekly hours, bookings, the no-double-booking constraint, row level security |
-| [`supabase/migrations/0002_rules.sql`](../supabase/migrations/0002_rules.sql) | Ring 1a: shop policies, blocked times, the full booking lifecycle (statuses, timestamps, deposit snapshot), the events log, idempotency keys |
+| [`supabase/migrations/0002_rules.sql`](../supabase/migrations/0002_rules.sql) | Ring 1a: shop policies, blocked times, the full booking lifecycle (statuses, timestamps, deposit snapshot), the events log, idempotency keys (dropped again by 0003) |
+| [`supabase/migrations/0003_consent.sql`](../supabase/migrations/0003_consent.sql) | Ring 1b: holds awaiting approval (`approve_by`, the mandate, the person's phone), approval requests (token kept only as a hash); drops `idempotency_keys` |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -14,23 +15,26 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 - `services (shop_slug, id, name, duration_min, price_cents, deposit_cents, position)`
 - `staff (id, shop_slug, name)`
 - `weekly_hours (staff_id, weekday 1–7 ISO, opens, closes)`: several rows per day are allowed. Lunch is the gap between `09:00–12:00` and `12:30–17:00`.
-- `bookings (id, shop_slug, service_id, staff_id, during tstzrange, status, customer_name, agent_name, created_at, cancelled_at, cancelled_by, completed_at, no_show_at, deposit_cents)`
-  - `status` is one of `awaiting_deposit`, `confirmed`, `cancelled`, `expired`, `completed`, `no_show`. Ring 1a only writes `confirmed`, `cancelled`, `completed` and `no_show`.
-  - `cancelled_by` is `agent` or `owner`. Each transition stamps its own time column.
+- `bookings (id, shop_slug, service_id, staff_id, during tstzrange, status, customer_name, agent_name, created_at, cancelled_at, cancelled_by, completed_at, no_show_at, deposit_cents, approve_by, customer_phone, mandate)`
+  - `status` is one of `awaiting_approval`, `awaiting_deposit`, `confirmed`, `cancelled`, `expired`, `completed`, `no_show`. `book` writes `awaiting_approval`; Ring 1c will write `awaiting_deposit`.
+  - `approve_by`: when the hold lapses (booking time + 10 minutes). Required while `awaiting_approval`.
+  - `customer_phone`: the phone number the person gave when approving, plain E.164 (an MVP decision: no hashing), or null. Optional and not verified. `Booking.customer.phoneLast4` is its last 4 digits.
+  - `mandate`: the person's limits as the agent sent them (a JSON object), or null.
+  - `cancelled_by` is `agent`, `owner` or `customer` (the person declined). Each transition stamps its own time column.
   - `deposit_cents` is a snapshot of the service's deposit when the booking was made, so a later price change doesn't rewrite history.
+- `approvals (booking_id pk, token_hash unique, created_at, decided_at, decision)`: one per booking. `token_hash` is the SHA-256 of the token in the approval link; the token itself is never stored. `decision` is `approved` or `declined`, set together with `decided_at`. `Booking.customer.verified` is `decision = 'approved'`.
 - `policies (shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone, deposit_rule, late_cancel_rule, no_show_rule, updated_at)`: one row per shop. A shop without a row uses the column defaults (120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules).
 - `blocked_times (id, staff_id, during tstzrange, reason, created_at)`: holidays and time off. Half-open, like bookings. The owner sees `reason`; agents never do.
-- `events (id, booking_id, at, actor, type, data jsonb)`: one row per booking state change (`booked`, `cancelled`, `completed`, `no_show`), written in the same transaction as the change. `actor` is `agent`, `owner` or `system`.
-- `idempotency_keys (key, tool, request_hash, response jsonb, created_at)`, primary key `(key, tool)`: the first successful `book` or `cancel` call with a key saves its response, and a retry with the same key and arguments gets it back. A key may be reused after 24 hours. Old keys aren't deleted yet (`TODO(ring-2)`).
+- `events (id, booking_id, at, actor, type, data jsonb)`: one row per booking state change (`booked`, `approved`, `declined`, `expired`, `cancelled`, `completed`, `no_show`), written in the same transaction as the change. `actor` is `agent`, `owner`, `customer` or `system`.
 
 Double booking is impossible at the database level:
 
 ```sql
 constraint no_overlap exclude using gist (staff_id with =, during with &&)
-  where (status in ('awaiting_deposit', 'confirmed'))
+  where (status in ('awaiting_approval', 'awaiting_deposit', 'confirmed'))
 ```
 
-Two bookings that hold time (`awaiting_deposit` or `confirmed`) for the same staff member can't overlap. Cancelled, expired, completed and no-show bookings free their time. `during` is half-open (`[start, end)`), so back-to-back bookings are fine. When the constraint fires, Postgres raises SQLSTATE `23P01`. The `book` tool then reads busy time again and, if another staff member is free at that exact start, tries once more with them; otherwise it returns `slot_taken`. If two overlapping inserts arrive at the same moment, Postgres can also abort one with `40P01` (deadlock). The server retries that insert, which then fails cleanly with `23P01`.
+Two bookings that hold time (`awaiting_approval`, `awaiting_deposit` or `confirmed`) for the same staff member can't overlap, so a held slot can't be double-booked. A hold past `approve_by` would still count, so `book` first marks such holds `expired` in the same transaction (lazy expiry; see [frontdesk-api.md](frontdesk-api.md#lazy-expiry)): a stale hold never blocks a new booking. Cancelled, expired, completed and no-show bookings free their time. `during` is half-open (`[start, end)`), so back-to-back bookings are fine. When the constraint fires, Postgres raises SQLSTATE `23P01`. The `book` tool then reads busy time again and, if another staff member is free at that exact start, tries once more with them; otherwise it returns `slot_taken`. If two overlapping inserts arrive at the same moment, Postgres can also abort one with `40P01` (deadlock). The server retries that insert, which then fails cleanly with `23P01`.
 
 Booking state changes are conditional: `UPDATE bookings … WHERE id = … AND status = <expected>`, with the event inserted in the same statement. Of two concurrent changes to one booking, only one matches; the other writes nothing.
 
@@ -38,11 +42,12 @@ Booking state changes are conditional: `UPDATE bookings … WHERE id = … AND s
 
 ### Database time and `FRONTDESK_NOW`
 
-`created_at`, `events.at`, `cancelled_at`, `completed_at`, `no_show_at` and `idempotency_keys.created_at` are set by the database with `now()` (the start of the transaction). `FRONTDESK_NOW` freezes only Front Desk's own clock, which drives the booking rules (see [frontdesk-api.md](frontdesk-api.md)). So with Postgres:
+`created_at`, `events.at`, `cancelled_at`, `completed_at` and `no_show_at` are set by the database with `now()` (the start of the transaction). `FRONTDESK_NOW` freezes only Front Desk's own clock, which drives the booking rules (see [frontdesk-api.md](frontdesk-api.md)). So with Postgres:
 - `createdAt`, event times and the lifecycle timestamps show real time, even when the app clock is frozen.
-- Idempotency keys expire 24 real hours after their first use, measured on the database's clock, even when `FRONTDESK_NOW` is set.
 
-The in-memory store (no `DATABASE_URL`) stamps all of these with the app clock instead, so with `FRONTDESK_NOW` set they show the frozen instant, and keys never expire.
+The in-memory store (no `DATABASE_URL`) stamps all of these with the app clock instead, so with `FRONTDESK_NOW` set they show the frozen instant.
+
+The consent times are the exception: `bookings.approve_by` and `approvals.decided_at` come from Front Desk's clock in both stores, because the hold is decided with it. So with `FRONTDESK_NOW` frozen a hold never lapses; restart with a later `FRONTDESK_NOW` to see it expire.
 
 ## Set up a Supabase project
 
@@ -112,6 +117,27 @@ What 0002 does to existing data:
 
 It's additive, so it's compatible with the Ring 0 code already deployed: new tables, nullable columns, a `deposit_cents` column with a default, and widened checks that Ring 0's writes already meet. If the new code is deployed before the integration has applied 0002, Front Desk calls fail with `internal` until it has.
 
+### Ring 1b: applying 0003
+
+`0003_consent.sql` is applied like any other migration (never in the SQL editor). It seeds nothing, so there's no seed to re-run. It also drops `idempotency_keys`: `book` and `cancel` no longer take an idempotency key.
+
+1. **Preview database, before the verifier runs on the Ring 1b PR:** from the PR branch, push it:
+
+   ```bash
+   npx supabase@3 db push --remote="$PREVIEW_DB_URL"
+   ```
+
+2. **Production:** the GitHub integration applies 0003 when the PR merges.
+3. **Check** with `select version from supabase_migrations.schema_migrations;` (lists `0003`) and `\d approvals` (or `select * from approvals limit 1;`).
+4. **Set [`PUBLIC_BASE_URL`](#5-set-public_base_url) for Production** before the code is deployed, so approval links point at the production domain.
+
+What 0003 does to existing data:
+- Existing bookings keep their status; `approve_by`, `customer_phone` and `mandate` are null. They stay unverified (`customer.verified: false`): nobody approved them.
+- The `no_overlap` constraint is rebuilt to cover `awaiting_approval` too. No existing row has that status, so it rebuilds without conflicts.
+- `approvals` starts empty. `idempotency_keys` and its saved responses are deleted.
+
+It's not fully compatible with the Ring 1a code already deployed: that code's `book` and `cancel` use `idempotency_keys`, which 0003 drops. If the integration applies 0003 before Vercel finishes deploying the Ring 1b code, `book` and `cancel` fail with `internal` for those seconds or minutes. The other changes are additive. If the Ring 1b code is deployed first, `book` and the approval routes fail with `internal` until 0003 is applied.
+
 ### 2. Get the connection string: use the transaction pooler
 
 In the Supabase dashboard, click **Connect**, choose **Transaction pooler**, and copy the URI. It looks like:
@@ -161,6 +187,30 @@ OWNER_API_TOKEN=<64 hex characters>
 - **Never open.** If it's unset, blank or shorter than 16 characters, every owner route answers **503** with a configuration message. A missing or wrong token in a request is **401**.
 - **Never commit it.** Anyone holding it can change the shop's rules and act on its bookings. To rotate it, change the value in Vercel and redeploy.
 - It's a stopgap: `TODO(ring-2)`: owner sign-in replaces the token.
+
+### 5. Set `PUBLIC_BASE_URL`
+
+The consent flow (Ring 1b) needs one more variable.
+
+**`PUBLIC_BASE_URL`**: the origin people open approval links on, e.g. `https://frontdesk.example.com`. `book` builds each link as `${PUBLIC_BASE_URL}/approve/<token>`.
+- Locally it defaults to `http://localhost:3000`. If `pnpm dev` runs on another port, set it to match.
+- On Vercel, if it's unset, it falls back to `https://${VERCEL_URL}`, the deployment's own URL. That's fine for previews. **Set it for Production** to the production domain, or links point at a per-deployment URL.
+- It must be an absolute `http(s)` URL without a query, fragment or credentials; a trailing slash is dropped. Anything else is a configuration error.
+
+```bash
+# .env.local
+PUBLIC_BASE_URL=http://localhost:3000
+```
+
+## Environment variables
+
+| Variable | Where | Required | What |
+|---|---|---|---|
+| `DATABASE_URL` | Vercel (per environment), local | On Vercel | The Supabase transaction pooler string (port 6543). Unset locally: in-memory data. |
+| `OWNER_API_TOKEN` | Vercel (per environment), local | For the owner routes | Bearer token for the owner routes, at least 16 characters. |
+| `PUBLIC_BASE_URL` | Vercel Production, local if not port 3000 | No (defaults below) | Origin of the approval links. Default: `http://localhost:3000` locally, `https://${VERCEL_URL}` on Vercel. |
+| `FRONTDESK_NOW` | Local, demos | No | Freeze Front Desk's clock at an RFC 3339 instant. |
+| `DATABASE_URL_TEST` | Local, CI if wanted | No | A scratch Postgres for the Postgres tests. |
 
 ## Production and Preview databases
 
@@ -235,20 +285,21 @@ The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/dep
 
 ## Running the Postgres tests
 
-`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with `0001_skeleton.sql`, `0002_rules.sql` and the seed applied:
+`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql`, `0002_rules.sql`, `0003_consent.sql`) and the seed applied:
 
 ```bash
 DATABASE_URL_TEST=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm test
 ```
 
-Two files use it:
+Three files use it:
 
 | File | What it covers |
 |---|---|
-| [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, idempotency keys (replay, conflict, rollback, concurrency, reuse after 24 hours), and the owner writes (policies, services, hours, blocks). |
-| [`lib/server/frontdesk/flow-pg.test.ts`](../lib/server/frontdesk/flow-pg.test.ts) | The lifecycle and idempotency flow through the service layer, the code the MCP tools and owner routes call: book and replay, conflicts, cancel (released, captured, none), cancel after the start, an owner no-show, and concurrent books and cancels. |
+| [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, lazy expiry, approval answers, and the owner writes (policies, services, hours, blocks). |
+| [`lib/server/frontdesk/flow-pg.test.ts`](../lib/server/frontdesk/flow-pg.test.ts) | The lifecycle flow through the service layer, the code the MCP tools and owner routes call: book (and the same slot again → slot_taken), approve, cancel (released, captured, none), cancel after the start, an owner no-show, and concurrent books and cancels. |
+| [`lib/server/consent/consent-pg.test.ts`](../lib/server/consent/consent-pg.test.ts) | The consent flow on Postgres: approve with and without a phone (the token stored only as a hash, the phone as plain E.164), decline, and lazy expiry (a stale hold never blocks a new booking; exactly one `expired` event under concurrency). |
 
-They only touch rows of their own and delete them afterwards: bookings in 2099, idempotency keys they made, and a throwaway shop for the lifecycle, idempotency and owner-write tests. Hart's seeded rows are read, never changed. Without `DATABASE_URL_TEST` they're skipped, and the test output says so.
+They only touch rows of their own and delete them afterwards: bookings in 2099 (their approvals and events cascade), and a throwaway shop for the lifecycle, consent and owner-write tests. Hart's seeded rows are read, never changed. Without `DATABASE_URL_TEST` they're skipped, and the test output says so.
 
 A throwaway local database with Docker:
 
@@ -266,14 +317,14 @@ for f in supabase/migrations/*.sql supabase/seed.sql; do docker exec -i frontdes
 
 Every schema change is a new migration file in an ordinary PR. The GitHub integration applies it to production when the PR merges to `main`.
 
-1. **Add the next numbered file,** for example `supabase/migrations/0003_add_staff_color.sql`, containing only the change:
+1. **Add the next numbered file,** for example `supabase/migrations/0004_add_staff_color.sql`, containing only the change:
 
    ```sql
    alter table staff add column color text;
    ```
 
-   Keep the `0001`, `0002`, … numbering. Supabase applies files in version order. `supabase migration new` names files with a timestamp (`20261108120000_x.sql`), which sorts after every numbered file, so a later `0003` would be refused as out of order.
-2. **Never edit a migration that has been merged.** Production has already run it. To fix one, add another, such as `0003_fix_…`.
+   Keep the `0001`, `0002`, … numbering. Supabase applies files in version order. `supabase migration new` names files with a timestamp (`20261108120000_x.sql`), which sorts after every numbered file, so a later `0004` would be refused as out of order.
+2. **Never edit a migration that has been merged.** Production has already run it. To fix one, add another, such as `0004_fix_…`.
 3. **Test it locally:** apply every migration and the seed to a throwaway Postgres, then run the Postgres tests. See [Running the Postgres tests](#running-the-postgres-tests).
 4. **Open a PR, and push the migration to the Preview database** so the PR's preview runs against the new schema. See [When a PR adds a migration](#when-a-pr-adds-a-migration). The **Supabase Preview** check is skipped on PRs unless preview branches are enabled in Supabase, so production isn't touched before merge.
 5. **Merge.** On the push to `main`, the integration applies the new file to production and records it. To confirm, check that the **Supabase Preview** check on the merge commit is green, or look at **Branches → main → View Logs** in Supabase.
@@ -284,4 +335,4 @@ Every schema change is a new migration file in an ordinary PR. The GitHub integr
 
 **Demo data:** the seed doesn't run on production. If you change `supabase/seed.sql`, run it once in the SQL editor after merging; it's safe to run again. Also update `SEED` in [`lib/server/frontdesk/memory-store.ts`](../lib/server/frontdesk/memory-store.ts) to match. If you change a policy default or range, update `DEFAULT_POLICIES` and `POLICY_LIMITS` in [`lib/server/frontdesk/policies.ts`](../lib/server/frontdesk/policies.ts) to match the `policies` table.
 
-**Agents:** `supabase/**` isn't in Claude Code's default ownership area in AGENTS.md. An issue that needs a migration must authorize it, as #6 did.
+**Agents:** `supabase/**` isn't in Claude Code's default ownership area in AGENTS.md. An issue that needs a migration must authorize it, as #6, #8 and #15 did.

@@ -16,7 +16,7 @@ import type {
   UpdateServiceRequest,
   WeeklyHours,
 } from "../../types/frontdesk";
-import type { LifecycleAction } from "../engine/lifecycle";
+import type { ManageAction } from "../engine/lifecycle";
 import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { POLICY_LIMITS } from "./policies";
@@ -573,7 +573,7 @@ export function ownerBookingAction(
   deps: FrontDeskDeps,
   shopSlug: string,
   bookingId: string,
-  action: LifecycleAction,
+  action: ManageAction,
 ): Promise<OwnerBookingActionResponse> {
   return transitionBooking(deps, shopSlug, bookingId, action, "owner");
 }

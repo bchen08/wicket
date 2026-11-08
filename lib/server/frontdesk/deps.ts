@@ -1,14 +1,20 @@
 import { systemClock } from "../clock";
+import type { ConsentConfig } from "../consent/config";
 import { createLogNotifier } from "../notify/log-notifier";
 import { createMemoryStore } from "./memory-store";
 import { createPostgresStore } from "./postgres-store";
 import type { FrontDeskDeps } from "./service";
 
-// The one place that decides where Front Desk's data comes from. Every route uses getFrontDeskDeps().
+// The one place that decides where Front Desk's data comes from and reads its settings. Every route
+// uses getFrontDeskDeps().
 //
 //   DATABASE_URL set              → Postgres
 //   unset, not on Vercel          → in-memory demo data (one console warning)
 //   unset, on Vercel (VERCEL set) → configuration error; a deployment never serves fake data
+//
+// Consent (Ring 1b):
+//   PUBLIC_BASE_URL      the approval links' origin. Default: http://localhost:3000 locally,
+//                        https://${VERCEL_URL} on Vercel.
 
 /** Front Desk is deployed without the settings it needs. Surfaces as an `internal` error; the log says why. */
 export class ConfigurationError extends Error {
@@ -20,28 +26,64 @@ export class ConfigurationError extends Error {
 
 type Env = Record<string, string | undefined>;
 
+const LOCAL_BASE_URL = "http://localhost:3000";
+
+/** PUBLIC_BASE_URL, or its fallback, checked and without a trailing slash. */
+function publicBaseUrl(env: Env): string {
+  const configured = env.PUBLIC_BASE_URL?.trim();
+  const vercelUrl = env.VERCEL_URL?.trim();
+  let value: string;
+  if (configured) value = configured;
+  else if (!env.VERCEL) value = LOCAL_BASE_URL;
+  else if (vercelUrl) value = `https://${vercelUrl}`;
+  else {
+    throw new ConfigurationError(
+      "PUBLIC_BASE_URL is not set, and neither is VERCEL_URL. Set PUBLIC_BASE_URL in the Vercel project's environment " +
+        "variables to the deployment's origin, e.g. https://frontdesk.example.com. See docs/database.md.",
+    );
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new ConfigurationError(`PUBLIC_BASE_URL must be an absolute URL like https://frontdesk.example.com, got "${value}".`);
+  }
+  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.search !== "" || url.hash !== "" || url.username !== "") {
+    throw new ConfigurationError(
+      `PUBLIC_BASE_URL must be a plain http(s) origin (optionally with a path), without a query, fragment or credentials, got "${value}".`,
+    );
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+}
+
+/** The consent settings from `env`. Throws ConfigurationError for a malformed setting. */
+export function consentConfigFromEnv(env: Env): ConsentConfig {
+  return { publicBaseUrl: publicBaseUrl(env) };
+}
+
 /** Build deps from `env`, without caching. Exported for tests; the app uses getFrontDeskDeps(). */
 export function createFrontDeskDeps(env: Env, warn: (message: string) => void = console.warn): FrontDeskDeps {
   const clock = systemClock;
   const notifier = createLogNotifier();
   const url = env.DATABASE_URL?.trim();
 
-  if (url) {
-    const db = createPostgresStore(url);
-    return { clock, notifier, catalog: db, store: db };
-  }
-  if (env.VERCEL) {
+  if (!url && env.VERCEL) {
     throw new ConfigurationError(
       "DATABASE_URL is not set. Set it in the Vercel project's environment variables (Preview and Production) " +
         "to the Supabase transaction pooler connection string (port 6543). See docs/database.md.",
     );
+  }
+  const consent = consentConfigFromEnv(env);
+  if (url) {
+    const db = createPostgresStore(url);
+    return { clock, notifier, consent, catalog: db, store: db };
   }
   warn(
     "[frontdesk] DATABASE_URL is not set: using in-memory demo data. Bookings are lost when the server restarts. " +
       "See docs/database.md to use Postgres.",
   );
   const memory = createMemoryStore({ clock });
-  return { clock, notifier, catalog: memory, store: memory };
+  return { clock, notifier, consent, catalog: memory, store: memory };
 }
 
 // Cached on globalThis, not in a module variable: Next.js can load this module once per route

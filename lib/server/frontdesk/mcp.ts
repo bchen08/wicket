@@ -14,9 +14,10 @@ import type {
   GetPoliciesResult,
   ListServicesResult,
 } from "../../types/frontdesk";
-import { DEFAULT_LIMIT, MAX_LIMIT, MAX_WINDOW_DAYS } from "../engine/availability";
+import { DateTime } from "luxon";
+import { DEFAULT_LIMIT, MAX_LIMIT, MAX_WINDOW_DAYS, formatDisplay } from "../engine/availability";
+import { APPROVAL_HOLD_MINUTES } from "../engine/lifecycle";
 import { toApiError } from "./errors";
-import { IDEMPOTENCY_KEY_MAX, IDEMPOTENCY_KEY_MIN } from "./idempotency";
 import {
   book,
   cancelBooking,
@@ -26,6 +27,7 @@ import {
   listServices,
   MAX_ALTERNATIVES,
   MAX_CUSTOMER_NAME,
+  MAX_MANDATE_CAP_CENTS,
   minutesInWords,
   parseBookArgs,
   parseCancelArgs,
@@ -35,6 +37,7 @@ import {
   UNKNOWN_AGENT,
   type BookOutcome,
   type FrontDeskDeps,
+  type GetBookingOutcome,
 } from "./service";
 
 // The agent door: Front Desk's MCP tools. Transport lives in app/api/mcp/route.ts.
@@ -47,13 +50,16 @@ export const SERVER_INSTRUCTIONS = [
   "Front Desk lets you book appointments at small independent businesses.",
   "It currently serves one shop: Hart's Barbers, in the America/New_York time zone.",
   "The flow: list_services for service ids, get_policies for the shop's rules, get_availability for open start times,",
-  "then book with one of those starts, the customer's name and a fresh idempotency_key (a new UUID per booking;",
-  "reuse it only to retry the same call, e.g. after a timeout).",
+  "then book with one of those starts and the customer's name. If the person gave you limits (a price or deposit",
+  "cap, or a time window), send them as mandate: the server refuses anything outside them.",
   "Before booking, tell the person the shop's rules: the deposit, the cancellation window and the no-show rule.",
-  "book confirms immediately. get_booking reads a booking by its id.",
-  "cancel follows the shop's cancellation policy (the deposit is released or kept depending on how close the start is),",
-  "so tell the person the consequence before cancelling.",
-  "No money is collected yet, and the customer's identity is not verified.",
+  `No booking is final until the person approves it themselves: book holds the slot for ${APPROVAL_HOLD_MINUTES} minutes`,
+  "and returns an approval link (booking.approval.url). Send the person that link right away; they open it and",
+  "approve or decline. Then call get_booking to check the status: confirmed",
+  "(approved), cancelled (declined) or expired (the hold ran out; book again if they still want it).",
+  "cancel works on a hold too. On a confirmed booking it follows the shop's cancellation policy (the deposit is",
+  "released or kept depending on how close the start is), so tell the person the consequence before cancelling.",
+  "No money is collected yet.",
 ].join(" ");
 
 /** How every tool reports a failure. Each description adds the codes that tool can return. */
@@ -157,21 +163,6 @@ const getAvailabilityOutputSchema = z.object({
   truncated: z.boolean().describe("true if more slots exist in the window than were returned."),
 });
 
-/** The JSON Schema pattern parseIdempotencyKey enforces: 8–128 visible ASCII characters (U+0021–U+007E). */
-const IDEMPOTENCY_KEY_PATTERN = `^[\\x21-\\x7E]{${IDEMPOTENCY_KEY_MIN},${IDEMPOTENCY_KEY_MAX}}$`;
-
-const idempotencyKeyInput = (what: string) =>
-  advertise({
-    type: "string",
-    minLength: IDEMPOTENCY_KEY_MIN,
-    maxLength: IDEMPOTENCY_KEY_MAX,
-    pattern: IDEMPOTENCY_KEY_PATTERN,
-    description:
-      `A fresh UUID for this ${what} (${IDEMPOTENCY_KEY_MIN}–${IDEMPOTENCY_KEY_MAX} visible ASCII characters, no spaces). ` +
-      "Send the same key only to retry the same call (e.g. after a timeout): it then returns the first result " +
-      "instead of acting twice. Never reuse it for a different request.",
-  });
-
 const bookingIdInput = advertise({
   type: "string",
   format: "uuid",
@@ -198,10 +189,40 @@ const bookInputShape = {
       `The name the booking is under, as the customer wants the shop to see it, e.g. "Maya" or "Maya Lopez". ` +
       `1–${MAX_CUSTOMER_NAME} characters. Ask the user if you don't know it.`,
   }),
-  idempotency_key: idempotencyKeyInput("booking"),
+  mandate: advertise({
+    type: "object",
+    additionalProperties: false,
+    description:
+      "Optional: the limits the person gave you. The server refuses a booking outside them (outside_mandate), and the " +
+      "person sees them on the approval page. Leave out any limit they didn't set; don't invent one.",
+    properties: {
+      priceCapCents: {
+        type: "integer",
+        minimum: 0,
+        maximum: MAX_MANDATE_CAP_CENTS,
+        description: "The most the service may cost, in integer US cents (5000 = $50.00).",
+      },
+      depositCapCents: {
+        type: "integer",
+        minimum: 0,
+        maximum: MAX_MANDATE_CAP_CENTS,
+        description: "The largest deposit the service may require, in integer US cents.",
+      },
+      window: {
+        type: "object",
+        additionalProperties: false,
+        required: ["from", "to"],
+        description: "The appointment must start and end inside [from, to).",
+        properties: {
+          from: { type: "string", format: "date-time", description: "RFC 3339 with offset, e.g. 2026-11-14T09:00:00-05:00." },
+          to: { type: "string", format: "date-time", description: "RFC 3339 with offset, after from." },
+        },
+      },
+    },
+  }),
 } satisfies Record<keyof BookInput, z.ZodType>; // same keys as the contract, no more, no fewer
 
-const BOOK_REQUIRED = ["service_id", "start", "customer_name", "idempotency_key"] as const;
+const BOOK_REQUIRED = ["service_id", "start", "customer_name"] as const;
 
 const bookInputSchema = z.object(bookInputShape).meta({ required: [...BOOK_REQUIRED] });
 
@@ -215,10 +236,9 @@ const getBookingInputSchema = z.object(getBookingInputShape).meta({ required: [.
 
 const cancelInputShape = {
   booking_id: bookingIdInput,
-  idempotency_key: idempotencyKeyInput("cancellation"),
 } satisfies Record<keyof CancelInput, z.ZodType>;
 
-const CANCEL_REQUIRED = ["booking_id", "idempotency_key"] as const;
+const CANCEL_REQUIRED = ["booking_id"] as const;
 
 const cancelInputSchema = z.object(cancelInputShape).meta({ required: [...CANCEL_REQUIRED] });
 
@@ -232,11 +252,15 @@ const bookingSchema = z.object({
   end: z.string().describe("RFC 3339 with the shop's offset."),
   display: z.string().describe('Human-readable start, e.g. "Sat 14 Nov, 2:30 pm EST".'),
   status: z
-    .enum(["awaiting_deposit", "confirmed", "cancelled", "expired", "completed", "no_show"])
-    .describe("awaiting_deposit and confirmed hold the time; cancelled, expired, completed and no_show are final."),
+    .enum(["awaiting_approval", "awaiting_deposit", "confirmed", "cancelled", "expired", "completed", "no_show"])
+    .describe(
+      "awaiting_approval: held until the person approves with the link. awaiting_approval, awaiting_deposit and confirmed " +
+        "hold the time; cancelled, expired, completed and no_show are final.",
+    ),
   customer: z.object({
     displayName: z.string(),
-    verified: z.literal(false).describe("Always false for now: the customer's identity is not checked."),
+    verified: z.boolean().describe("true once the person approved the booking through the approval link."),
+    phoneLast4: z.string().optional().describe("Last 4 digits of the phone number the person gave when approving, if any."),
   }),
   agent: z.object({ name: z.string().describe("Best-effort label for the booking agent. Unverified.") }),
   depositCents: z
@@ -244,6 +268,13 @@ const bookingSchema = z.object({
     .int()
     .describe("Deposit the service requires, in integer US cents. Not collected yet. 0 = none."),
   createdAt: z.string().describe("RFC 3339."),
+  approval: z
+    .object({
+      url: z.string().describe("Send this link to the person: they approve or decline there."),
+      expiresAt: z.string().describe("When the hold lapses, RFC 3339."),
+    })
+    .optional()
+    .describe("Only in book's result, while the booking awaits approval. get_booking never includes it."),
 });
 
 const bookOutputSchema = z.object({ booking: bookingSchema });
@@ -350,27 +381,39 @@ function pausedAvailabilityText({ shop, policies }: GetPoliciesResult): string {
   return `${shop.name} isn't taking bookings right now, so there are no open times. ${callTheShop(policies.phone)}`;
 }
 
-const REPLAYED_BOOK = "(replayed: this is the booking from your earlier call with the same idempotency_key)";
-const REPLAYED_CANCEL = "(replayed: this is the result of your earlier cancel with the same idempotency_key)";
+
+/** An RFC 3339 instant as "Mon 9 Nov, 12:10 pm UTC-5", in its own offset. Only when book gave no holdDisplay. */
+function displayInstant(rfc3339: string): string {
+  return formatDisplay(DateTime.fromISO(rfc3339, { setZone: true }));
+}
 
 /**
- * E.g. "Booked Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. A $10 deposit will be required
- * once deposits are enabled; nothing was charged." When `replayed`, says it's the earlier call's booking.
+ * What the agent must do after book: "Hold placed until <time>. Send <name> this link to approve:
+ * <url>. Then call get_booking to check the status."
  */
-export function bookText({ booking, staffName, replayed = false }: BookOutcome & { replayed?: boolean }): string {
+export function bookText({ booking, staffName, holdDisplay }: BookOutcome): string {
+  const name = booking.customer.displayName;
   const deposit =
     booking.depositCents > 0
       ? `A ${formatUsdShort(booking.depositCents)} deposit will be required once deposits are enabled; nothing was charged.`
       : "This service needs no deposit.";
-  return [
-    `Booked ${booking.serviceName} with ${staffName}, ${booking.display}, for ${booking.customer.displayName}. ${deposit}`,
-    ...(replayed ? [REPLAYED_BOOK] : []),
-    `Booking id: ${booking.id}. It is confirmed now; don't book it again.`,
-  ].join("\n");
+  const lines = [`Held ${booking.serviceName} with ${staffName}, ${booking.display}, for ${name}. It is not confirmed yet.`];
+  if (booking.approval) {
+    lines.push(
+      `Hold placed until ${holdDisplay ?? displayInstant(booking.approval.expiresAt)}. Send ${name} this link to approve: ` +
+        `${booking.approval.url}. Then call get_booking to check the status.`,
+    );
+  }
+  lines.push(
+    deposit,
+    `Booking id: ${booking.id}. Don't book this time again while the hold is on. If ${name} declines or the hold ` +
+      "runs out, the time is freed.",
+  );
+  return lines.join("\n");
 }
 
 /** E.g. "Cancelled Haircut, Sat 14 Nov, 2:30 pm EST, for Maya. Status: cancelled." plus the deposit effect in words. */
-export function cancelText({ booking, depositEffect, replayed = false }: CancelResult & { replayed?: boolean }): string {
+export function cancelText({ booking, depositEffect }: CancelResult): string {
   const deposit = formatUsdShort(booking.depositCents);
   const effect = {
     none: "This booking has no deposit, so there's nothing to release or keep.",
@@ -379,18 +422,43 @@ export function cancelText({ booking, depositEffect, replayed = false }: CancelR
   }[depositEffect];
   return [
     `Cancelled ${booking.serviceName}, ${booking.display}, for ${booking.customer.displayName}. Status: ${booking.status}.`,
-    ...(replayed ? [REPLAYED_CANCEL] : []),
     `${effect} No money has been collected yet, so nothing was charged or refunded.`,
     `Booking id: ${booking.id}.`,
   ].join("\n");
 }
 
-/** E.g. "Haircut, Sat 14 Nov, 2:30 pm EST, for Maya. Status: confirmed." */
-function bookingText({ booking }: GetBookingResult): string {
+/** What a status means for the agent, in get_booking's text. */
+function statusNote({ booking, declined }: GetBookingOutcome): string | null {
+  const name = booking.customer.displayName;
+  switch (booking.status) {
+    case "awaiting_approval":
+      return (
+        `Waiting for ${name} to approve with the link from book (the hold lasts ${APPROVAL_HOLD_MINUTES} minutes from ` +
+        "booking). Remind them if needed, then call get_booking again."
+      );
+    case "confirmed":
+      if (!booking.customer.verified) return "It is confirmed.";
+      return booking.customer.phoneLast4
+        ? `${name} approved it (phone ending ${booking.customer.phoneLast4}). It is confirmed.`
+        : `${name} approved it. It is confirmed.`;
+    case "expired":
+      return `The hold ran out before ${name} approved, so the time is free again. Book again if they still want it.`;
+    case "cancelled":
+      return declined ? `${name} declined it, so the time is free again.` : null;
+    default:
+      return null;
+  }
+}
+
+/** E.g. "Haircut, Sat 14 Nov, 2:30 pm EST, for Maya. Status: confirmed." plus what the status means. */
+function bookingText(outcome: GetBookingOutcome): string {
+  const { booking } = outcome;
   const deposit =
     booking.depositCents > 0 ? `Deposit: ${formatUsdShort(booking.depositCents)} (not collected yet).` : "No deposit.";
+  const note = statusNote(outcome);
   return [
     `${booking.serviceName}, ${booking.display}, for ${booking.customer.displayName}. Status: ${booking.status}.`,
+    ...(note ? [note] : []),
     `${deposit} Booking id: ${booking.id}.`,
   ].join("\n");
 }
@@ -443,7 +511,7 @@ export function createFrontDeskMcpHandler(
 ): (request: Request) => Promise<Response> {
   const getDeps = typeof deps === "function" ? deps : () => deps;
   return createMcpHandler((server) => registerFrontDeskTools(server, getDeps), {
-    serverInfo: { name: "front-desk", version: "0.3.0" },
+    serverInfo: { name: "front-desk", version: "0.4.0" },
     instructions: SERVER_INSTRUCTIONS,
   });
 }
@@ -551,21 +619,24 @@ export function registerFrontDeskTools(
     },
   );
 
-  // Deposits and customer identity are deferred: see the TODOs on book() in service.ts.
+  // Deposits are deferred: see the TODOs on book() in service.ts.
   server.registerTool(
     "book",
     {
       title: "Book an appointment",
       description:
-        "Book an appointment at Hart's Barbers. The booking is confirmed immediately when this returns: " +
-        "there is no hold or confirm step, so only call it once the user has chosen a time and heard the shop's rules " +
+        `Hold an appointment at Hart's Barbers for ${APPROVAL_HOLD_MINUTES} minutes until the person approves it. ` +
+        "Nothing is final until they do: the result has status awaiting_approval and booking.approval.url, a link to " +
+        "send the person right away. They open it and approve (→ confirmed) or decline (→ cancelled); if nobody " +
+        "answers in time the hold expires and the time is freed. Then call " +
+        "get_booking to check the status. Only call book once the person has chosen a time and heard the shop's rules " +
         "(get_policies). start must be one of the starts get_availability just returned for the same service_id " +
         "(RFC 3339 with offset, e.g. 2026-11-14T14:30:00-05:00); any other time is refused. " +
         `customer_name is the name the booking is under (1–${MAX_CUSTOMER_NAME} characters). ` +
-        "idempotency_key: send a fresh UUID per booking; retrying with the same key and arguments returns the same " +
-        "booking instead of booking twice; a different request with a used key is idempotency_conflict. " +
+        "mandate (optional): the person's limits (priceCapCents, depositCapCents, window { from, to }); the server " +
+        "refuses a booking outside them. " +
+        "Call it once per booking: calling again for the same time gets slot_taken while the hold is on. " +
         "No deposit is collected yet: depositCents says what the service will require once deposits are enabled. " +
-        "The customer's identity is not verified. " +
         `${ERROR_FORMAT} ` +
         `code slot_taken: someone else just booked that time; details.alternatives has up to ${MAX_ALTERNATIVES} nearby ` +
         "open starts to offer the person, or call get_availability again. " +
@@ -574,7 +645,8 @@ export function registerFrontDeskTools(
         "code too_far: beyond how far ahead the shop books this service; pick a start before details.latest. " +
         "code outside_hours: not a bookable time for that service; call get_availability and choose one of its starts. " +
         "code paused: the shop isn't taking bookings; tell the person to call the shop (details.phone). " +
-        "code idempotency_conflict: that key was already used for a different booking; send a new key. " +
+        "code outside_mandate: the service or time breaks the person's limit (details.field: price_cap, deposit_cap or " +
+        "window); ask them to widen it, or choose a different service or time. " +
         "code invalid_request: fix the arguments as next_action says.",
       inputSchema: bookInputSchema,
       outputSchema: bookOutputSchema,
@@ -582,8 +654,8 @@ export function registerFrontDeskTools(
         title: "Book an appointment",
         readOnlyHint: false,
         destructiveHint: false,
-        // The same arguments, idempotency_key included, have no additional effect.
-        idempotentHint: true,
+        // Each call places a new hold (or is slot_taken), so repeating it isn't a no-op.
+        idempotentHint: false,
         openWorldHint: false,
       },
     },
@@ -608,8 +680,11 @@ export function registerFrontDeskTools(
       title: "Get a booking",
       description:
         "Read one booking at Hart's Barbers by its id (booking.id from book): the service, start, staff member, " +
-        "customer name, deposit and status (awaiting_deposit, confirmed, cancelled, expired, completed or no_show). " +
-        "Until customer verification ships, anyone holding a booking id can read it. Read-only. " +
+        "customer name, deposit and status. Call it after sending the approval link to see what the person did: " +
+        "awaiting_approval (not answered yet), confirmed (approved; customer.verified is true and customer.phoneLast4 " +
+        "is set), cancelled (declined, or cancelled by you or the shop), expired (the hold ran out; book again if " +
+        "they still want it). Also awaiting_deposit, completed or no_show. It never includes the approval link. " +
+        "Until agents sign in, anyone holding a booking id can read it. Read-only, apart from recording that a hold ran out. " +
         `${ERROR_FORMAT} code booking_not_found: no booking with that id at this shop; check the id. ` +
         "code invalid_request: fix the arguments as next_action says.",
       inputSchema: getBookingInputSchema,
@@ -619,9 +694,10 @@ export function registerFrontDeskTools(
     async (rawArgs) => {
       try {
         const args = parseGetBookingArgs(rawArgs);
-        const result = await getBooking(getDeps(), shopSlug, args);
+        const outcome = await getBooking(getDeps(), shopSlug, args);
+        const result: GetBookingResult = { booking: outcome.booking };
         return {
-          content: [{ type: "text", text: bookingText(result) }],
+          content: [{ type: "text", text: bookingText(outcome) }],
           structuredContent: result,
         };
       } catch (err) {
@@ -635,19 +711,18 @@ export function registerFrontDeskTools(
     {
       title: "Cancel a booking",
       description:
-        "Cancel a booking at Hart's Barbers. It follows the shop's cancellation policy (get_policies): cancelling at " +
-        "least cancelWindowHours before the start releases the deposit; cancelling later, but before the start, " +
-        "captures it (the shop keeps it as a late fee); after the start the booking is not_cancellable. " +
+        "Cancel a booking at Hart's Barbers. A hold that is still awaiting approval can be cancelled any time, and " +
+        "frees the time at once. A confirmed booking follows the shop's cancellation policy (get_policies): " +
+        "cancelling at least cancelWindowHours before the start releases the deposit; cancelling later, but before " +
+        "the start, captures it (the shop keeps it as a late fee); after the start the booking is not_cancellable. " +
         "Tell the person the consequence and get their go-ahead before cancelling. " +
         "Returns the booking (status cancelled), depositEffect (none, released or captured) and depositCollected, " +
         "which is false because no money is collected yet. " +
-        "idempotency_key: send a fresh UUID per cancellation; retrying with the same key and booking_id returns the " +
-        "same result without cancelling twice. " +
-        "Until customer verification ships, anyone holding a booking id can cancel it. " +
-        `${ERROR_FORMAT} code not_cancellable: the booking is already final (details.status) or has started; ` +
+        "Cancelling again is not_cancellable (it's already cancelled), so a retry never cancels twice. " +
+        "Until agents sign in, anyone holding a booking id can cancel it. " +
+        `${ERROR_FORMAT} code not_cancellable: the booking is already final (details.status), its hold ran out, or it has started; ` +
         "don't retry, tell the person to call the shop. " +
         "code booking_not_found: no booking with that id at this shop; check the id. " +
-        "code idempotency_conflict: that key was already used for a different booking; send a new key. " +
         "code invalid_request: fix the arguments as next_action says.",
       inputSchema: cancelInputSchema,
       outputSchema: cancelOutputSchema,

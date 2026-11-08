@@ -1,7 +1,11 @@
 // Shared fixtures for Front Desk tests. Not imported by app code.
 import type { Booking, Policies } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
+import { approveBooking } from "../consent/approvals";
+import type { ConsentConfig } from "../consent/config";
+import { newApprovalToken, sha256Hex } from "../consent/crypto";
 import type { Notifier } from "../notify/notifier";
+import type { NewBooking } from "./booking-store";
 import type { NewBlock, ShopCatalog } from "./catalog";
 import { createMemoryStore, type InitialBooking } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
@@ -39,6 +43,39 @@ export const EXAMPLE_BOOKINGS: InitialBooking[] = [
   },
 ];
 
+/** The consent settings tests use: localhost links. */
+export const TEST_CONSENT: ConsentConfig = Object.freeze({ publicBaseUrl: "http://localhost:3000" });
+
+/** A test phone number (E.164) and another one. */
+export const PHONE_E164 = "+14015550123";
+export const OTHER_PHONE_E164 = "+14015550199";
+
+/** `base` with the Ring 1b consent deps (TEST_CONSENT) unless it has them. */
+export function withConsent(base: Omit<FrontDeskDeps, "consent"> & Partial<Pick<FrontDeskDeps, "consent">>): FrontDeskDeps {
+  return { consent: TEST_CONSENT, ...base };
+}
+
+/** The consent fields createBooking needs, for tests that call the store directly. */
+export function holdFields(approveBy: Date): Pick<NewBooking, "approveBy" | "approvalTokenHash" | "mandate"> {
+  return { approveBy, approvalTokenHash: sha256Hex(newApprovalToken()), mandate: null };
+}
+
+/** The token in a booking's approval link (book's result only). */
+export function approvalToken(booking: Booking): string {
+  const url = booking.approval?.url;
+  if (!url) throw new Error(`Booking ${booking.id} has no approval link.`);
+  return url.slice(url.lastIndexOf("/") + 1);
+}
+
+/**
+ * Approve a booking the way the person would, through the approval use case: open the link and
+ * approve, giving `phone` (none when null). `booking` must be book's result (it carries the link).
+ * Returns the confirmed booking.
+ */
+export async function approveAsCustomer(deps: FrontDeskDeps, booking: Booking, phone: string | null = PHONE_E164): Promise<Booking> {
+  return (await approveBooking(deps, approvalToken(booking), phone === null ? {} : { phone })).booking;
+}
+
 /** A notifier that remembers what it was told. */
 export function recordingNotifier(): Notifier & { alerts: Booking[] } {
   const alerts: Booking[] = [];
@@ -51,10 +88,8 @@ export function recordingNotifier(): Notifier & { alerts: Booking[] } {
 }
 
 /**
- * `deps` with some catalog methods replaced, both where use cases read deps.catalog and inside
- * idempotent actions (book, cancel), which read the catalog through the store they're given.
- * `overrides` gets the catalog it replaces methods on; close over shared state (e.g. a counter)
- * outside it.
+ * `deps` with some catalog methods replaced where use cases read deps.catalog. `overrides` gets the
+ * catalog it replaces methods on; close over shared state (e.g. a counter) outside it.
  */
 export function withCatalog(
   deps: FrontDeskDeps,
@@ -63,16 +98,13 @@ export function withCatalog(
   return {
     ...deps,
     catalog: { ...deps.catalog, ...overrides(deps.catalog) },
-    store: {
-      ...deps.store,
-      idempotent: (scope, action) => deps.store.idempotent(scope, (tx) => action({ ...tx, ...overrides(tx) })),
-    },
   };
 }
 
 /**
  * Deps backed by a fresh in-memory store and a fixed clock. `policies` is merged over Hart's seeded
- * policies; `initialBookings` and `initialBlocks` exist before the first call.
+ * policies; `initialBookings` and `initialBlocks` exist before the first call. Consent: TEST_CONSENT
+ * (merged with `consent`).
  */
 export function memoryDeps(
   options: {
@@ -81,6 +113,7 @@ export function memoryDeps(
     initialBookings?: InitialBooking[];
     policies?: Partial<Policies>;
     initialBlocks?: NewBlock[];
+    consent?: Partial<ConsentConfig>;
   } = {},
 ): FrontDeskDeps {
   const clock = options.clock ?? fixedClock(NOW);
@@ -90,5 +123,11 @@ export function memoryDeps(
     policies: options.policies,
     initialBlocks: options.initialBlocks,
   });
-  return { clock, catalog: store, store, notifier: options.notifier ?? recordingNotifier() };
+  return {
+    clock,
+    catalog: store,
+    store,
+    notifier: options.notifier ?? recordingNotifier(),
+    consent: { ...TEST_CONSENT, ...options.consent },
+  };
 }

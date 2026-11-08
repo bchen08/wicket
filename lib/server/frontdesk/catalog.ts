@@ -24,11 +24,16 @@ export type StaffHours = {
 export type BusyInterval = TimeRange & {
   staffId: string;
   /**
-   * What makes it busy. "booking": an awaiting_deposit or confirmed booking (booking over it is
-   * slot_taken). "block": a blocked time such as a holiday (booking over it is outside_hours).
-   * Omitted means "booking".
+   * What makes it busy. "booking": an awaiting_approval, awaiting_deposit or confirmed booking
+   * (booking over it is slot_taken). "block": a blocked time such as a holiday (booking over it is
+   * outside_hours). Omitted means "booking".
    */
   kind?: "booking" | "block";
+  /**
+   * An awaiting_approval booking: its hold lapses at this instant (approve_by). From then on it no
+   * longer counts as busy, even before lazy expiry marks it expired (see activeBusy in service.ts).
+   */
+  heldUntil?: Date;
   /** Why it's busy. For debugging only; never shown to agents. */
   reason?: string;
 };
@@ -68,7 +73,8 @@ export interface ShopCatalog {
   getStaffHours(slug: string): Promise<StaffHours[]>;
   /**
    * Busy time overlapping `range` (half-open on both sides), sorted by start: bookings whose status is
-   * awaiting_deposit or confirmed (kind "booking") and blocked times (kind "block").
+   * awaiting_approval, awaiting_deposit or confirmed (kind "booking"; holds carry heldUntil) and blocked
+   * times (kind "block"). Lapsed holds are included; callers drop them by heldUntil.
    */
   getBusyIntervals(slug: string, range: TimeRange): Promise<BusyInterval[]>;
   /**

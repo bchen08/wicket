@@ -1,14 +1,22 @@
 import postgres from "postgres";
-import type { BlockedTime, Booking, BookingActor, BookingEventType, BookingStatus, Policies, Service } from "../../types/frontdesk";
+import type {
+  BlockedTime,
+  Booking,
+  BookingActor,
+  BookingEventType,
+  BookingStatus,
+  Mandate,
+  Policies,
+  Service,
+} from "../../types/frontdesk";
 import {
-  IDEMPOTENCY_TTL_MS,
+  normalizeUuid,
   SlotTakenError,
   toBooking,
   toBookingEvent,
+  type AnswerApprovalResult,
   type BookingRecord,
   type BookingStore,
-  type IdempotencyScope,
-  type IdempotentStore,
   type NewBooking,
 } from "./booking-store";
 import {
@@ -21,10 +29,9 @@ import {
   type TimeRange,
   type WeeklyHours,
 } from "./catalog";
-import { idempotencyConflict, nestedIdempotencyError, normalizeUuid } from "./idempotency-errors";
 
 // Postgres ShopCatalog + BookingStore (postgres.js), for the schema in
-// supabase/migrations/0001_skeleton.sql and 0002_rules.sql.
+// supabase/migrations/0001_skeleton.sql, 0002_rules.sql and 0003_consent.sql.
 
 /** SQLSTATE exclusion_violation: the bookings.no_overlap constraint fired. */
 const EXCLUSION_VIOLATION = "23P01";
@@ -66,7 +73,7 @@ export async function closePostgresClients(): Promise<void> {
 }
 
 /**
- * Where a store's queries run: the root client, or one transaction (the store an idempotent action
+ * Where a store's queries run: the root client, or one transaction (the store a transactional method
  * gets). postgres.js' TransactionSql doesn't extend Sql, so `sql` is their union; both are callable
  * the same way. Only the root can begin a transaction; only a transaction has savepoints.
  */
@@ -86,6 +93,8 @@ type BookingRow = {
   customer_name: string;
   agent_name: string;
   created_at: Date;
+  customer_verified: boolean;
+  customer_phone: string | null;
   timezone: string;
 };
 
@@ -103,8 +112,15 @@ function toRecord(r: BookingRow): BookingRecord {
     customerName: r.customer_name,
     agentName: r.agent_name,
     createdAt: r.created_at,
+    customerVerified: r.customer_verified,
+    customerPhone: r.customer_phone,
     timezone: r.timezone,
   };
+}
+
+/** Thrown inside answerApproval's transaction to roll it back. */
+class AnswerRollback extends Error {
+  readonly reason = "not_pending" as const;
 }
 
 type EventRow = {
@@ -183,16 +199,26 @@ const tstzrange = (db: Db, range: TimeRange) =>
 
 /**
  * The columns of a Booking. `b` is bookings or a CTE with the same columns; depositCents is the
- * booking's own snapshot, and the service name is joined in by bookingJoins.
+ * booking's own snapshot, and the service name and verified customer are joined in by bookingJoins.
  */
 const bookingColumns = (db: Db) => db`
   b.id::text as id, b.shop_slug, b.service_id, sv.name as service_name, b.deposit_cents,
   b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at, b.status,
-  b.customer_name, b.agent_name, b.created_at, sh.timezone
+  b.customer_name, b.agent_name, b.created_at, coalesce(ap.decision = 'approved', false) as customer_verified, b.customer_phone, sh.timezone
 `;
 const bookingJoins = (db: Db) => db`
   join services sv on sv.shop_slug = b.shop_slug and sv.id = b.service_id
   join shops sh on sh.slug = b.shop_slug
+  left join approvals ap on ap.booking_id = b.id
+`;
+
+/** An "expired" event's data for an expiring row `x` (see expiredEventData in booking-store.ts, which the memory store uses). */
+const expiredEventJson = (db: Db) => db`
+  jsonb_build_object(
+    'from', 'awaiting_approval', 'to', 'expired',
+    'depositEffect', case when x.deposit_cents > 0 then 'released' else 'none' end,
+    'depositCollected', false
+  )
 `;
 
 const policyColumns = (db: Db) => db`
@@ -201,21 +227,30 @@ const policyColumns = (db: Db) => db`
 `;
 
 /**
- * One statement: insert the booking with its deposit snapshot and its "booked" event (data-modifying
- * CTEs), and return the joined Booking.
+ * One statement: insert the held booking with its deposit snapshot, deadline and mandate, its approval
+ * request and its "booked" event (data-modifying CTEs), and return the joined Booking.
  */
 async function insertBooking(db: Db, input: NewBooking): Promise<Booking> {
+  const mandate = input.mandate ? db.json(input.mandate as postgres.JSONValue) : null;
   const rows = await db<BookingRow[]>`
     with b as (
-      insert into bookings (shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents)
+      insert into bookings (
+        shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents, approve_by, mandate
+      )
       values (
         ${input.shopSlug}, ${input.serviceId}, ${input.staffId}, ${tstzrange(db, input)},
-        'confirmed', ${input.customerName}, ${input.agentName}, ${input.depositCents}
+        'awaiting_approval', ${input.customerName}, ${input.agentName}, ${input.depositCents},
+        ${input.approveBy.toISOString()}::timestamptz, ${mandate}::jsonb
       )
       returning *
+    ), a as (
+      insert into approvals (booking_id, token_hash) select id, ${input.approvalTokenHash}::text from b
     ), e as (
       insert into events (booking_id, actor, type, data)
-      select id, 'agent', 'booked', jsonb_build_object('status', status, 'agentName', agent_name) from b
+      select id, 'agent', 'booked',
+             jsonb_build_object('status', status, 'agentName', agent_name)
+               || case when mandate is null then '{}'::jsonb else jsonb_build_object('mandate', mandate) end
+      from b
     )
     select ${bookingColumns(db)} from b ${bookingJoins(db)}
   `;
@@ -223,7 +258,7 @@ async function insertBooking(db: Db, input: NewBooking): Promise<Booking> {
   return toBooking(toRecord(rows[0]));
 }
 
-/** The BookingStore methods over `conn`: the root client, or the transaction an idempotent action runs in. */
+/** The BookingStore methods over `conn` (in practice the root client). */
 function bookingStoreOn(conn: Conn): BookingStore {
   const db: Db = conn.sql;
 
@@ -270,6 +305,45 @@ function bookingStoreOn(conn: Conn): BookingStore {
         select ${bookingColumns(db)} from bookings b ${bookingJoins(db)} where b.id = ${key}::uuid
       `;
       return rows[0] ? toBooking(toRecord(rows[0])) : null;
+    },
+
+    async refreshBooking(id, now) {
+      const key = normalizeUuid(id);
+      if (key === null) return null;
+      // One statement, so the expiry, its event and the read are atomic. The second branch reads the
+      // row only when the first expired nothing (a data-modifying CTE's changes aren't visible to the
+      // rest of the statement, so it would show the old status).
+      const rows = await db<BookingRow[]>`
+        with x as (
+          update bookings set status = 'expired'
+          where id = ${key}::uuid and status = 'awaiting_approval' and approve_by <= ${now.toISOString()}::timestamptz
+          returning *
+        ), e as (
+          insert into events (booking_id, actor, type, data) select x.id, 'system', 'expired', ${expiredEventJson(db)} from x
+        )
+        select ${bookingColumns(db)} from x b ${bookingJoins(db)}
+        union all
+        select ${bookingColumns(db)} from bookings b ${bookingJoins(db)}
+        where b.id = ${key}::uuid and not exists (select 1 from x)
+      `;
+      return rows[0] ? toBooking(toRecord(rows[0])) : null;
+    },
+
+    async expireStaleHolds(shopSlug, range, now) {
+      // Of two concurrent expiries the second waits for the first's row locks, re-checks the status
+      // and skips the rows already expired, so each hold gets exactly one event.
+      const [row] = await db<{ n: number }[]>`
+        with x as (
+          update bookings set status = 'expired'
+          where shop_slug = ${shopSlug} and status = 'awaiting_approval'
+            and approve_by <= ${now.toISOString()}::timestamptz and during && ${tstzrange(db, range)}
+          returning id, deposit_cents
+        ), e as (
+          insert into events (booking_id, actor, type, data) select x.id, 'system', 'expired', ${expiredEventJson(db)} from x
+        )
+        select count(*)::int as n from x
+      `;
+      return row?.n ?? 0;
     },
 
     async transition(id, expectedStatus, nextStatus, event) {
@@ -321,54 +395,64 @@ function bookingStoreOn(conn: Conn): BookingStore {
       );
     },
 
-    async idempotent<T>(
-      scope: IdempotencyScope,
-      action: (store: IdempotentStore) => Promise<T>,
-    ): Promise<{ result: T; replayed: boolean }> {
-      if (conn.kind === "tx") throw nestedIdempotencyError();
-      const outcome = await conn.sql.begin(async (tx) => {
-        // Claim the key: a new key inserts; one older than the TTL is taken over. If another
-        // transaction holds the key uncommitted, this waits for it to commit or roll back first.
-        const claimed = await tx`
-          insert into idempotency_keys (key, tool, request_hash)
-          values (${scope.key}, ${scope.tool}, ${scope.requestHash})
-          on conflict (key, tool) do update
-            set request_hash = excluded.request_hash, response = null, created_at = now()
-            where idempotency_keys.created_at < now() - ${IDEMPOTENCY_TTL_MS}::double precision * interval '1 millisecond'
-          returning key
+    // ---- Ring 1b: consent ----
+
+    async findApproval(tokenHash) {
+      const rows = await db<{ booking_id: string; decision: "approved" | "declined" | null; approve_by: Date | null; mandate: Mandate | null }[]>`
+        select a.booking_id::text as booking_id, a.decision, b.approve_by, b.mandate
+        from approvals a join bookings b on b.id = a.booking_id
+        where a.token_hash = ${tokenHash}
+      `;
+      const r = rows[0];
+      if (!r || !r.approve_by) return null;
+      return { bookingId: r.booking_id, decision: r.decision, approveBy: r.approve_by, mandate: r.mandate };
+    },
+
+    async answerApproval(input) {
+      const key = normalizeUuid(input.bookingId);
+      if (key === null) return { ok: false, reason: "not_pending" };
+      const now = input.now.toISOString();
+      const answer = async (tx: postgres.TransactionSql): Promise<Booking> => {
+        const decided = await tx`
+          update approvals set decision = ${input.decision}, decided_at = ${now}::timestamptz
+          where booking_id = ${key}::uuid and decided_at is null
+          returning booking_id
         `;
-        if (claimed.length > 0) {
-          // A throw here rolls back the whole transaction: the action's writes and the key. The
-          // action reads through the same transaction too (see IdempotentStore).
-          const txConn: Conn = { kind: "tx", sql: tx };
-          const result = await action({ ...catalogOn(txConn), ...bookingStoreOn(txConn) });
-          await tx`
-            update idempotency_keys set response = ${tx.json(result as postgres.JSONValue)}::jsonb
-            where key = ${scope.key} and tool = ${scope.tool}
-          `;
-          return { result, replayed: false };
-        }
-        // The key is live and committed (the insert above already waited for any transaction
-        // holding it), so its response is visible to this statement.
-        const [saved] = await tx<{ request_hash: string; response: T; pending: boolean }[]>`
-          select request_hash, response, response is null as pending
-          from idempotency_keys where key = ${scope.key} and tool = ${scope.tool}
+        if (decided.length === 0) throw new AnswerRollback();
+        const phone = input.decision === "approved" ? (input.phone ?? null) : null;
+        const rows = await tx<BookingRow[]>`
+          with t as (
+            update bookings set
+              status = ${input.nextStatus},
+              customer_phone = coalesce(${phone}::text, customer_phone),
+              cancelled_at = case when ${input.nextStatus === "cancelled"} then now() else cancelled_at end,
+              cancelled_by = case when ${input.nextStatus === "cancelled"} then 'customer' else cancelled_by end
+            where id = ${key}::uuid and status = 'awaiting_approval' and approve_by > ${now}::timestamptz
+            returning *
+          ), e as (
+            insert into events (booking_id, actor, type, data)
+            select id, ${input.event.actor}::text, ${input.event.type}::text, ${tx.json(input.event.data as postgres.JSONValue)}::jsonb from t
+          )
+          select ${bookingColumns(tx)} from t b ${bookingJoins(tx)}
         `;
-        if (!saved || saved.pending) {
-          throw new Error(`Idempotency key ${scope.tool}/${scope.key} has no saved response.`);
-        }
-        if (saved.request_hash !== scope.requestHash) throw idempotencyConflict(scope.key, scope.tool);
-        return { result: saved.response, replayed: true };
-      });
-      return outcome as { result: T; replayed: boolean };
+        if (!rows[0]) throw new AnswerRollback();
+        return toBooking(toRecord(rows[0]));
+      };
+      try {
+        const booking = await (conn.kind === "root" ? conn.sql.begin(answer) : conn.sql.savepoint(answer));
+        return { ok: true, booking } satisfies AnswerApprovalResult;
+      } catch (err) {
+        if (err instanceof AnswerRollback) return { ok: false, reason: err.reason };
+        throw err;
+      }
     },
   };
   return store;
 }
 
 /**
- * The ShopCatalog methods over `conn`: the root client, or the transaction an idempotent action runs
- * in (so its reads use the connection that transaction already holds).
+ * The ShopCatalog methods over `conn` (in practice the root client; the savepoint branches keep owner
+ * writes atomic if one ever runs inside a transaction).
  */
 function catalogOn(conn: Conn): ShopCatalog {
   const sql: Db = conn.sql;
@@ -416,19 +500,21 @@ function catalogOn(conn: Conn): ShopCatalog {
 
     async getBusyIntervals(slug, range): Promise<BusyInterval[]> {
       // Weekly hours already leave out lunch, so busy time is bookings that hold time (the statuses
-      // in the no_overlap constraint) plus blocked times. Ordered by start, then kind, then id.
+      // in the no_overlap constraint; a hold carries its deadline) plus blocked times. Ordered by
+      // start, then kind, then id.
       const rows = await sql<
-        { kind: "booking" | "block"; id: string; staff_id: string; start_at: Date; end_at: Date }[]
+        { kind: "booking" | "block"; id: string; staff_id: string; start_at: Date; end_at: Date; held_until: Date | null }[]
       >`
-        select busy.kind, busy.id::text as id, busy.staff_id, busy.start_at, busy.end_at
+        select busy.kind, busy.id::text as id, busy.staff_id, busy.start_at, busy.end_at, busy.held_until
         from (
-          select 'booking' as kind, b.id, b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at
+          select 'booking' as kind, b.id, b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at,
+                 case when b.status = 'awaiting_approval' then b.approve_by end as held_until
           from bookings b
           where b.shop_slug = ${slug}
-            and b.status in ('awaiting_deposit', 'confirmed')
+            and b.status in ('awaiting_approval', 'awaiting_deposit', 'confirmed')
             and b.during && ${tstzrange(sql, range)}
           union all
-          select 'block', bt.id, bt.staff_id, lower(bt.during), upper(bt.during)
+          select 'block', bt.id, bt.staff_id, lower(bt.during), upper(bt.during), null
           from blocked_times bt
           join staff s on s.id = bt.staff_id
           where s.shop_slug = ${slug} and bt.during && ${tstzrange(sql, range)}
@@ -441,6 +527,7 @@ function catalogOn(conn: Conn): ShopCatalog {
         end: r.end_at,
         kind: r.kind,
         reason: `${r.kind} ${r.id}`,
+        ...(r.held_until ? { heldUntil: r.held_until } : {}),
       }));
     },
 

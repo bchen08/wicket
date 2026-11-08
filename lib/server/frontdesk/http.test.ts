@@ -109,10 +109,12 @@ describe("error status mapping", () => {
     ["slot_taken", 409],
     ["paused", 409],
     ["not_cancellable", 409],
-    ["idempotency_conflict", 409],
     ["outside_hours", 422],
     ["too_soon", 422],
     ["too_far", 422],
+    ["outside_mandate", 422],
+    ["approval_closed", 409],
+    ["approval_expired", 410],
   ])("%s → %i with the ApiError envelope", async (code, status) => {
     expect(STATUS[code]).toBe(status);
     const res = errorResponse(new FrontDeskError(code, "Something specific went wrong.", "Do the specific thing.", { x: 1 }));
