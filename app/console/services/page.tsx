@@ -1,3 +1,4 @@
+import { requireOwner } from "@/components/console/require-owner";
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import type { ServicesResponse } from "@/lib/types/frontdesk";
@@ -33,7 +34,10 @@ async function Services() {
     </>
   );
 }
-export default function ServicesPage() {
+export const instant = false;
+
+export default async function ServicesPage() {
+  await requireOwner();
   return (
     <SettingsShell
       title="Services"
