@@ -2,6 +2,9 @@
 // The UI must import these types instead of describing the shape itself.
 // Money is always an integer number of cents. Instants are RFC 3339 strings with an offset.
 
+// The web booking API's shapes (plain HTTP booking for agents without MCP, and the booking page).
+export type * from "./web-booking";
+
 /** A business that takes bookings. */
 export type Shop = {
   /** Stable URL-safe id, e.g. "harts". */

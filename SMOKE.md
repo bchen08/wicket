@@ -15,7 +15,7 @@ pnpm smoke <PREVIEW_URL> --commit <PR head sha> --bypass <secret>
 - Otherwise it prints PASS, FAIL or SKIPPED for each check, with evidence, then one verdict line. Exit code 0: everything passed (SKIPPED rows aren't failures, but they aren't passes either). 1: a check failed.
 - Previews are behind Vercel Authentication. `--bypass` (or the env var `VERCEL_AUTOMATION_BYPASS_SECRET`) is the team's Protection Bypass for Automation secret; get it from a teammate. Without it, a preview answers with Vercel's login page and the run is `BLOCKED: preview needs the Vercel bypass secret (--bypass)`.
 - The owner checks use `harts-preview` on previews. Elsewhere pass `--owner-token <OWNER_API_TOKEN>`, or the checks that need it (the owner lists, and the alerts in the booking loop) are SKIPPED.
-- The booking loop runs only where `/api/status` says `database.writesAllowed: true`, and the run declines (or, once approved, cancels) every booking it made, even after a failure. Its bookings show the agent `front-desk-smoke`.
+- The booking loop (items 11–14 and 17, and the web bookings W4–W5) runs only where `/api/status` says `database.writesAllowed: true`, and the run declines (or, once approved, cancels) every booking it made, even after a failure. Its bookings show the agent `front-desk-smoke`.
 - On production: `pnpm smoke https://<production domain> --owner-token <production token>`. The booking loop is SKIPPED there: production is never written to.
 
 Items marked **[browser]** need a browser signed in to the team's Vercel account. **[by hand]** items need a person's judgment or a wait.
@@ -43,6 +43,16 @@ Items marked **[browser]** need a browser signed in to the team's Vercel account
 8. **[browser]** `/console` in a browser with no `fd_owner` cookie (a private window) says to open `/console/unlock` and enter the shop's access code.
 9. **[browser]** At `/console/unlock`, a wrong code shows "That access code didn't work." The right code (`OWNER_API_TOKEN`; `harts-preview` on previews) lands on `/console`, which lists the bookings: ones awaiting approval included, with the phone number when one was given.
 10. **[browser]** `/approve/not-a-real-token` shows "This link isn't valid", not an error page.
+
+## Web booking API (plain web requests, no MCP)
+
+The same engine as the MCP tools, over plain HTTP (see [docs/web-booking.md](docs/web-booking.md)). W1–W3 are read-only and run everywhere. W4–W5 book, so like the booking loop they run only where `/api/status` shows `"writesAllowed": true`, and the run declines what they book.
+
+- **W1 [smoke]** `/api/shops/harts/availability?service=haircut` returns 200 with `days`: 7 entries starting today (New York), each slot with a `start` and a `display` such as `"Sat 14 Nov, 2:30 pm EST"`.
+- **W2 [smoke]** `/api/shops/harts/agents.md` returns plain text naming this deployment's MCP endpoint (`<origin>/api/mcp`), the availability route, the book route (`<origin>/api/shops/harts/book`) and `booking.approval.url`. **[by hand]** Read it as an agent would: it's enough to book with curl, without any other docs.
+- **W3 [smoke]** `/.well-known/front-desk.json` returns JSON whose `mcp`, `webApi` and `agentsMd` are on this deployment's origin.
+- **W4 [smoke]** `POST /api/shops/harts/book` with JSON `{"service":"haircut","start":<a W1 start>,"name":…,"bookedBy":"front-desk-smoke"}` → 201, `booking.status: "awaiting_approval"`, `booking.approval.url` on this origin, agent `front-desk-smoke`. The same start posted as a form (with a `Referer`) → 303 back to the Referer with `?error=slot_taken&message=…`. Declining the booking through `/api/approvals/<token>/decline` → `cancelled`.
+- **W5 [smoke]** A plain HTML form post (`application/x-www-form-urlencoded`: `service`, `start`, `name`) of another start → 303 with `Location: <origin>/approve/<token>`. **[browser]** Follow that Location in a browser: the approval page shows that booking.
 
 ## Booking loop (previews with their own database only)
 

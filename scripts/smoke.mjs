@@ -7,12 +7,16 @@
 // 1. Reads /api/status first. If the deployment isn't ready, or isn't at --commit, it prints
 //    "BLOCKED: <problems>", runs nothing else and exits 2. BLOCKED means the environment isn't ready,
 //    not that the code is wrong.
-// 2. Read-only checks: health, services, owner access, errors, the MCP route.
+// 2. Read-only checks: health, services, owner access, errors, the MCP route, and the web booking API's
+//    availability, agents.md and /.well-known/front-desk.json.
 // 3. The booking loop, only where /api/status says writesAllowed (the Preview database, or in-memory
 //    data): book → slot_taken → get_booking → decline → the slot is free again → the owner's alerts list
 //    has booking_cancelled for it; then book another start → approve → the alerts list has
-//    booking_confirmed for it. Every booking it makes is declined or cancelled at the end, even after a
-//    failure. Its MCP requests say they come from "front-desk-smoke", so the bookings show who made them.
+//    booking_confirmed for it. Then the web booking API: a JSON book gets a link, a form post at that held
+//    start is sent back with ?error=slot_taken, the JSON booking is declined, and a form post lands on
+//    /approve/<token>. Every booking it makes is declined or cancelled at the end, even after a failure.
+//    Its MCP requests and web bookings say they come from "front-desk-smoke", so the bookings show who
+//    made them.
 //
 // --bypass <secret> (or VERCEL_AUTOMATION_BYPASS_SECRET) sends Vercel's x-vercel-protection-bypass header
 // on every request, for previews behind Vercel Authentication. --owner-token overrides the owner token,
@@ -424,6 +428,45 @@ export async function runSmoke({
     return names.join(", ");
   });
 
+  // ---- Web booking API, read-only (docs/web-booking.md) ----
+
+  /** What the web booking checks booked: { slot, booking }. */
+  const web = {};
+
+  await check("W1", "Web availability: GET /api/shops/harts/availability?service=haircut", async () => {
+    const res = await client.request("/api/shops/harts/availability?service=haircut");
+    const days = res.json?.days;
+    expect(res.status === 200 && Array.isArray(days), http(res));
+    const slots = days.flatMap((d) => (Array.isArray(d?.slots) ? d.slots : []));
+    expect(days.length === 7, `${days.length} days, expected 7`);
+    const bad = slots.find((s) => typeof s?.start !== "string" || typeof s?.display !== "string");
+    expect(!bad, `a slot without start or display: ${snippet(JSON.stringify(bad))}`);
+    const n = slots.length;
+    return `7 days from ${res.json.from}, ${n} open start${n === 1 ? "" : "s"}${n ? `, first ${slots[0].display}` : ""}`;
+  });
+
+  await check("W2", "agents.md says how to book: MCP, then the web API", async () => {
+    const res = await client.request("/api/shops/harts/agents.md");
+    const type = res.headers.get("content-type") ?? "";
+    expect(res.status === 200 && type.startsWith("text/plain"), `HTTP ${res.status} ${type} ${snippet(res.text, 60)}`);
+    const needs = [`${baseUrl}/api/mcp`, `${baseUrl}/api/shops/harts/availability`, `${baseUrl}/api/shops/harts/book`, "approval.url"];
+    const missing = needs.filter((part) => !res.text.includes(part));
+    expect(missing.length === 0, `agents.md doesn't mention ${missing.join(", ")}`);
+    return `200 text/plain, ${res.text.length} characters, names the MCP endpoint and the web API on this origin`;
+  });
+
+  await check("W3", "/.well-known/front-desk.json points at this deployment", async () => {
+    const res = await client.request("/.well-known/front-desk.json");
+    const d = res.json;
+    expect(res.status === 200 && d, http(res));
+    const evidence = `mcp ${d.mcp}, webApi ${d.webApi}, agentsMd ${d.agentsMd}`;
+    expect(
+      d.mcp === `${baseUrl}/api/mcp` && d.webApi === `${baseUrl}/api/shops/harts` && d.agentsMd === `${baseUrl}/api/shops/harts/agents.md`,
+      evidence,
+    );
+    return evidence;
+  });
+
   // ---- Booking loop (writes) ----
 
   const loop = [
@@ -436,6 +479,12 @@ export async function runSmoke({
     ["17", "Book another start and approve it → confirmed"],
     ["17", "The owner's alerts list has booking_confirmed for it"],
   ];
+  const webLoop = [
+    ["W4", "Web book (JSON) → 201 awaiting_approval, link on this origin"],
+    ["W4", "The same start as a form post → 303 back with ?error=slot_taken"],
+    ["W4", "Decline the web booking → cancelled"],
+    ["W5", "Web book (form post) → 303 to /approve/<token>"],
+  ];
   /** Bookings this run made: { id, token, done, approved } (done: declined or cancelled). */
   const made = [];
 
@@ -444,7 +493,7 @@ export async function runSmoke({
       status.environment === "production"
         ? "production: never written to"
         : `writes not allowed here (shop "${status.database?.shopName}")`;
-    for (const [item, title] of loop) rows.push({ item, title, result: "SKIPPED", evidence: why });
+    for (const [item, title] of [...loop, ...webLoop]) rows.push({ item, title, result: "SKIPPED", evidence: why });
   } else {
     const ctx = {};
     const needs = (key) => {
@@ -484,6 +533,34 @@ export async function runSmoke({
       expect(alert.status === "logged" || alert.status === "sent", evidence);
       return evidence;
     };
+    /** A booking known only by its approval link (a form post's 303), so cleanup can decline it. */
+    const rememberLink = (location) => {
+      const linkToken = location.split("/approve/")[1]?.split(/[?#]/)[0];
+      if (linkToken) made.push({ id: undefined, token: decodeURIComponent(linkToken), done: false, approved: false });
+    };
+    /** Decline one of this run's bookings through its approval link, as the page's Decline button does. */
+    const decline = (linkToken) =>
+      client.request(`/api/approvals/${encodeURIComponent(linkToken)}/decline`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      });
+    /** A web book request: JSON, or a plain HTML form post from `referer`. */
+    const webBook = (fields, { form = false, referer } = {}) =>
+      client.request("/api/shops/harts/book", {
+        method: "POST",
+        headers: form
+          ? { "content-type": "application/x-www-form-urlencoded", ...(referer ? { referer } : {}) }
+          : { "content-type": "application/json" },
+        body: form ? new URLSearchParams(fields).toString() : JSON.stringify(fields),
+      });
+    /** Open Haircut starts from the web availability route, read now. */
+    const webSlots = async () => {
+      const res = await client.request("/api/shops/harts/availability?service=haircut");
+      expect(res.status === 200 && Array.isArray(res.json?.days), `availability: ${http(res)}`);
+      return res.json.days.flatMap((d) => (Array.isArray(d?.slots) ? d.slots : []));
+    };
+    const webFields = (start) => ({ service: "haircut", start, name: SMOKE_CUSTOMER, bookedBy: SMOKE_AGENT });
+    const shortLink = (link) => link.replace(/(\/approve\/.{6}).*/, "$1…");
 
     try {
       await check(...loop[0], async () => {
@@ -517,10 +594,7 @@ export async function runSmoke({
         needs("booking");
         const mine = made.find((b) => b.id === ctx.booking.id);
         expect(mine?.token, "the booking has no approval token");
-        const res = await client.request(`/api/approvals/${encodeURIComponent(mine.token)}/decline`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-        });
+        const res = await decline(mine.token);
         expect(res.status === 200 && res.json?.booking?.status === "cancelled", http(res));
         mine.done = true;
         ctx.declined = true;
@@ -566,6 +640,60 @@ export async function runSmoke({
         needs("approved");
         return alertFor(ctx.approved.id, "booking_confirmed");
       });
+
+      // The web booking API (W4, W5): the same engine, over plain HTTP.
+      await check(...webLoop[0], async () => {
+        // Read now, not W1's list: the loop above left a confirmed booking until cleanup.
+        const pool = await webSlots();
+        expect(pool.length > 0, "the web availability has no open Haircut starts");
+        const slot = pool[Math.floor(random() * pool.length)];
+        const res = await webBook(webFields(slot.start));
+        const booking = res.json?.booking;
+        if (booking?.id) remember(booking);
+        expect(res.status === 201, http(res));
+        const link = booking?.approval?.url ?? "";
+        const evidence = `${booking?.display ?? slot.start}: ${booking?.status}, link ${shortLink(link)}, agent "${booking?.agent?.name}"`;
+        expect(booking?.status === "awaiting_approval", evidence);
+        expect(link.startsWith(`${baseUrl}/approve/`), `${evidence} (expected a link on ${baseUrl})`);
+        expect(booking?.agent?.name === SMOKE_AGENT, `${evidence} (expected agent "${SMOKE_AGENT}")`);
+        Object.assign(web, { slot, booking });
+        return evidence;
+      });
+
+      await check(...webLoop[1], async () => {
+        if (!web.booking) throw new CheckFailed("not run: the web booking check failed");
+        const referer = `${baseUrl}/?from=smoke`;
+        const res = await webBook(webFields(web.slot.start), { form: true, referer });
+        const location = res.headers.get("location") ?? "";
+        if (location.includes("/approve/")) rememberLink(location); // a broken server booked it twice
+        expect(res.status === 303, http(res));
+        const back = new URL(location, baseUrl);
+        const evidence = `303 → ${back.pathname}?error=${back.searchParams.get("error")}&message=${snippet(back.searchParams.get("message"), 40)}`;
+        expect(back.origin === baseUrl && back.pathname === "/" && back.searchParams.get("from") === "smoke", `${evidence} (expected the Referer, ${referer})`);
+        expect(back.searchParams.get("error") === "slot_taken", evidence);
+        return evidence;
+      });
+
+      await check(...webLoop[2], async () => {
+        const mine = made.find((b) => b.id !== undefined && b.id === web.booking?.id);
+        if (!mine?.token) throw new CheckFailed("not run: the web booking check failed");
+        const res = await decline(mine.token);
+        expect(res.status === 200 && res.json?.booking?.status === "cancelled", http(res));
+        mine.done = true;
+        return "200, status cancelled";
+      });
+
+      await check(...webLoop[3], async () => {
+        const pool = (await webSlots()).filter((s) => s.start !== web.slot?.start);
+        expect(pool.length > 0, "the web availability has no other open Haircut start");
+        const slot = pool[Math.floor(random() * pool.length)];
+        const res = await webBook(webFields(slot.start), { form: true, referer: `${baseUrl}/` });
+        const location = res.headers.get("location") ?? "";
+        if (location.includes("/approve/")) rememberLink(location);
+        expect(res.status === 303, http(res));
+        expect(location.startsWith(`${baseUrl}/approve/`), `303 → ${location || "(no Location)"}`);
+        return `${slot.display}: 303 → ${shortLink(location)}`;
+      });
     } finally {
       // Decline (or, once approved, cancel) every booking this run made, even after a failure.
       await check("—", "Cleanup: every booking it made is declined or cancelled", async () => {
@@ -573,14 +701,16 @@ export async function runSmoke({
         for (const b of made.filter((x) => !x.done)) {
           try {
             if (b.token && !b.approved) {
-              const res = await client.request(`/api/approvals/${encodeURIComponent(b.token)}/decline`, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-              });
+              const res = await decline(b.token);
               if (res.status === 200) {
                 b.done = true;
                 continue;
               }
+            }
+            if (b.id === undefined) {
+              // A form post's booking: its approval link is all this run has.
+              left.push(`link ${b.token.slice(0, 6)}… (couldn't decline)`);
+              continue;
             }
             const cancelled = await client.callTool("cancel", { booking_id: b.id });
             if (!cancelled.error || cancelled.error.code === "not_cancellable") b.done = true;
