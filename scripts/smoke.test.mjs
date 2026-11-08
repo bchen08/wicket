@@ -9,6 +9,7 @@ import {
   SMOKE_AGENT,
   UNLOCK_NEXT_ACTION,
 } from "./smoke.mjs";
+import { fakeSigninServer } from "./smoke-checks/signin-fake.mjs";
 
 // The smoke script's verdicts and exit codes, against a stubbed fetch that plays a Front Desk deployment.
 
@@ -56,6 +57,8 @@ const toolError = (code) => ({ isError: true, content: [{ type: "text", text: JS
  */
 function fakeDeployment({ status = readyStatus(), route, doubleBook = false, ownerToken = PREVIEW_OWNER_TOKEN } = {}) {
   const state = { requests: [], bookings: [], mcp: [], alerts: [], lastNightlyRun: null };
+  // Connector sign-in's routes and signed-in MCP calls (scripts/smoke-checks/signin-fake.mjs).
+  const signin = fakeSigninServer({ baseUrl: BASE });
   const alert = (b, kind) => state.alerts.unshift({ id: String(state.alerts.length + 1), bookingId: b.id, kind, channel: "log", status: "logged", error: null });
   const isOwner = (headers) => headers.get("authorization") === `Bearer ${ownerToken}`;
   const ACTIVE = ["awaiting_approval", "awaiting_deposit", "confirmed"];
@@ -89,6 +92,8 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
     state.requests.push({ path: url.pathname, method, headers });
     const override = route && (await route(url, init, state));
     if (override) return override;
+    const signedIn = await signin.handle(url, init, headers);
+    if (signedIn) return signedIn;
 
     if (method === "GET" && url.pathname === "/api/status") return json({ ...status, lastNightlyRun: state.lastNightlyRun ?? status.lastNightlyRun ?? null });
     if (method === "GET" && url.pathname === "/api/jobs/nightly") {
@@ -174,7 +179,9 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
         return new Response(`event: message\ndata: ${data}\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
       }
       if (msg.method === "tools/list") {
-        return reply({ tools: ["list_services", "get_policies", "get_availability", "book", "get_booking", "cancel"].map((name) => ({ name })) });
+        return reply({
+          tools: ["list_services", "get_policies", "get_availability", "book", "get_booking", "cancel", "list_my_bookings"].map((name) => ({ name })),
+        });
       }
       const { name, arguments: args, _meta } = msg.params;
       if (name === "get_availability") {
@@ -230,11 +237,13 @@ describe("pnpm smoke", () => {
     const deployment = fakeDeployment();
     const run = await smoke(deployment, { commit: SHA, bypass: "bypass-secret" });
 
+    expect(run.rows.filter((r) => r.result !== "PASS")).toEqual([]);
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(results(run.rows)).toEqual(Array(33).fill("PASS"));
-    expect(run.line).toBe("PASS: 33 passed.");
-    expect(run.output).toMatch(/\nPASS: 33 passed\.$/);
+    // 33 checks, plus connector sign-in's S1–S7 (scripts/smoke-checks/signin.mjs).
+    expect(results(run.rows)).toEqual(Array(40).fill("PASS"));
+    expect(run.line).toBe("PASS: 40 passed.");
+    expect(run.output).toMatch(/\nPASS: 40 passed\.$/);
     // Over MCP: one booking declined, a Beard trim approved and then cancelled by the cleanup, and the deposit
     // check's Haircut approved and cancelled. Over the web: the JSON booking declined, and the form post's
     // booking declined by the cleanup. All by front-desk-smoke.
@@ -280,8 +289,8 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("FAIL");
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.item === "2")).toMatchObject({ result: "FAIL", evidence: "HTTP 500 boom" });
-    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(32);
-    expect(run.line).toBe("FAIL: 1 failed, 32 passed, 0 skipped.");
+    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(39);
+    expect(run.line).toBe("FAIL: 1 failed, 39 passed, 0 skipped.");
   });
 
   it("BLOCKED: not_ready prints the problems, runs nothing else and exits 2", async () => {
@@ -344,11 +353,13 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
     expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual([
-      "5", "5", "11", "11", "12", "14", "14", "14", "17", "17", "19", "19", "19", "19", "W4", "W4", "W4", "W5", "23", "23",
+      "5", "5", "S5", "S6", "S7", "11", "11", "12", "14", "14", "14", "17", "17", "19", "19", "19", "19", "W4", "W4", "W4", "W5", "23", "23",
     ]);
     // The read-only web checks still run; no cleanup row: it made no bookings.
     expect(run.rows.filter((r) => r.item.startsWith("W") && r.result === "PASS").map((r) => r.item)).toEqual(["W1", "W2", "W3"]);
-    expect(run.line).toBe("PASS: 12 passed, 20 skipped (a skipped check is not a pass: verify those by hand).");
+    // Connector sign-in's read-only S1–S4 run; its sign-in (S5–S7) is skipped like the booking loop.
+    expect(run.rows.filter((r) => r.item.startsWith("S") && r.result === "PASS").map((r) => r.item)).toEqual(["S1", "S2", "S3", "S4"]);
+    expect(run.line).toBe("PASS: 16 passed, 23 skipped (a skipped check is not a pass: verify those by hand).");
     expect(deployment.state.requests.some((r) => r.path === "/api/jobs/nightly")).toBe(false);
     expect(deployment.state.mcp.some((c) => c.params?.name === "book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.path === "/api/shops/harts/book")).toBe(false);
@@ -358,7 +369,8 @@ describe("pnpm smoke", () => {
   it("--owner-token overrides the preview token, and is never printed", async () => {
     const deployment = fakeDeployment({ ownerToken: "prod-secret-token" });
     const run = await smoke(deployment, { ownerToken: "prod-secret-token" });
-    const sent = deployment.state.requests.map((r) => r.headers.get("authorization")).filter(Boolean);
+    // (MCP calls carry connector sign-in's own access token, never the owner token.)
+    const sent = deployment.state.requests.filter((r) => r.path !== "/api/mcp").map((r) => r.headers.get("authorization")).filter(Boolean);
     expect(sent.length).toBeGreaterThan(0);
     expect(new Set(sent)).toEqual(new Set(["Bearer prod-secret-token"]));
     expect(run.exitCode).toBe(EXIT.pass);

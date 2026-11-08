@@ -89,11 +89,12 @@ if (!url) {
       await closePostgresClients();
     });
 
-    it("0003 left no customers or otp_challenges tables, and approvals stores the token itself", async () => {
-      const [row] = await sql<{ customers: string | null; otp: string | null }[]>`
-        select to_regclass('public.customers')::text as customers, to_regclass('public.otp_challenges')::text as otp
+    it("0003 left no otp_challenges table, and approvals stores the token itself", async () => {
+      // (0003 left no customers table either; 0008_signin.sql adds one for connector sign-in.)
+      const [row] = await sql<{ otp: string | null }[]>`
+        select to_regclass('public.otp_challenges')::text as otp
       `;
-      expect(row).toEqual({ customers: null, otp: null });
+      expect(row).toEqual({ otp: null });
       const columns = await sql<{ column_name: string }[]>`
         select column_name from information_schema.columns
         where table_schema = 'public' and table_name = 'approvals' order by ordinal_position

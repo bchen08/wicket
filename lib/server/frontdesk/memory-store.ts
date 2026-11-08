@@ -166,6 +166,8 @@ type StoredBooking = Omit<
   LifecycleStamps & {
     approveBy: Date | null;
     customerPhone: string | null;
+    /** bookings.customer_id: the signed-in customer, or null. */
+    customerId: string | null;
     mandate: Mandate | null;
     checkoutSessionId: string | null;
     paymentIntentId: string | null;
@@ -354,7 +356,8 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       completedAt: null,
       noShowAt: null,
       approveBy: input.approveBy ? copyDate(input.approveBy) : null,
-      customerPhone: null,
+      customerPhone: input.customerPhone ?? null,
+      customerId: input.customerId ?? null,
       mandate: input.mandate ? jsonCopy(input.mandate) : null,
       depositState: input.depositState ?? "none",
       checkoutSessionId: input.checkoutSessionId ?? null,
@@ -558,6 +561,14 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       return bookings
         .filter((b) => b.shopSlug === shopSlug && overlaps(b, range) && (!statuses || statuses.includes(b.status)))
         .sort(byStart)
+        .map((b) => toBooking(record(b)));
+    },
+
+    async listCustomerBookings(shopSlug, customerId, since, limit) {
+      return bookings
+        .filter((b) => b.shopSlug === shopSlug && b.customerId === customerId && b.end.getTime() > since.getTime())
+        .sort(byStart)
+        .slice(0, limit)
         .map((b) => toBooking(record(b)));
     },
 

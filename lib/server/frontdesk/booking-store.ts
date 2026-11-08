@@ -40,6 +40,10 @@ export type NewBooking = {
   approvalToken: string;
   /** The person's limits as validated by book, or null. */
   mandate: Mandate | null;
+  /** The signed-in customer the booking belongs to (connector sign-in), or absent/null for an anonymous agent. */
+  customerId?: string | null;
+  /** The signed-in customer's phone (E.164), stored as customer_phone from the start. Absent/null: none yet. */
+  customerPhone?: string | null;
 };
 
 // ---- Ring 1b: consent records ----
@@ -154,6 +158,11 @@ export interface BookingStore {
    * `statuses` when it's given (the nightly tidy-up asks for awaiting_deposit, then confirmed).
    */
   listBookings(shopSlug: string, range: TimeRange, statuses?: readonly BookingStatus[]): Promise<Booking[]>;
+  /**
+   * One signed-in customer's bookings at the shop (bookings.customer_id), of any status, that end after
+   * `since`, sorted by start, at most `limit`. Doesn't expire anything.
+   */
+  listCustomerBookings(shopSlug: string, customerId: string, since: Date, limit: number): Promise<Booking[]>;
   /** One booking by id, or null. Any string is accepted: a malformed id is simply not found. Doesn't expire anything. */
   getBooking(id: string): Promise<Booking | null>;
   /**

@@ -21,6 +21,9 @@
 //    its four counts, and /api/status shows that run as lastNightlyRun.
 //    Its MCP requests and web bookings say they come from "front-desk-smoke", so the bookings show who
 //    made them.
+//    Before the booking loop, connector sign-in (scripts/smoke-checks/signin.mjs, items S1–S7): the OAuth
+//    discovery documents and the 401 sign-in challenge everywhere; where writesAllowed, a full sign-in as a
+//    test client, a signed-in booking without a name (cancelled again) and a token refresh.
 //
 // --bypass <secret> (or VERCEL_AUTOMATION_BYPASS_SECRET) sends Vercel's x-vercel-protection-bypass header
 // on every request, for previews behind Vercel Authentication. --owner-token overrides the owner token,
@@ -29,6 +32,7 @@
 // Exit codes: 0 every check passed (some may be SKIPPED), 1 a check failed, 2 BLOCKED, 64 bad arguments.
 
 import { pathToFileURL } from "node:url";
+import { runSigninChecks } from "./smoke-checks/signin.mjs";
 
 export const SMOKE_AGENT = "front-desk-smoke";
 export const SMOKE_CUSTOMER = "Smoke Test";
@@ -39,7 +43,7 @@ export const BYPASS_HEADER = "x-vercel-protection-bypass";
 export const EXIT = { pass: 0, fail: 1, blocked: 2, usage: 64 };
 
 const SHOP_SERVICES = ["haircut", "beard-trim", "haircut-beard"];
-const MCP_TOOLS = ["book", "cancel", "get_availability", "get_booking", "get_policies", "list_services"];
+const MCP_TOOLS = ["book", "cancel", "get_availability", "get_booking", "get_policies", "list_my_bookings", "list_services"];
 /** Tool calls use the 2026-07-28 protocol, whose per-request _meta envelope carries clientInfo (the agent's name). */
 const MCP_MODERN = "2026-07-28";
 const MCP_LEGACY = "2025-06-18";
@@ -446,7 +450,7 @@ export async function runSmoke({
     return `server ${result.serverInfo.name} ${result.serverInfo.version}, protocol ${result.protocolVersion}`;
   });
 
-  await check("7", "MCP tools/list has the six tools", async () => {
+  await check("7", "MCP tools/list has the seven tools", async () => {
     const result = await client.mcp("tools/list", {});
     const names = Array.isArray(result?.tools) ? result.tools.map((t) => t.name).sort() : [];
     expect(JSON.stringify(names) === JSON.stringify(MCP_TOOLS), `tools: ${names.join(", ") || "none"}`);
@@ -525,6 +529,23 @@ export async function runSmoke({
     ["23", "GET /api/jobs/nightly → 200 with its four counts"],
     ["23", "/api/status shows that run as lastNightlyRun"],
   ];
+
+  // ---- Connector sign-in (scripts/smoke-checks/signin.mjs): read-only checks everywhere, the sign-in flow where writes are allowed ----
+
+  await runSigninChecks({
+    check,
+    expect,
+    client,
+    http,
+    snippet,
+    baseUrl,
+    writesAllowed: status.database?.writesAllowed === true,
+    agent: SMOKE_AGENT,
+    customerName: SMOKE_CUSTOMER,
+    now,
+    random,
+  });
+
   /** Bookings this run made: { id, token, done, approved } (done: declined or cancelled). */
   const made = [];
 

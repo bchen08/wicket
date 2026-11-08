@@ -10,6 +10,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 | [`supabase/migrations/0004_alerts.sql`](../supabase/migrations/0004_alerts.sql) | Owner alerts: `policies.owner_email` and the `alerts` table (one row per alert sent, logged or failed). Drops the unused `idempotency_keys`. |
 | [`supabase/migrations/0005_deposits.sql`](../supabase/migrations/0005_deposits.sql) | Deposits through Stripe Checkout: the Checkout Session, its URL, the PaymentIntent, `pay_by`, `deposit_state` and the last refused capture or release on `bookings`. See [deposits.md](deposits.md#database-0005_depositssql). |
 | [`supabase/migrations/0006_nightly.sql`](../supabase/migrations/0006_nightly.sql) | The nightly tidy-up's log: the `nightly_runs` table (one row per run, with its counts), which `/api/status` shows as `lastNightlyRun`. See [nightly.md](nightly.md#database-0006_nightlysql). |
+| [`supabase/migrations/0008_signin.sql`](../supabase/migrations/0008_signin.sql) | Connector sign-in: `customers` (one per shop and phone), `bookings.customer_id`, and the OAuth tables `oauth_clients`, `oauth_codes`, `oauth_tokens`. See [connector-signin.md](connector-signin.md#database-0008_signinsql). |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -31,6 +32,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 - `events (id, booking_id, at, actor, type, data jsonb)`: one row per booking state change (`booked`, `approved`, `declined`, `expired`, `cancelled`, `completed`, `no_show`), written in the same transaction as the change. `actor` is `agent`, `owner`, `customer` or `system`.
 - `alerts (id, shop_slug, booking_id, kind, channel, recipient, status, error, created_at)`: one row per owner alert, whatever happened to it. `kind` is `booking_confirmed` or `booking_cancelled`; `channel` is `email` (to `recipient`) or `log` (`recipient` null); `status` is `sent`, `logged` or `failed` (with `error`). `id` increases. Deleting a booking deletes its alerts. The owner reads the newest 50 with `GET /api/shops/[shop]/alerts` ([frontdesk-api.md](frontdesk-api.md#owner-alerts)).
 - `idempotency_keys`: from 0002, unused since the MVP reset, dropped by 0004.
+- `customers (id, shop_slug, name, phone, created_at, updated_at)`, unique `(shop_slug, phone)`, and `bookings.customer_id`: the person an agent signed in as (connector sign-in), null for bookings made without sign-in. `oauth_clients`, `oauth_codes` and `oauth_tokens` hold connector sign-in's clients, codes and tokens, stored as they are. See [connector-signin.md](connector-signin.md).
 
 Double booking is impossible at the database level:
 
@@ -329,7 +331,7 @@ The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/dep
 
 ## Running the Postgres tests
 
-`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql` to `0006_nightly.sql`) and the seed applied:
+`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql` to `0008_signin.sql`) and the seed applied:
 
 ```bash
 DATABASE_URL_TEST=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm test

@@ -115,7 +115,7 @@ export function bookingNotFound(bookingId: string): FrontDeskError {
   return new FrontDeskError(
     "booking_not_found",
     `No booking with id "${bookingId}" at this shop.`,
-    "Check the booking id. It is the booking.id (a UUID) that book returned.",
+    "Check the booking id. It is the booking.id (a UUID) that book returned, or that list_my_bookings lists for a signed-in person.",
     { booking_id: bookingId },
   );
 }
@@ -465,9 +465,10 @@ export function parseMandate(raw: unknown): Mandate | null {
  * Check raw `book` tool arguments (any JSON) and narrow them to BookInput, in the same style as
  * parseGetAvailabilityArgs: missing fields and wrong JSON types become invalid_request errors.
  * customer_name is returned trimmed; mandate is checked by parseMandate (omitted from the result when
- * there is none).
+ * there is none). A signed-in agent's call has customer_name filled in before it gets here (bookArgsFor in
+ * lib/server/identity/customer.ts), so it is always required here.
  */
-export function parseBookArgs(raw: unknown): BookInput {
+export function parseBookArgs(raw: unknown): ParsedBookInput {
   const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const { service_id, start, customer_name } = args;
 
@@ -514,6 +515,9 @@ export function parseBookArgs(raw: unknown): BookInput {
   };
 }
 
+/** BookInput after parseBookArgs: customer_name is always there. */
+export type ParsedBookInput = BookInput & { customer_name: string };
+
 /**
  * What book() hands back: the contract's BookResult, plus the staff name, when the hold lapses in the
  * shop's zone (e.g. "Tue 10 Nov, 11:10 am EST") and whether this deployment collects deposits, for the
@@ -546,6 +550,8 @@ export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string
  * lib/server/deposits/deposits.ts once a deposit is paid) or the person declines, not here: a hold alone
  * is no news. A booking awaiting its deposit past pay_by is checked with Stripe in step 4 too
  * (syncDeposit), so an unpaid one never blocks this booking.
+ * With `customer` (an agent signed in as that person, lib/server/identity/customer.ts) the booking belongs to
+ * them (customer_id) and carries their phone from the start; the caller has already filled customer_name.
  * TODO(ring-2): require a mandate once agents sign in.
  */
 export async function book(
@@ -553,6 +559,7 @@ export async function book(
   shopSlug: string,
   input: BookInput,
   agentName: string,
+  customer: BookingCustomer | null = null,
 ): Promise<BookOutcome> {
   const args = parseBookArgs(input);
   const start = parseRfc3339(args.start);
@@ -565,8 +572,11 @@ export async function book(
     );
   }
 
-  return bookOnce(deps, shopSlug, args, start, cleanAgentName(agentName));
+  return bookOnce(deps, shopSlug, args, start, cleanAgentName(agentName), customer);
 }
+
+/** The signed-in customer a booking belongs to: their id and phone. */
+export type BookingCustomer = { id: string; phone: string };
 
 /** checkStart's refusals that come from the shop's rules alone, before hours and busy time count. */
 const RULE_REFUSALS: ReadonlySet<RefusedStart["reason"]> = new Set(["paused", "too_soon", "too_far"]);
@@ -575,9 +585,10 @@ const RULE_REFUSALS: ReadonlySet<RefusedStart["reason"]> = new Set(["paused", "t
 async function bookOnce(
   deps: FrontDeskDeps,
   shopSlug: string,
-  args: BookInput,
+  args: ParsedBookInput,
   start: Date,
   agentName: string,
+  customer: BookingCustomer | null,
 ): Promise<BookOutcome> {
   const shop = await requireShop(deps, shopSlug);
   const [service, policies, staffHours] = await Promise.all([
@@ -657,6 +668,8 @@ async function bookOnce(
         approveBy: held.approveBy,
         approvalToken: token,
         mandate: args.mandate ?? null,
+        customerId: customer?.id ?? null,
+        customerPhone: customer?.phone ?? null,
       });
     } catch (err) {
       if (err instanceof SlotTakenError) return null;
