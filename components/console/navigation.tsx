@@ -7,6 +7,7 @@ const links = [
   ["Services", "/console/services"],
   ["Hours", "/console/hours"],
   ["Rules", "/console/rules"],
+  ["Agents", "/console/agents"],
 ] as const;
 export function ConsoleNavigation() {
   const pathname = usePathname();

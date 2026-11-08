@@ -13,14 +13,16 @@ import { getSigninDeps } from "@/lib/server/oauth/deps";
 // it. The form posts to /api/oauth/authorize, which answers 303 back to the agent (or here with ?error=…).
 // TODO(ring-2): verify the number with a texted code once texting lands.
 
+export const instant = false;
+
 export const metadata: Metadata = {
   title: "Sign in — Front Desk",
   robots: { index: false, follow: false },
 };
 
 const FORM_ERRORS: Record<SigninFormError, string> = {
-  invalid_name: "Enter your name (up to 80 characters).",
-  invalid_phone: "That number doesn't look right. Enter your mobile number, e.g. 401 555 0123 or +44 7700 900123.",
+  invalid_name: "Enter your name",
+  invalid_phone: "Enter a mobile number, like 401 555 0123",
   internal: "Something went wrong on our side. Please try again.",
 };
 
@@ -31,30 +33,28 @@ function Ask({ view }: { view: Extract<SigninView, { kind: "ask" }> }) {
     <input key={name} type="hidden" name={name} value={value} />
   ));
   return (
-    <section className="flex flex-col gap-6">
+    <section className="flex flex-col gap-6 rounded-2xl border border-border bg-card p-6 sm:p-8">
       <header className="flex flex-col gap-3">
         <p className="eyebrow text-primary">Sign in to {view.shop.name}</p>
-        <h1 className="section-title">{view.clientName} wants to book for you</h1>
-        <p className="text-muted-foreground">
-          {view.clientName} ({view.clientHost}) is asking to book appointments at {view.shop.name} as you, and to see and
-          cancel your bookings there. Sign in with your name and mobile number so you don&apos;t have to type them again.
-          You still approve every booking yourself.
-        </p>
+        <h1 className="text-3xl font-medium leading-tight tracking-tight text-balance">{view.clientName} wants to book at {view.shop.name} for you</h1>
+        <p className="text-xs text-muted-foreground wrap-anywhere">{view.clientHost}</p>
+        <p className="text-sm text-muted-foreground">It can book, see and cancel your appointments at {view.shop.name}. Nothing is booked without your approval.</p>
       </header>
       {view.error && (
-        <p role="alert" className="rounded-lg border border-destructive/30 p-3 text-sm text-destructive">
+        <p id="signin-error" role="alert" className="rounded-lg border border-destructive/30 p-3 text-sm text-destructive">
           {FORM_ERRORS[view.error]}
         </p>
       )}
-      <form method="post" action="/api/oauth/authorize" className="flex flex-col gap-3">
+      <div className="grid grid-cols-2 gap-3">
+      <form method="post" action="/api/oauth/authorize" className="contents">
         {hidden}
-        <label className="flex flex-col gap-1 text-sm">
+        <label className="col-span-2 mb-2 flex flex-col gap-2 text-sm">
           Your name, as the shop should see it
-          <input type="text" name="name" required maxLength={80} autoComplete="name" className={inputClass} />
+          <input type="text" name="name" required maxLength={80} autoComplete="name" aria-invalid={view.error === "invalid_name"} aria-describedby={view.error === "invalid_name" ? "signin-error" : undefined} className={inputClass} />
         </label>
-        <label className="flex flex-col gap-1 text-sm">
+        <label className="col-span-2 mb-2 flex flex-col gap-2 text-sm">
           Mobile number
-          <input type="tel" name="phone" required autoComplete="tel" placeholder="401 555 0123" className={inputClass} />
+          <input type="tel" name="phone" required autoComplete="tel" placeholder="401 555 0123" aria-invalid={view.error === "invalid_phone"} aria-describedby={view.error === "invalid_phone" ? "signin-error" : undefined} className={inputClass} />
         </label>
         <button
           type="submit"
@@ -76,6 +76,7 @@ function Ask({ view }: { view: Extract<SigninView, { kind: "ask" }> }) {
           Deny
         </button>
       </form>
+      </div>
     </section>
   );
 }
@@ -98,8 +99,7 @@ async function Signin({ searchParams }: PageProps<"/signin">) {
   if (view.kind === "error") {
     return (
       <section className="flex flex-col gap-3 rounded-2xl border border-border bg-surface/50 p-6 sm:p-8">
-        <h1 className="text-2xl font-medium">We can&apos;t sign you in</h1>
-        <p className="text-muted-foreground wrap-anywhere">{view.message}</p>
+        <p role="status" className="text-muted-foreground wrap-anywhere">{view.message}</p>
       </section>
     );
   }

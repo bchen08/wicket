@@ -5,6 +5,7 @@ import { CopyApprovalLink } from "@/components/copy-approval-link";
 import Link from "next/link";
 import { BookingActions } from "@/components/console/booking-actions";
 import { BookingDepositDisplay } from "@/components/console/booking-deposit";
+import { AgentBadge } from "@/components/console/agent-badge";
 
 const STATUS_LABELS: Record<BookingStatus, string> = {
   awaiting_approval: "Awaiting approval",
@@ -55,7 +56,7 @@ function BookingCard({ booking, now }: { booking: Booking; now: number }) {
       {booking.customer.phone && (
         <p className="text-sm">Phone: {booking.customer.phone}</p>
       )}
-      <p className="text-sm text-muted-foreground">via {booking.agent.name}</p>
+      <AgentBadge agent={booking.agent} />
       {(booking.status === "awaiting_approval" || booking.status === "awaiting_deposit") && booking.approval && (
         <div className="flex flex-col gap-3 rounded-lg bg-surface p-4">
           <p className="text-sm text-muted-foreground">

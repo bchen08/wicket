@@ -65,6 +65,7 @@ export function RulesForm({ policies }: { policies: Policies }) {
       cancelWindowHours: Number(data.get("cancelWindowHours")),
       phone: String(data.get("phone")).trim() || null,
       ownerEmail: String(data.get("ownerEmail")).trim() || null,
+      ownerMobile: String(data.get("ownerMobile")).trim() || null,
       depositRule: String(data.get("depositRule")),
       lateCancelRule: String(data.get("lateCancelRule")),
       noShowRule: String(data.get("noShowRule")),
@@ -132,6 +133,15 @@ export function RulesForm({ policies }: { policies: Policies }) {
             maxLength={254}
             defaultValue={policies.ownerEmail ?? ""}
             hint="Where new-booking and cancellation emails go."
+          />
+          <FormInput
+            name="ownerMobile"
+            label="Owner mobile"
+            type="tel"
+            autoComplete="tel"
+            placeholder="+1 401 555 0123"
+            defaultValue={policies.ownerMobile ?? ""}
+            hint="Booking alerts and sign-in codes are texted here. Include the country code, e.g. +1 401 555 0123."
           />
           <FormInput
             name="phone"

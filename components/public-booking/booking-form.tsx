@@ -19,6 +19,7 @@ const fields = {
   start: "start",
   name: "name",
   bookedBy: "bookedBy",
+  phone: "phone",
 } as const satisfies Record<string, keyof WebBookRequest>;
 
 export function ShopPhone({ phone }: { phone: string | null }) {
@@ -138,6 +139,11 @@ export function BookingForm({
               maxLength={80}
               className="min-h-12"
             />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="booking-phone">Mobile (optional)</FieldLabel>
+            <Input id="booking-phone" name={fields.phone} type="tel" autoComplete="tel" aria-describedby="booking-phone-help" className="min-h-12" />
+            <p id="booking-phone-help" className="text-sm text-muted-foreground">We&apos;ll text you the approval link if we can</p>
           </Field>
           <Field>
             <FieldLabel htmlFor="booked-by">
