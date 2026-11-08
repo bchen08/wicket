@@ -1,0 +1,80 @@
+// Every table and column the Postgres store (postgres-store.ts) reads or writes, in the `public` schema.
+// GET /api/status compares this list with the database's information_schema: anything missing makes the
+// schema "outdated" and is named in `missing` (e.g. "approvals.token").
+//
+// Keep it exact. schema.test.ts fails if postgres-store.ts names a column this list lacks, or if a
+// listed column is no longer used. When a change makes the store use a new column, add it here in the
+// same PR as the migration that creates it.
+export const REQUIRED_SCHEMA = {
+  shops: ["slug", "name", "timezone"],
+  services: ["shop_slug", "id", "name", "duration_min", "price_cents", "deposit_cents", "position"],
+  staff: ["id", "shop_slug", "name"],
+  weekly_hours: ["staff_id", "weekday", "opens", "closes"],
+  bookings: [
+    "id",
+    "shop_slug",
+    "service_id",
+    "staff_id",
+    "during",
+    "status",
+    "customer_name",
+    "agent_name",
+    "created_at",
+    "cancelled_at",
+    "cancelled_by",
+    "completed_at",
+    "no_show_at",
+    "deposit_cents",
+    "approve_by",
+    "customer_phone",
+    "mandate",
+  ],
+  approvals: ["booking_id", "token", "decision", "decided_at"],
+  events: ["id", "booking_id", "at", "actor", "type", "data"],
+  policies: [
+    "shop_slug",
+    "lead_time_min",
+    "horizon_days",
+    "deposit_horizon_days",
+    "cancel_window_hours",
+    "paused",
+    "phone",
+    "deposit_rule",
+    "late_cancel_rule",
+    "no_show_rule",
+    "updated_at",
+  ],
+  blocked_times: ["id", "staff_id", "during", "reason"],
+} as const satisfies Record<string, readonly string[]>;
+
+export type RequiredTable = keyof typeof REQUIRED_SCHEMA;
+
+/** The tables in REQUIRED_SCHEMA. */
+export const REQUIRED_TABLES = Object.keys(REQUIRED_SCHEMA) as RequiredTable[];
+
+/** A column that exists in the database. */
+export type PresentColumn = { table: string; column: string };
+
+/**
+ * What REQUIRED_SCHEMA needs that `present` lacks, in list order: "table.column" for a missing column, or
+ * the bare table name when none of its columns exist (the table itself is missing).
+ */
+export function missingFromSchema(present: Iterable<PresentColumn>): string[] {
+  const columns = new Set<string>();
+  const tables = new Set<string>();
+  for (const { table, column } of present) {
+    columns.add(`${table}.${column}`);
+    tables.add(table);
+  }
+  const missing: string[] = [];
+  for (const table of REQUIRED_TABLES) {
+    if (!tables.has(table)) {
+      missing.push(table);
+      continue;
+    }
+    for (const column of REQUIRED_SCHEMA[table] as readonly string[]) {
+      if (!columns.has(`${table}.${column}`)) missing.push(`${table}.${column}`);
+    }
+  }
+  return missing;
+}

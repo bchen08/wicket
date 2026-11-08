@@ -537,3 +537,45 @@ export type ApproveResponse = {
 export type DeclineResponse = {
   booking: Booking;
 };
+
+// ---- Environment status ----
+
+/**
+ * GET /api/status: what this deployment is and whether it's ready to be verified. Always 200 and never
+ * cached. `pnpm smoke` reads it before anything else (docs/VERIFIER.md). It never contains a secret value
+ * or a connection string.
+ */
+export type StatusResponse = {
+  /** `ready` exactly when `problems` is empty. */
+  status: "ready" | "not_ready";
+  /** VERCEL_ENV; `development` when it isn't set (pnpm dev). */
+  environment: "production" | "preview" | "development";
+  /** The deployed commit: VERCEL_GIT_COMMIT_SHA, first 7 characters. null when it isn't set (pnpm dev). */
+  commit: string | null;
+  database: {
+    /** `postgres` when DATABASE_URL is set, else `memory` (in-memory demo data; on Vercel that's a configuration error). */
+    mode: "postgres" | "memory";
+    /** Whether the database answered. The in-memory store always does (except on Vercel, where it isn't used). */
+    reachable: boolean;
+    /** The name of the shop with slug `harts`, or null (unreachable, or not seeded). */
+    shopName: string | null;
+    /**
+     * Whether checks may write here (book, decline). Never in production. Elsewhere only when shopName ends in
+     * "(preview)" (the Preview database) or the data is in memory.
+     */
+    writesAllowed: boolean;
+    /**
+     * `current`: every table and column Front Desk reads and writes exists. `outdated`: some are missing (see
+     * `missing`). `unknown`: the database couldn't be inspected.
+     */
+    schema: "current" | "outdated" | "unknown";
+    /** What's missing, e.g. "approvals.token", or a bare table name ("approvals") when the whole table is. */
+    missing: string[];
+  };
+  /** Whether OWNER_API_TOKEN is set. Its value is never shown. */
+  ownerAccess: "configured" | "missing";
+  /** Approval links are built on the origin of the request that creates them, like this one's. */
+  approvalLinks: { origin: string };
+  /** One sentence each, saying what to fix and where. Empty when ready. */
+  problems: string[];
+};
