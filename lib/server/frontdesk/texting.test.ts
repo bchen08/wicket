@@ -10,6 +10,7 @@ import type {
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
 import { approveBooking, declineBooking } from "../consent/approvals";
+import { createPhotonSender } from "../notify/photon";
 import { approvalLinkText, ownerAlertText } from "../notify/texts";
 import { createFrontDeskDeps } from "./deps";
 import { policiesGet, policiesPut, type OwnerOptions } from "./http";
@@ -50,6 +51,24 @@ const hold = (deps: FrontDeskDeps, extra: { customer_phone?: string } = {}, star
 /** The recorded alerts as [kind, channel, recipient, status], oldest first. */
 const recorded = async (deps: FrontDeskDeps) =>
   (await deps.store.listAlerts("harts", ALERTS_LIMIT)).reverse().map((a) => [a.kind, a.channel, a.recipient, a.status]);
+
+/** The real Photon sender against a fake API that, like a shared pool, only lets a person's own assigned line text them. */
+function photonTexter(assignments: { handle: string; assignedPhoneNumber: string }[]) {
+  const sentFrom: string[] = [];
+  const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "GET") return Response.json({ assignments });
+    const body = JSON.parse(String(init?.body));
+    if (String(url).endsWith("/users")) return Response.json({ id: body.handle });
+    if (String(url).endsWith("/spaces")) return Response.json({ id: body.participantIds.join(" to ") });
+    const [line, person] = String(body.spaceId).split(" to ");
+    if (!assignments.some((a) => a.handle === person && a.assignedPhoneNumber === line)) {
+      return Response.json({ code: "SHARED_LINE_NOT_ASSIGNED", status: 403, title: "Shared Line Not Assigned" }, { status: 403 });
+    }
+    sentFrom.push(line);
+    return Response.json({ id: "pho_msg_1" }, { status: 202 });
+  }) as typeof globalThis.fetch;
+  return { texter: createPhotonSender({ apiKey: "pho_sk_test", projectId: "pho_prj_test", line: "+12125550100", fetch }), sentFrom };
+}
 
 // ---- The approval link by text ----
 
@@ -159,6 +178,28 @@ describe("book with the person's phone: the approval link by text", () => {
     // Logged without the number.
     const logged = vi.mocked(console.error).mock.calls.map((c) => String(c[0])).join("\n");
     expect(logged).toContain("booking.approval_text_failed");
+    expect(logged).not.toContain(PHONE_E164);
+  });
+
+  it("through Photon, a person with their own assigned line gets the link from that line (texted: true)", async () => {
+    const { texter, sentFrom } = photonTexter([
+      { handle: "+14015550999", assignedPhoneNumber: "+12125550188" },
+      { handle: PHONE_E164, assignedPhoneNumber: "+12125550177" },
+    ]);
+    const outcome = await hold(memoryDeps({ texter }), { customer_phone: PHONE_E164 });
+    expect(outcome.texted).toBe(true);
+    expect(sentFrom).toEqual(["+12125550177"]);
+  });
+
+  it("through Photon, a number that isn't in the project fails cleanly: texted false, and the hold stands", async () => {
+    const { texter, sentFrom } = photonTexter([{ handle: "+14015550999", assignedPhoneNumber: "+12125550188" }]);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const outcome = await hold(memoryDeps({ texter }), { customer_phone: PHONE_E164 });
+    expect(outcome.texted).toBe(false);
+    expect(outcome.booking.status).toBe("awaiting_approval");
+    expect(sentFrom).toEqual([]);
+    const logged = vi.mocked(console.error).mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logged).toContain("SHARED_LINE_NOT_ASSIGNED");
     expect(logged).not.toContain(PHONE_E164);
   });
 
