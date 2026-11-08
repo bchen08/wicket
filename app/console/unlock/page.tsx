@@ -29,7 +29,7 @@ async function WrongCode({
   return (
     <p
       role="alert"
-      className="rounded-lg border border-destructive/30 p-3 text-sm text-destructive"
+      className="border-y border-destructive/40 py-3 text-sm text-destructive"
     >
       That access code didn&apos;t work. Check it and try again.
     </p>
@@ -66,8 +66,8 @@ async function TextMeACode({
           role={message.alert ? "alert" : "status"}
           className={
             message.alert
-              ? "rounded-lg border border-destructive/30 p-3 text-sm text-destructive"
-              : "rounded-lg border border-border p-3 text-sm"
+              ? "border-y border-destructive/40 py-3 text-sm text-destructive"
+              : "border-y border-border py-3 text-sm"
           }
         >
           {message.text}
@@ -88,7 +88,7 @@ async function TextMeACode({
               inputMode="numeric"
               autoComplete="one-time-code"
               pattern="[0-9 ]{6,7}"
-              className="min-h-12 w-full rounded-lg border border-border bg-background px-4 py-3 text-base"
+              className="min-h-12 w-full rounded-md border border-border bg-background px-4 py-3 font-mono text-base"
             />
           </label>
           <button
@@ -127,7 +127,7 @@ async function AccessCode({ searchParams }: Pick<PageProps<"/console/unlock">, "
     <form method="post" action="/api/owner/session" className="flex flex-col gap-3">
       <label className="flex flex-col gap-2 text-sm">
         Access code
-        <input type="password" name="token" required autoComplete="current-password" className="min-h-12 w-full rounded-lg border border-border bg-background px-4 py-3 text-base" />
+        <input type="password" name="token" required autoComplete="current-password" className="min-h-12 w-full rounded-md border border-border bg-background px-4 py-3 font-mono text-base" />
       </label>
       <button type="submit" className={buttonVariants({ variant: texting ? "outline" : "default", size: "lg", className: "min-h-12 w-full" })}>Unlock</button>
     </form>
@@ -143,16 +143,16 @@ export default function UnlockPage({
   searchParams,
 }: PageProps<"/console/unlock">) {
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-md flex-col gap-8 px-5 py-8 sm:px-8 sm:py-12">
+    <main className="mx-auto flex min-h-screen w-full max-w-md flex-col gap-8 px-6 py-8 sm:px-10 sm:py-12">
       <Link
         href="/"
-        className="w-fit text-lg font-semibold tracking-tight text-primary"
+        className="w-fit font-serif text-xl"
       >
-        Front Desk<span className="text-foreground">.</span>
+        Front Desk<span>.</span>
       </Link>
-      <section className="mt-6 flex flex-col gap-5 rounded-2xl border border-border bg-surface/40 p-6 sm:mt-12 sm:p-8">
-        <p className="eyebrow text-primary">For the shop owner</p>
-        <h1 className="section-title">Welcome back.</h1>
+      <section className="mt-6 flex flex-col gap-5 border-t border-border pt-8 sm:mt-12">
+        <p className="text-sm text-muted-foreground">For the shop owner</p>
+        <h1 className="font-serif text-4xl leading-tight sm:text-5xl">Welcome back.</h1>
         <Suspense fallback={null}>
           <TextMeACode searchParams={searchParams} />
           <AccessCode searchParams={searchParams} />

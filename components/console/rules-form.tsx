@@ -15,10 +15,10 @@ export function PauseBookings({ initialPaused }: { initialPaused: boolean }) {
   const [paused, setPaused] = useState(initialPaused);
   const state = useSave();
   return (
-    <section className="flex flex-col gap-4 rounded-xl border-2 border-primary bg-accent/40 p-5 sm:p-6">
+    <section className="flex flex-col gap-4 border-t border-foreground pt-8">
       <div className="flex items-center justify-between gap-6">
         <div className="flex flex-col gap-2">
-          <label htmlFor="pause-bookings" className="text-xl font-medium">
+          <label htmlFor="pause-bookings" className="font-serif text-2xl leading-tight">
             Pause bookings
           </label>
           <p id="pause-help" className="text-sm text-muted-foreground">
@@ -82,9 +82,9 @@ export function RulesForm({ policies }: { policies: Policies }) {
     <form
       onSubmit={submit}
       onChange={state.clear}
-      className="flex flex-col gap-6 rounded-xl border border-border bg-card p-5 sm:p-6"
+      className="flex flex-col gap-6 border-t border-border pt-8"
     >
-      <h2 className="text-lg font-medium">Booking rules</h2>
+      <h2 className="font-serif text-2xl leading-tight">Booking rules</h2>
       <fieldset disabled={state.pending} className="min-w-0">
         <FieldGroup>
           <FieldGroup className="grid grid-cols-1 gap-5 sm:grid-cols-2">

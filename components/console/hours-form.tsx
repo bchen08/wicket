@@ -33,7 +33,7 @@ export function HoursForm({ staff }: { staff: StaffWeeklyHours }) {
   }
   return (
     <form
-      className="flex flex-col gap-5 rounded-xl border border-border bg-card p-5 sm:p-6"
+      className="flex flex-col gap-5 border-t border-border pt-8"
       onSubmit={(event) => {
         event.preventDefault();
         void state.save(async () => {
@@ -50,7 +50,7 @@ export function HoursForm({ staff }: { staff: StaffWeeklyHours }) {
         });
       }}
     >
-      <h2 className="text-lg font-medium">{staff.staffName} · Weekly hours</h2>
+      <h2 className="font-serif text-2xl leading-tight">{staff.staffName} · Weekly hours</h2>
       <p className="text-sm text-muted-foreground">
         Add separate windows for breaks. A day with no windows is closed. Times
         use 15-minute intervals.

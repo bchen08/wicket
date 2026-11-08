@@ -53,14 +53,14 @@ export async function OwnerBookings() {
     return (
       <section className="flex flex-col gap-5">
         <div className="flex items-center justify-between gap-4">
-          <h1 className="text-2xl font-medium">Bookings</h1>
+          <h1 className="font-serif text-4xl leading-tight sm:text-5xl">Bookings</h1>
           <RefreshBookings />
         </div>
         <div
           role="alert"
-          className="flex flex-col gap-2 rounded-xl border border-border bg-card p-5 wrap-anywhere"
+          className="flex flex-col gap-2 border-t border-border pt-5 wrap-anywhere"
         >
-          <h2 className="font-medium">Could not load bookings</h2>
+          <h2 className="font-serif text-xl">Could not load bookings</h2>
           <p className="text-sm">{message}</p>
           {nextAction && (
             <p className="text-sm text-muted-foreground">{nextAction}</p>
@@ -79,23 +79,23 @@ export async function OwnerBookings() {
     (booking) => Date.parse(booking.start) < now,
   );
   return (
-    <div className="flex min-w-0 flex-col gap-8">
-      <header className="flex items-start justify-between gap-3">
-        <div className="min-w-0 wrap-anywhere">
-          <p className="mb-2 text-xs font-medium uppercase tracking-widest text-primary">
+    <div className="flex min-w-0 flex-col gap-12">
+      <header className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 flex-col gap-3 wrap-anywhere">
+          <p className="text-sm text-muted-foreground">
             Bookings
           </p>
-          <h1 className="text-2xl font-medium tracking-tight sm:text-3xl">
+          <h1 className="font-serif text-4xl leading-tight text-balance sm:text-5xl">
             {data.shop.name}
           </h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Times in {data.shop.timezone}
+          <p className="text-sm text-muted-foreground">
+            Times in <span className="font-mono">{data.shop.timezone}</span>
           </p>
         </div>
         <RefreshBookings />
       </header>
       {data.bookings.length === 0 ? (
-        <p className="rounded-xl border border-border bg-card p-6 text-sm leading-7 text-muted-foreground">
+        <p className="border-t border-border pt-6 text-base leading-relaxed text-muted-foreground">
           No bookings yet. When an AI agent books Hart&apos;s, it shows up here.
         </p>
       ) : (

@@ -56,7 +56,7 @@ export function BookingActions({ booking, now }: { booking: Booking; now: number
       </>}
       {canCancel && <Button variant="outline" disabled={busy} onClick={() => { setConfirm("cancel"); setFeedback(null); }}>Cancel</Button>}
     </div>}
-    {confirm && confirmationAllowed && <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface p-4" role="group" aria-label={confirm === "cancel" ? "Confirm cancellation" : "Confirm no-show"}>
+    {confirm && confirmationAllowed && <div className="flex flex-col gap-3 border-y border-border py-4" role="group" aria-label={confirm === "cancel" ? "Confirm cancellation" : "Confirm no-show"}>
       <p className="font-medium">{confirm === "cancel" ? "Cancel this booking?" : "Mark this booking as a no-show?"}</p>
       <p className="text-sm" aria-live="polite">{effect}</p>
       <div className="flex flex-wrap gap-2">

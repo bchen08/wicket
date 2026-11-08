@@ -29,9 +29,9 @@ async function TimeOff({
     return <SaveFeedback feedback={errorFeedback(error)} />;
   }
   return (
-    <section className="flex flex-col gap-6 rounded-xl border border-border bg-card p-5 sm:p-6">
+    <section className="flex flex-col gap-6 border-t border-border pt-8">
       <div>
-        <h2 className="text-xl font-medium">Time off</h2>
+        <h2 className="font-serif text-3xl leading-tight">Time off</h2>
         <p className="mt-2 text-sm text-muted-foreground">
           From the past 7 days through the next year.
         </p>

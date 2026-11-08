@@ -36,12 +36,9 @@ export function Masthead() {
         <Link href="/" className="font-serif text-xl">
           Front Desk
         </Link>
-        <Link
-          href={shop.path}
-          className="text-sm underline-offset-4 hover:underline"
-        >
-          {"Hart's booking page"}
-        </Link>
+        <Button asChild>
+          <Link href="/console">Open your console</Link>
+        </Button>
       </div>
     </header>
   );
@@ -64,7 +61,7 @@ export function Hero() {
           </p>
           <div className="flex flex-wrap items-center gap-3">
             <Button asChild size="lg">
-              <Link href={shop.path}>{"Book a test haircut at Hart's"}</Link>
+              <Link href="/console">Open your console</Link>
             </Button>
             <Button asChild size="lg" variant="outline">
               <a href={contactHref}>Set up your shop</a>
