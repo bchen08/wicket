@@ -1,3 +1,4 @@
+import { requireOwner } from "@/components/console/require-owner";
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import type { PoliciesResponse } from "@/lib/types/frontdesk";
@@ -23,7 +24,10 @@ async function Rules() {
     </>
   );
 }
-export default function RulesPage() {
+export const instant = false;
+
+export default async function RulesPage() {
+  await requireOwner();
   return (
     <SettingsShell
       title="Rules"

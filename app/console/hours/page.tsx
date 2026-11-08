@@ -1,3 +1,4 @@
+import { requireOwner } from "@/components/console/require-owner";
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import type {
@@ -77,7 +78,10 @@ async function Hours() {
     </>
   );
 }
-export default function HoursPage() {
+export const instant = false;
+
+export default async function HoursPage() {
+  await requireOwner();
   return (
     <SettingsShell
       title="Hours"

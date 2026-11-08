@@ -1,7 +1,9 @@
 import "server-only";
 import { headers } from "next/headers";
 import { readResponse } from "@/components/console/api";
+import { requireOwner } from "@/components/console/require-owner";
 export async function loadSettings<T>(path: string): Promise<T> {
+  await requireOwner();
   const incoming = await headers();
   const host = incoming.get("host");
   if (!host) throw new Error("Unable to determine the shop API address.");

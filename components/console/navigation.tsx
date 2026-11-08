@@ -11,6 +11,7 @@ const links = [
 ] as const;
 export function ConsoleNavigation() {
   const pathname = usePathname();
+  if (pathname === "/console/unlock") return null;
   return (
     <nav
       aria-label="Owner console"

@@ -1,9 +1,11 @@
+import { requireOwner } from "@/components/console/require-owner";
 import { headers } from "next/headers";
 import type { ApiError, BookingsResponse } from "@/lib/types/frontdesk";
 import { BookingGroup } from "@/components/owner-booking-card";
 import { RefreshBookings } from "@/components/refresh-bookings";
 
 async function loadBookings(): Promise<BookingsResponse> {
+  await requireOwner();
   const incoming = await headers();
   const host = incoming.get("host");
   if (!host) throw new Error("Unable to determine the booking API address.");
@@ -35,6 +37,7 @@ async function loadBookings(): Promise<BookingsResponse> {
 }
 
 export async function OwnerBookings() {
+  await requireOwner();
   let data: BookingsResponse;
   try {
     data = await loadBookings();
