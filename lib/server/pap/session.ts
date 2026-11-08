@@ -7,8 +7,8 @@ import { decodeJwt, jwkThumbprint, verifySignature, type Jwk, type JwsAlgorithm 
 // Checked: Poppy-Version is 0.4; the Session JWT and its delegation are the right kinds of JWT; the delegation
 // is signed by a key at the agent's jwks_uri and hasn't expired (at most 24 hours long); the Session JWT is
 // signed by the delegated key it names (kid = that key's thumbprint), is for this Company (aud) and was signed
-// within the last minute or so (iat). Not checked (MVP: no hardening): htm and htu, replayed jti, ath (Front
-// Desk issues no access tokens), session continuity (sub and agent_id per sid), and the address checks on the
+// within the last minute or so (iat). Not checked (MVP: no hardening): htm and htu, replayed jti, ath (a connector
+// access token isn't tied to the session), session continuity (sub and agent_id per sid), and the address checks on the
 // URLs fetched. See docs/agent-identity.md.
 
 /** The protocol version Front Desk implements and serves. */

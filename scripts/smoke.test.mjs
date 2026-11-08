@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { SMOKE_PAP_AGENT } from "./smoke-checks/agents.mjs";
 import {
   blockedReasons,
   BYPASS_HEADER,
@@ -54,19 +53,16 @@ const toolError = (code) => ({ isError: true, content: [{ type: "text", text: JS
  * Approving a service with a deposit (anything but a beard-trim) waits for it, with a Stripe URL, when
  * status.deposits is "stripe_test", and confirms it (deposit not_collected) otherwise. GET /api/jobs/nightly
  * answers NIGHTLY_RUN, and /api/status shows it as lastNightlyRun from then on.
- * An MCP request with a Poppy-Session header is refused with 400 invalid_session unless the header is a JWT
- * whose iss is a data: URL of client metadata (the demo PAP agent's); then its bookings are confirmed under
- * that client_name. Signatures aren't checked here: lib/server/pap tests the real verification.
  */
 function fakeDeployment({ status = readyStatus(), route, doubleBook = false, ownerToken = PREVIEW_OWNER_TOKEN } = {}) {
-  const state = { requests: [], bookings: [], mcp: [], alerts: [], lastNightlyRun: null, agents: new Map() };
+  const state = { requests: [], bookings: [], mcp: [], alerts: [], lastNightlyRun: null };
   const alert = (b, kind) => state.alerts.unshift({ id: String(state.alerts.length + 1), bookingId: b.id, kind, channel: "log", status: "logged", error: null });
   const isOwner = (headers) => headers.get("authorization") === `Bearer ${ownerToken}`;
   const ACTIVE = ["awaiting_approval", "awaiting_deposit", "confirmed"];
   const held = (start) => state.bookings.some((b) => b.start === start && ACTIVE.includes(b.status));
-  const newBooking = (start, service, agent, clientId = null) => {
+  const newBooking = (start, service, agent) => {
     const n = state.bookings.length + 1;
-    const b = { id: `booking-${n}`, token: `token-${n}`, start, service, status: "awaiting_approval", deposit: "none", agent, clientId };
+    const b = { id: `booking-${n}`, token: `token-${n}`, start, service, status: "awaiting_approval", deposit: "none", agent };
     state.bookings.push(b);
     return b;
   };
@@ -75,8 +71,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
     status: b.status,
     start: b.start,
     display: `Tue 10 Nov, ${b.start.slice(11, 16)}`,
-    serviceId: b.service,
-    agent: { name: b.agent, confirmed: b.clientId !== null, ...(b.clientId ? { clientId: b.clientId } : {}) },
+    agent: { name: b.agent },
     deposit: {
       amountCents: b.service === "beard-trim" ? 0 : 1000,
       state: b.deposit,
@@ -108,26 +103,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
       });
     }
     if (method === "GET" && url.pathname === "/api/shops/harts/bookings") {
-      return isOwner(headers) ? json({ bookings: state.bookings.map(view) }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
-    }
-    if (method === "GET" && url.pathname === "/api/shops/harts/agents") {
-      if (!isOwner(headers)) return apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
-      const agents = [...state.agents].map(([clientId, a]) => ({
-        clientId,
-        name: a.name,
-        firstSeen: "2026-11-08T07:00:00-05:00",
-        lastSeen: "2026-11-08T07:00:00-05:00",
-        bookings: state.bookings.filter((b) => b.clientId === clientId).length,
-        lastBookedAt: null,
-      }));
-      return json({ shop: { slug: "harts" }, agents, unconfirmedBookings: state.bookings.filter((b) => b.clientId === null).length });
-    }
-    if (method === "GET" && url.pathname === "/.well-known/poppy.json") {
-      return json({
-        protocol_version: "0.4",
-        organization: { name: "Hart's Barbers (preview)", domain: url.host },
-        apis: [{ type: "mcp", url: `${BASE}/api/mcp`, description: "Book." }],
-      });
+      return isOwner(headers) ? json({ bookings: [] }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
     }
     if (method === "GET" && url.pathname === "/api/shops/harts/alerts") {
       return isOwner(headers) ? json({ alerts: state.alerts.slice(0, 50) }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
@@ -146,12 +122,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
       return new Response(text, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
     if (method === "GET" && url.pathname === "/.well-known/front-desk.json") {
-      return json({
-        mcp: `${BASE}/api/mcp`,
-        webApi: `${BASE}/api/shops/harts`,
-        agentsMd: `${BASE}/api/shops/harts/agents.md`,
-        poppy: `${BASE}/.well-known/poppy.json`,
-      });
+      return json({ mcp: `${BASE}/api/mcp`, webApi: `${BASE}/api/shops/harts`, agentsMd: `${BASE}/api/shops/harts/agents.md` });
     }
     if (method === "POST" && url.pathname === "/api/shops/harts/book") {
       const form = (headers.get("content-type") ?? "").startsWith("application/x-www-form-urlencoded");
@@ -196,12 +167,6 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
     if (method === "POST" && url.pathname === "/api/mcp") {
       const msg = JSON.parse(init.body);
       state.mcp.push({ method: msg.method, params: msg.params, headers });
-      let pap = null;
-      if (headers.has("poppy-session")) {
-        pap = papAgent(headers.get("poppy-session"));
-        if (!pap) return json({ error: "invalid_session", error_description: "Poppy-Session must be a compact JWT." }, 400);
-        state.agents.set(pap.clientId, { name: pap.name });
-      }
       const reply = (result) => json({ jsonrpc: "2.0", id: msg.id, result });
       if (msg.method === "initialize") {
         // Like the real server: legacy requests are answered as one SSE event.
@@ -209,7 +174,9 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
         return new Response(`event: message\ndata: ${data}\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
       }
       if (msg.method === "tools/list") {
-        return reply({ tools: ["list_services", "get_policies", "get_availability", "book", "get_booking", "cancel"].map((name) => ({ name })) });
+        return reply({
+          tools: ["list_services", "get_policies", "get_availability", "book", "get_booking", "cancel", "list_my_bookings"].map((name) => ({ name })),
+        });
       }
       const { name, arguments: args, _meta } = msg.params;
       if (name === "get_availability") {
@@ -220,8 +187,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
       }
       if (name === "book") {
         if (held(args.start) && !doubleBook) return reply(toolError("slot_taken"));
-        const name = pap?.name ?? _meta?.["io.modelcontextprotocol/clientInfo"]?.name ?? "unknown agent";
-        const b = newBooking(args.start, args.service_id, name, pap?.clientId ?? null);
+        const b = newBooking(args.start, args.service_id, _meta?.["io.modelcontextprotocol/clientInfo"]?.name ?? "unknown agent");
         return reply(toolResult({ booking: view(b) }));
       }
       if (name === "get_booking") {
@@ -243,17 +209,6 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
   return { fetch, state };
 }
 
-/** The agent a Poppy-Session JWT names: { clientId, name } from its iss (a data: URL of client metadata), or null. */
-function papAgent(jwt) {
-  try {
-    const payload = JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString("utf8"));
-    const metadata = JSON.parse(Buffer.from(payload.iss.split(",")[1], "base64").toString("utf8"));
-    return typeof metadata.client_name === "string" ? { clientId: payload.iss, name: metadata.client_name } : null;
-  } catch {
-    return null;
-  }
-}
-
 /** Run the script against a fake deployment, collecting what it prints. */
 async function smoke(deployment, options = {}) {
   const lines = [];
@@ -263,13 +218,15 @@ async function smoke(deployment, options = {}) {
     now: () => Date.parse("2026-11-08T12:00:00Z"),
     random: () => 0,
     print: (line) => lines.push(line),
+    // The feature checks in scripts/smoke-checks/ have their own tests (e.g. smoke-checks/texting.test.mjs).
+    checks: [],
     ...options,
   });
   return { ...outcome, output: lines.join("\n") };
 }
 
 const results = (rows) => rows.map((r) => r.result);
-/** The booking loop's cleanup row (the first "—"; the agent checks' own cleanup comes after it). */
+/** The cleanup row: every booking the run made is declined or cancelled. */
 const cleanupRow = (run) => run.rows.find((r) => r.item === "—");
 
 describe("pnpm smoke", () => {
@@ -279,32 +236,14 @@ describe("pnpm smoke", () => {
 
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(results(run.rows)).toEqual(Array(40).fill("PASS"));
-    expect(run.line).toBe("PASS: 40 passed.");
-    expect(run.output).toMatch(/\nPASS: 40 passed\.$/);
+    expect(results(run.rows)).toEqual(Array(33).fill("PASS"));
+    expect(run.line).toBe("PASS: 33 passed.");
+    expect(run.output).toMatch(/\nPASS: 33 passed\.$/);
     // Over MCP: one booking declined, a Beard trim approved and then cancelled by the cleanup, and the deposit
     // check's Haircut approved and cancelled. Over the web: the JSON booking declined, and the form post's
-    // booking declined by the cleanup. All by front-desk-smoke. Then the agent checks: a Beard trim by the
-    // PAP agent (confirmed) and one over plain MCP (unconfirmed), both declined.
-    expect(deployment.state.bookings.map((b) => [b.status, b.agent, b.clientId !== null])).toEqual([
-      ...Array(5).fill(["cancelled", SMOKE_AGENT, false]),
-      ["cancelled", SMOKE_PAP_AGENT, true],
-      ["cancelled", SMOKE_AGENT, false],
-    ]);
-    expect(deployment.state.bookings.map((b) => b.service)).toEqual(["haircut", "beard-trim", "haircut", "haircut", "haircut", "beard-trim", "beard-trim"]);
-    expect(run.rows.filter((r) => r.item.startsWith("A")).map((r) => [r.item, r.evidence])).toEqual([
-      ["A1", `PAP 0.4, "Hart's Barbers (preview)" on ${new URL(BASE).host}, mcp ${BASE}/api/mcp; listed in front-desk.json`],
-      ["A2", '400, error invalid_session ("Poppy-Session must be a compact JWT.")'],
-      ["A3", `Tue 10 Nov, 10:00: awaiting_approval, agent "${SMOKE_PAP_AGENT}" confirmed`],
-      ["A4", `agent "${SMOKE_PAP_AGENT}", confirmed true`],
-      ["A5", `"${SMOKE_PAP_AGENT}": 1 booking, last seen 2026-11-08T07:00:00-05:00; 1 agents, 5 unconfirmed bookings`],
-      ["A6", `agent "${SMOKE_AGENT}", confirmed false`],
-    ]);
-    expect(run.rows.at(-1)).toMatchObject({ title: "Cleanup: the agent checks' bookings are declined", evidence: "2 made, 2 declined" });
-    // The PAP agent's MCP requests carry its session and the protocol version.
-    const signed = deployment.state.mcp.filter((c) => c.headers.has("poppy-session"));
-    expect(signed.map((c) => c.params?.name ?? c.method)).toEqual(["tools/list", "get_availability", "book"]);
-    expect(signed.slice(1).every((c) => c.headers.get("poppy-version") === "0.4")).toBe(true);
+    // booking declined by the cleanup. All by front-desk-smoke.
+    expect(deployment.state.bookings.map((b) => [b.status, b.agent])).toEqual(Array(5).fill(["cancelled", SMOKE_AGENT]));
+    expect(deployment.state.bookings.map((b) => b.service)).toEqual(["haircut", "beard-trim", "haircut", "haircut", "haircut"]);
     // Deposits off: the approved Haircut was confirmed without collecting its deposit.
     expect(run.rows.find((r) => r.title.startsWith("Approve a Haircut"))).toMatchObject({
       item: "19",
@@ -345,8 +284,8 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("FAIL");
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.item === "2")).toMatchObject({ result: "FAIL", evidence: "HTTP 500 boom" });
-    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(39);
-    expect(run.line).toBe("FAIL: 1 failed, 39 passed, 0 skipped.");
+    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(32);
+    expect(run.line).toBe("FAIL: 1 failed, 32 passed, 0 skipped.");
   });
 
   it("BLOCKED: not_ready prints the problems, runs nothing else and exits 2", async () => {
@@ -410,13 +349,10 @@ describe("pnpm smoke", () => {
     expect(run.exitCode).toBe(EXIT.pass);
     expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual([
       "5", "5", "11", "11", "12", "14", "14", "14", "17", "17", "19", "19", "19", "19", "W4", "W4", "W4", "W5", "23", "23",
-      "A3", "A4", "A5", "A6",
     ]);
     // The read-only web checks still run; no cleanup row: it made no bookings.
     expect(run.rows.filter((r) => r.item.startsWith("W") && r.result === "PASS").map((r) => r.item)).toEqual(["W1", "W2", "W3"]);
-    // The read-only agent checks still run.
-    expect(run.rows.filter((r) => r.item.startsWith("A") && r.result === "PASS").map((r) => r.item)).toEqual(["A1", "A2"]);
-    expect(run.line).toBe("PASS: 14 passed, 24 skipped (a skipped check is not a pass: verify those by hand).");
+    expect(run.line).toBe("PASS: 12 passed, 20 skipped (a skipped check is not a pass: verify those by hand).");
     expect(deployment.state.requests.some((r) => r.path === "/api/jobs/nightly")).toBe(false);
     expect(deployment.state.mcp.some((c) => c.params?.name === "book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.path === "/api/shops/harts/book")).toBe(false);
@@ -463,8 +399,6 @@ describe("pnpm smoke", () => {
       `Owner alerts with Bearer ${PREVIEW_OWNER_TOKEN} → 200`,
       "The owner's alerts list has booking_cancelled for it",
       "The owner's alerts list has booking_confirmed for it",
-      "The owner's bookings list shows that booking's agent confirmed",
-      "The owner's agents list has the agent, with its booking and last seen",
     ]);
     expect(run.rows.find((r) => r.item === "17" && r.title.startsWith("Book a Beard trim"))).toMatchObject({ result: "PASS" });
   });
@@ -479,8 +413,7 @@ describe("pnpm smoke", () => {
     // The web form post at the held start books it again too, and fails.
     expect(run.rows.find((r) => r.title.includes("?error=slot_taken"))).toMatchObject({ result: "FAIL" });
     expect(cleanupRow(run)).toMatchObject({ result: "PASS", evidence: "6 made, 6 declined or cancelled: none left behind" });
-    // Plus the agent checks' two, declined by their own cleanup.
-    expect(deployment.state.bookings.map((b) => b.status)).toEqual(Array(8).fill("cancelled"));
+    expect(deployment.state.bookings.map((b) => b.status)).toEqual(Array(6).fill("cancelled"));
   });
 
   it("web booking: a form post that doesn't redirect to /approve/ fails W5, and the JSON booking is still declined", async () => {
@@ -544,33 +477,6 @@ describe("pnpm smoke", () => {
     expect(run.rows.find((r) => r.item === "19")).toMatchObject({ result: "FAIL", evidence: "Tue 10 Nov, 10:30: confirmed, deposit not_collected" });
     // Still cleaned up.
     expect(cleanupRow(run)).toMatchObject({ result: "PASS" });
-    expect(deployment.state.bookings.every((b) => b.status === "cancelled")).toBe(true);
-  });
-
-  it("agent identity: FAIL when a PAP agent's booking isn't confirmed, and its bookings are still declined", async () => {
-    // A server that ignores the Poppy-Session header: every booking is unconfirmed.
-    const deployment = fakeDeployment({
-      route: (url, init) => {
-        if (url.pathname !== "/api/mcp") return undefined;
-        const headers = new Headers(init.headers);
-        if (!headers.has("poppy-session")) return undefined;
-        headers.delete("poppy-session");
-        return deployment.fetch(url.href, { ...init, headers });
-      },
-    });
-    const run = await smoke(deployment);
-    expect(run.exitCode).toBe(EXIT.fail);
-    expect(run.rows.filter((r) => r.item.startsWith("A")).map((r) => [r.item, r.result])).toEqual([
-      ["A1", "PASS"],
-      ["A2", "FAIL"],
-      ["A3", "FAIL"],
-      ["A4", "FAIL"],
-      ["A5", "FAIL"],
-      ["A6", "PASS"],
-    ]);
-    expect(run.rows.find((r) => r.item === "A3").evidence).toBe(`Tue 10 Nov, 10:00: awaiting_approval, agent "${SMOKE_PAP_AGENT}" unconfirmed`);
-    expect(run.rows.find((r) => r.item === "A4").evidence).toBe("not run: the PAP booking check failed");
-    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "2 made, 2 declined" });
     expect(deployment.state.bookings.every((b) => b.status === "cancelled")).toBe(true);
   });
 

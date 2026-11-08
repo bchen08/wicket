@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { missingFromSchema, REQUIRED_SCHEMA, REQUIRED_TABLES } from "./schema";
 
-// REQUIRED_SCHEMA must name every table and column postgres-store.ts reads or writes, and nothing else:
+// REQUIRED_SCHEMA must name every table and column the Postgres stores (postgres-store.ts and
+// lib/server/oauth/postgres-store.ts) read or write, and nothing else:
 // GET /api/status reports the schema "current" only when all of them exist, so a column the list lacks
 // would let an outdated database pass, and an extra one would block a good one.
 //
@@ -20,7 +21,7 @@ const SQL_WORDS = new Set([
   "update", "upper", "using", "uuid", "values", "when", "where", "with", "then",
 ]);
 
-const STORE_FILE = join(__dirname, "postgres-store.ts");
+const STORE_FILES = [join(__dirname, "postgres-store.ts"), join(__dirname, "..", "oauth", "postgres-store.ts")];
 const SQL_TAG = /\b(?:db|sql|tx|sp)\s*(?:<[^`]*>)?\s*$/;
 
 /** The text of every SQL template in `source`, with its interpolations and the quoted names inside `sql(rows, "a", "b")`. */
@@ -104,8 +105,8 @@ const listed = new Set<string>([
   ...REQUIRED_TABLES.flatMap((table) => [...REQUIRED_SCHEMA[table]]),
 ]);
 
-describe("REQUIRED_SCHEMA matches what postgres-store.ts queries", () => {
-  const templates = sqlTemplates(readFileSync(STORE_FILE, "utf8"));
+describe("REQUIRED_SCHEMA matches what the Postgres stores query", () => {
+  const templates = STORE_FILES.flatMap((file) => sqlTemplates(readFileSync(file, "utf8")));
   const { names, tokens } = sqlWords(templates);
 
   it("finds the store's SQL", () => {

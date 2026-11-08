@@ -55,6 +55,12 @@ export type WebBookRequest = {
   bookedBy?: string;
   /** The person's limits, as in MCP book. JSON only; optional. The server refuses a booking outside them. */
   mandate?: Mandate;
+  /**
+   * The person's mobile number, E.164, e.g. "+14015550123" (spaces, dashes, dots and parentheses are ignored).
+   * Optional, as in MCP book (customer_phone): stored on the booking, and where texting is on, the approval
+   * link is texted to it (WebBookResponse.texted).
+   */
+  phone?: string;
 };
 
 /**
@@ -69,7 +75,12 @@ export type WebBookResponse = {
    * expired. It's `<origin>/api/approvals/<token>`, the approval link's own API.
    */
   statusUrl: string;
-  /** What the agent should do now, in plain words: send the link, then check statusUrl. */
+  /**
+   * true when Front Desk texted the approval link to `phone`: don't send it again. false when no phone was
+   * given, texting is off, or the text didn't go through: send booking.approval.url yourself.
+   */
+  texted: boolean;
+  /** What the agent should do now, in plain words: send the link (unless it was texted), then check statusUrl. */
   next_action: string;
 };
 
@@ -93,7 +104,7 @@ export type BookingPageResponse = {
   policiesText: string;
   /** Today, YYYY-MM-DD in the shop's time zone: the first day in every service's `days`. */
   from: string;
-  /** Where the page's form posts: `<origin>/api/shops/<shop>/book` (fields: service, start, name, bookedBy). */
+  /** Where the page's form posts: `<origin>/api/shops/<shop>/book` (fields: service, start, name, bookedBy, phone). */
   bookUrl: string;
 };
 

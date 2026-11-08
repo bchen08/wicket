@@ -43,6 +43,10 @@ export type NewBooking = {
   approvalToken: string;
   /** The person's limits as validated by book, or null. */
   mandate: Mandate | null;
+  /** The signed-in customer the booking belongs to (connector sign-in), or absent/null for an anonymous agent. */
+  customerId?: string | null;
+  /** The person's phone number (E.164): customer_phone from book (filled from the signed-in customer if the agent sent none), or null/absent. */
+  customerPhone?: string | null;
 };
 
 // ---- Ring 1b: consent records ----
@@ -128,7 +132,7 @@ export type NewAlert = {
   bookingId: string;
   kind: AlertKind;
   channel: AlertChannel;
-  /** The email address it went to; null for a log line. */
+  /** The email address or mobile number (E.164) it went to; null for a log line. */
   recipient: string | null;
   status: AlertStatus;
   /** Why it failed; null unless status is failed. */
@@ -162,6 +166,19 @@ export type AgentActivity = {
   unconfirmedBookings: number;
 };
 
+// ---- Texting: the owner's sign-in codes ----
+
+/** A sign-in code texted to the owner (the owner_codes table). Stored as it is (MVP: no hashing). */
+export type NewOwnerCode = {
+  shopSlug: string;
+  /** Six digits, e.g. "042917". */
+  code: string;
+  /** The ownerMobile it was texted to (E.164). */
+  sentTo: string;
+  /** When it stops working: sent + 10 minutes. */
+  expiresAt: Date;
+};
+
 /** The event a transition writes. The store stamps `at` (Postgres now(), the memory store's clock). */
 export type NewBookingEvent = {
   actor: BookingActor;
@@ -184,6 +201,11 @@ export interface BookingStore {
    * `statuses` when it's given (the nightly tidy-up asks for awaiting_deposit, then confirmed).
    */
   listBookings(shopSlug: string, range: TimeRange, statuses?: readonly BookingStatus[]): Promise<Booking[]>;
+  /**
+   * One signed-in customer's bookings at the shop (bookings.customer_id), of any status, that end after
+   * `since`, sorted by start, at most `limit`. Doesn't expire anything.
+   */
+  listCustomerBookings(shopSlug: string, customerId: string, since: Date, limit: number): Promise<Booking[]>;
   /** One booking by id, or null. Any string is accepted: a malformed id is simply not found. Doesn't expire anything. */
   getBooking(id: string): Promise<Booking | null>;
   /**
@@ -268,6 +290,17 @@ export interface BookingStore {
   recordAgent(agent: SeenAgent): Promise<void>;
   /** Every recorded agent with its bookings at `shopSlug`, and the shop's bookings by unconfirmed agents. */
   listAgents(shopSlug: string): Promise<AgentActivity>;
+
+  // ---- Texting: the owner's sign-in codes ----
+
+  /** Store a code that was just texted to the owner. */
+  saveOwnerCode(code: NewOwnerCode): Promise<void>;
+  /**
+   * Redeem a code, in one statement: if the shop has an unused code equal to `code` with expires_at > now, mark
+   * it used (used_at = now) and return true; otherwise false. Of two requests with the same code, only one
+   * gets true, so a code works once.
+   */
+  redeemOwnerCode(shopSlug: string, code: string, now: Date): Promise<boolean>;
 }
 
 /** The staff member is already booked for part of that time. Another agent got there first. */

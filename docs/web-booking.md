@@ -19,7 +19,7 @@ Conventions are the MCP API's ([Conventions](frontdesk-api.md#conventions)): mon
 ```
 
 **Errors in the web API's words.** The service layer writes errors for MCP callers. The web routes keep the code, the status and the details, but:
-- `details.field` uses the web field names: `service_id` → `service`, `customer_name` → `name`;
+- `details.field` uses the web field names: `service_id` → `service`, `customer_name` → `name`, `customer_phone` → `phone`;
 - the message and `next_action` name the web routes instead of the tools: `get_availability` → `GET /api/shops/harts/availability`, `list_services` → `GET /api/shops/harts/services`, and the field names as above.
 
 For example, `outside_hours`'s next_action is "Call GET /api/shops/harts/availability and choose one of the returned starts."
@@ -80,6 +80,7 @@ It takes JSON, or a plain HTML form post (`application/x-www-form-urlencoded` or
 | `name` | Required. The name the booking is under, 1–80 characters after trimming, no NUL character. |
 | `bookedBy` | Optional. The agent's name; the person sees it on the approval page and the shop in its console. Without it (or blank), the booking's agent is `web (<the first 60 characters of the User-Agent>)`, or `web` with no User-Agent. Control characters are removed and it's cut to 80 characters, like an MCP client's name. It's never checked: web bookings always show `agent.confirmed: false` (only MCP requests with a verified PAP session are confirmed; see [agent-identity.md](agent-identity.md)). |
 | `mandate` | Optional, JSON only. The person's limits, as in MCP `book` ([Mandate](frontdesk-api.md#mandate)). |
+| `phone` | Optional. The person's mobile, E.164 (spaces, dashes, dots and parentheses are ignored), as MCP `customer_phone`. Stored on the booking; where texting is on, the approval link is texted to it and the answer has `"texted": true` ([texting.md](texting.md#1-the-approval-link-by-text)). Anything that isn't E.164 is `invalid_request`, `details.field: "phone"`. |
 
 ### JSON → 201 `WebBookResponse`
 
@@ -110,9 +111,12 @@ curl -s -X POST http://localhost:3000/api/shops/harts/book -H "Content-Type: app
     }
   },
   "statusUrl": "http://localhost:3000/api/approvals/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM",
+  "texted": false,
   "next_action": "Held Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. It is not confirmed yet. Send Maya this link right away to approve or decline: http://localhost:3000/approve/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM. The hold lapses at Tue 10 Nov, 11:10 am EST. Then GET http://localhost:3000/api/approvals/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM to see what they did: status pending, awaiting_deposit (approved, deposit not paid yet: send the same link again), approved, declined or expired. Don't book this time again while the hold is on."
 }
 ```
+
+`texted` is `true` when a `phone` was given and Front Desk texted it the link (texting on). `next_action` then says "Front Desk texted Maya the link to approve or decline at +1…, so don't send it again", and still includes the link in case the person asks.
 
 - `booking` is the same `Booking` MCP `book` returns. `approval.url` is on the origin of this request, so it works on previews and in production.
 - `statusUrl` is the approval link's own API, [`GET /api/approvals/<token>`](frontdesk-api.md#get-apiapprovalstoken--approvalview): its `status` is `pending`, `awaiting_deposit` (approved, but the deposit isn't paid yet; see [deposits.md](deposits.md)), `approved`, `declined` or `expired`. It's how a web agent checks the answer (there's no web `get_booking`).

@@ -89,11 +89,12 @@ if (!url) {
       await closePostgresClients();
     });
 
-    it("0003 left no customers or otp_challenges tables, and approvals stores the token itself", async () => {
-      const [row] = await sql<{ customers: string | null; otp: string | null }[]>`
-        select to_regclass('public.customers')::text as customers, to_regclass('public.otp_challenges')::text as otp
+    it("0003 left no otp_challenges table, and approvals stores the token itself", async () => {
+      // (0003 left no customers table either; 0008_signin.sql adds one for connector sign-in.)
+      const [row] = await sql<{ otp: string | null }[]>`
+        select to_regclass('public.otp_challenges')::text as otp
       `;
-      expect(row).toEqual({ customers: null, otp: null });
+      expect(row).toEqual({ otp: null });
       const columns = await sql<{ column_name: string }[]>`
         select column_name from information_schema.columns
         where table_schema = 'public' and table_name = 'approvals' order by ordinal_position
@@ -150,6 +151,45 @@ if (!url) {
       // Deleting the booking deletes its alerts.
       await sql`delete from bookings where id = ${booking.id}::uuid`;
       expect(await store.listAlerts(shop, 50)).toEqual([]);
+    });
+
+    it("texting (0007): createBooking stores customerPhone; a text alert is recorded; owner_mobile must be E.164", async () => {
+      const booking = await store.createBooking({ ...ours(at(10), at(10, 30)), customerPhone: "+14015550123" });
+      expect(booking.customer.phone).toBe("+14015550123");
+      expect((await store.getBooking(booking.id))?.customer.phone).toBe("+14015550123");
+      const without = await store.createBooking(ours(at(11), at(11, 30)));
+      expect(without.customer).not.toHaveProperty("phone");
+      const text = await store.recordAlert({
+        shopSlug: shop,
+        bookingId: booking.id,
+        kind: "booking_confirmed",
+        channel: "text",
+        recipient: "+12125550199",
+        status: "sent",
+        error: null,
+      });
+      expect(text).toMatchObject({ channel: "text", recipient: "+12125550199", status: "sent" });
+      // (Refused before anything is stored: the shop still has no policies row for the round-trip test below.)
+      await expect(sql`insert into policies (shop_slug, owner_mobile) values (${shop}, '555-0199')`).rejects.toMatchObject({ code: "23514" });
+      await sql`delete from bookings where id = any(${[booking.id, without.id]}::uuid[])`;
+    });
+
+    it("owner codes (0007): saved, redeemed once, refused when expired, wrong or another shop's", async () => {
+      const now = new Date();
+      const later = new Date(now.getTime() + 10 * 60_000);
+      await store.saveOwnerCode({ shopSlug: shop, code: "042917", sentTo: "+12125550199", expiresAt: later });
+      expect(await store.redeemOwnerCode("harts", "042917", now)).toBe(false); // another shop's
+      expect(await store.redeemOwnerCode(shop, "042918", now)).toBe(false); // wrong
+      expect(await store.redeemOwnerCode(shop, "042917", later)).toBe(false); // expired at expires_at
+      // Two requests with the same code at once: exactly one signs in.
+      const raced = await Promise.all([store.redeemOwnerCode(shop, "042917", now), store.redeemOwnerCode(shop, "042917", now)]);
+      expect(raced.filter(Boolean)).toHaveLength(1);
+      expect(await store.redeemOwnerCode(shop, "042917", now)).toBe(false); // used
+      const [row] = await sql<{ used_at: Date | null; sent_to: string }[]>`select used_at, sent_to from owner_codes where shop_slug = ${shop}`;
+      expect(row.used_at).not.toBeNull();
+      expect(row.sent_to).toBe("+12125550199");
+      await expect(store.saveOwnerCode({ shopSlug: shop, code: "12345", sentTo: "+1", expiresAt: later })).rejects.toMatchObject({ code: "23514" });
+      // Deleting the shop deletes its codes (afterAll).
     });
 
     it("reads the seeded shop, services, split hours and policies", async () => {
@@ -572,6 +612,7 @@ if (!url) {
         lateCancelRule: "",
         noShowRule: "",
         ownerEmail: null,
+        ownerMobile: null,
       };
       expect(await store.savePolicies(shop, first)).toEqual(first);
       const second: Policies = {
@@ -580,6 +621,7 @@ if (!url) {
         phone: "+1 555-0100",
         noShowRule: "We keep the deposit.",
         ownerEmail: "dana@example.com",
+        ownerMobile: "+14015550123",
       };
       expect(await store.savePolicies(shop, second)).toEqual(second);
       expect(await store.getPolicies(shop)).toEqual(second);

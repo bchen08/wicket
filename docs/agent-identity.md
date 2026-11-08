@@ -17,7 +17,7 @@ Spec: PAP draft 0.4 at commit [`a2ca25ab43eccc045bc7f2b86d3b579088da9af1`](https
 
 ## How an agent is confirmed
 
-1. **Discovery.** The agent reads `/.well-known/poppy.json`. It names the shop, Front Desk's host (`organization.domain`) and the MCP endpoint. Front Desk has no OAuth issuer, so its Company identifier is `https://<organization.domain>` (spec 3.2). Each preview domain and the production domain is a separate Company.
+1. **Discovery.** The agent reads `/.well-known/poppy.json`. It names the shop, Front Desk's host (`organization.domain`) and the MCP endpoint. Front Desk's Company identifier is `https://<organization.domain>` (spec 3.2), which on an HTTPS deployment is also the issuer connector sign-in uses ([connector-signin.md](connector-signin.md)). Each preview domain and the production domain is a separate Company.
 2. **Every MCP request** carries:
    - `Poppy-Session`: a Session JWT (`typ: poppy-session+jwt`, ES256). The agent signs it with a short-lived **delegated key**. Its header holds the delegation (`poppy_dlg`), which a key at the agent's `jwks_uri` signed.
    - `Poppy-Version: 0.4`.
@@ -50,7 +50,7 @@ Signature and expiry checks identify the agent; nothing else is built. Each of t
 - `htm` and `htu` (the request's method and URL) aren't compared with the request.
 - There's no replay table: a reused `jti` is accepted.
 - Session continuity isn't kept: a `sid` isn't tied to its first `sub` or `agent_id`.
-- `ath` isn't checked. Front Desk issues no access tokens.
+- `ath` isn't checked. A request can carry a connector access token and a `Poppy-Session`; each is verified on its own, and nothing ties one to the other.
 - The URLs fetched get no address checks (loopback, private, link-local) and no size limit, only a 5-second timeout. The unknown-`kid` refetch isn't throttled, and `jwks_uri` isn't required to share the `client_id`'s domain.
 - Any agent whose session verifies is accepted. There's no allowlist.
 
@@ -118,7 +118,7 @@ Public. It's built from the request's origin and needs no setting. If the shop c
 }
 ```
 
-There's no `auth` (no sign-in), no `agent` (no Company Agent) and no `web` section. `/.well-known/front-desk.json` links to it as `poppy`. Locally, `domain` includes the port (`localhost:3000`), and agents use `https://localhost:3000` as `aud` there too.
+There's no `auth` (connector sign-in isn't advertised to PAP agents), no `agent` (no Company Agent) and no `web` section. `/.well-known/front-desk.json` links to it as `poppy`. Locally, `domain` includes the port (`localhost:3000`), and agents use `https://localhost:3000` as `aud` there too.
 
 ## The demo PAP agent
 
@@ -151,4 +151,4 @@ Booking id: …
 | [`lib/server/pap/session.test.ts`](../lib/server/pap/session.test.ts) | `verifySession` against sessions the demo agent signs. Valid sessions are accepted. These are refused: an expired delegation, a stale `iat`, the wrong `aud`, a missing or old `Poppy-Version`, no delegation, a forged delegation or Session JWT, and a wrong `kid`. Also: the 10-minute key cache, the refetch on an unknown `kid`, the HTTPS `client_id` rule, `poppy.json` and RFC 7638 thumbprints. |
 | [`lib/server/identity/agent.test.ts`](../lib/server/identity/agent.test.ts) | End to end through the MCP handler, wired as the route wires it. A PAP agent's booking is confirmed and recorded. Last seen updates. An expired or wrong-audience session gets `invalid_session` and books nothing. A request without the header is unconfirmed, as before. The agents list counts per agent and unconfirmed. The owner 401 and 404. `poppy.json`. |
 | [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | On Postgres: `recordAgent` (first and last seen, renames), `agent_client_id` on bookings and in the `booked` event, `listAgents` counts and order. |
-| [`scripts/smoke.test.mjs`](../scripts/smoke.test.mjs) | Smoke's agent checks (A1–A6) pass against a fake deployment, fail when a PAP booking comes back unconfirmed, are skipped where writes aren't allowed, and decline what they book. |
+| [`scripts/smoke-checks/agents.test.mjs`](../scripts/smoke-checks/agents.test.mjs) | Smoke's agent checks (A1–A6) pass against a fake deployment, fail when a PAP booking comes back unconfirmed, are skipped where writes aren't allowed, and decline what they book. |

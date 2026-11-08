@@ -1,6 +1,5 @@
 -- Front Desk: agent identity (PAP 0.4). Apply once per database, after the migrations before it.
 -- Seeds nothing. See docs/agent-identity.md and docs/database.md.
--- TODO: renumber before review, after the migrations ahead of it in other PRs land.
 --
 -- Agents that speak PAP 0.4 send a signed Poppy-Session header with their MCP requests. When it verifies,
 -- Front Desk records the agent here and stores its client_id on the bookings it makes, so the console can

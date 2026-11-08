@@ -2,7 +2,7 @@ import type { Policies } from "../../types/frontdesk";
 
 /**
  * A shop's policies when it has no policies row. Keep in step with the column defaults in
- * supabase/migrations/0002_rules.sql (and owner_email in 0004_alerts.sql).
+ * supabase/migrations/0002_rules.sql (owner_email in 0004_alerts.sql, owner_mobile in 0007_texting.sql).
  */
 export const DEFAULT_POLICIES: Readonly<Policies> = Object.freeze({
   leadTimeMin: 120,
@@ -15,6 +15,7 @@ export const DEFAULT_POLICIES: Readonly<Policies> = Object.freeze({
   lateCancelRule: "",
   noShowRule: "",
   ownerEmail: null,
+  ownerMobile: null,
 });
 
 /**

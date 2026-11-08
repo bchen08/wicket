@@ -6,8 +6,11 @@ import { agentsGet } from "../frontdesk/http";
 import { createFrontDeskMcpHandler } from "../frontdesk/mcp";
 import { withRequestOrigin, type FrontDeskDeps } from "../frontdesk/service";
 import { memoryDeps, NOW } from "../frontdesk/test-support";
+import { createMemorySigninStore } from "../oauth/memory-store";
+import type { SigninStore } from "../oauth/store";
 import { createAgentKeyCache, type AgentKeyCache } from "../pap/client";
 import { identifyAgent, listShopAgents, poppyGet } from "./agent";
+import { withCustomerSignin } from "./customer";
 
 // Agent identity end to end: the demo PAP agent (scripts/demo-pap-agent.mjs) discovers Front Desk, opens a
 // session and books through the real MCP handler, wired the way app/api/mcp/route.ts wires it. The store's
@@ -19,6 +22,7 @@ const TOKEN = "owner-token";
 let current: number;
 let deps: FrontDeskDeps;
 let keys: AgentKeyCache;
+let signin: SigninStore;
 const clock: Clock = { now: () => new Date(current) };
 const now = () => current;
 
@@ -26,14 +30,19 @@ beforeEach(() => {
   current = NOW.getTime();
   deps = memoryDeps({ clock });
   keys = createAgentKeyCache({ now });
+  signin = createMemorySigninStore();
 });
 
-/** app/api/mcp/route.ts, without Next's connection(). */
-async function mcpRoute(request: Request): Promise<Response> {
-  const agent = await identifyAgent(request, () => deps, { keys, now });
-  if (agent instanceof Response) return agent;
-  return createFrontDeskMcpHandler(() => withRequestOrigin(deps, request), agent)(request);
-}
+/** app/api/mcp/route.ts, without Next's connection(): the sign-in gate around identifyAgent and the MCP handler. */
+const mcpRoute = (request: Request): Promise<Response> =>
+  withCustomerSignin(
+    async (req) => {
+      const agent = await identifyAgent(req, () => deps, { keys, now });
+      if (agent instanceof Response) return agent;
+      return createFrontDeskMcpHandler(() => withRequestOrigin(deps, req), agent)(req);
+    },
+    () => ({ store: signin, clock }),
+  )(request);
 
 /** A fetch that serves Front Desk's routes on ORIGIN from the in-memory deps. */
 const frontDesk: typeof fetch = async (input, init) => {
@@ -182,6 +191,69 @@ describe("a PAP agent books", () => {
       console.error = original;
     }
     expect(errors.length).toBeGreaterThan(0);
+  });
+});
+
+describe("a PAP agent signed in as a person (connector sign-in)", () => {
+  /** A fetch to Front Desk that also carries an access token for a new customer. */
+  async function signedIn(): Promise<typeof fetch> {
+    const maya = await signin.upsertCustomer("harts", "+14015550123", "Maya Lopez");
+    const token = "fda_test_access";
+    await signin.createTokens([
+      {
+        token,
+        kind: "access",
+        shopSlug: "harts",
+        clientId: "https://client.example/oauth/client.json",
+        customerId: maya.id,
+        scope: "bookings",
+        resource: `${ORIGIN}/api/mcp`,
+        expiresAt: new Date(current + 3600_000),
+      },
+    ]);
+    return (input, init) => frontDesk(input, { ...init, headers: { ...init?.headers, authorization: `Bearer ${token}` } });
+  }
+  const start = "2026-11-14T10:00:00-05:00";
+
+  it("books as that person, with the agent confirmed, and the booking is in list_my_bookings", async () => {
+    const identity = await createIdentity({ name: "Poppy Test Agent" });
+    const session = await openSession({ identity, audience: ORIGIN, now });
+    const client = papMcpClient({ mcpUrl: `${ORIGIN}/api/mcp`, session, name: "x", fetch: await signedIn() });
+
+    const booked = await client.callTool("book", { service_id: "beard-trim", start });
+    expect(booked.value.booking.agent).toEqual({ name: "Poppy Test Agent", confirmed: true, clientId: identity.clientId });
+    expect(booked.value.booking.customer).toMatchObject({ displayName: "Maya Lopez", phone: "+14015550123" });
+    expect(booked.value.texted).toBe(false);
+
+    const mine = await client.callTool("list_my_bookings", {});
+    expect(mine.value.bookings.map((b: Booking) => [b.id, b.agent.confirmed])).toEqual([[booked.value.booking.id, true]]);
+  });
+
+  it("a valid token doesn't excuse an invalid session: 400 invalid_session, nothing booked", async () => {
+    const res = await (await signedIn())(`${ORIGIN}/api/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "poppy-session": "nonsense", "poppy-version": "0.4" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_session" });
+  });
+
+  it("an unknown token is refused by the sign-in gate, whatever the session says", async () => {
+    const identity = await createIdentity();
+    const session = await openSession({ identity, audience: ORIGIN, now });
+    const res = await frontDesk(`${ORIGIN}/api/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: "Bearer fda_unknown",
+        ...(await session.headers("POST", `${ORIGIN}/api/mcp`)),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    expect(res.status).toBe(401);
+    expect((await listShopAgents(deps, "harts")).agents).toEqual([]);
   });
 });
 

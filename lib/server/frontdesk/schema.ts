@@ -1,4 +1,5 @@
-// Every table and column the Postgres store (postgres-store.ts) reads or writes, in the `public` schema.
+// Every table and column the Postgres stores (postgres-store.ts, and lib/server/oauth/postgres-store.ts for
+// connector sign-in) read or write, in the `public` schema.
 // GET /api/status compares this list with the database's information_schema: anything missing makes the
 // schema "outdated" and is named in `missing` (e.g. "approvals.token").
 //
@@ -35,6 +36,7 @@ export const REQUIRED_SCHEMA = {
     "deposit_state",
     "deposit_failure",
     "agent_client_id",
+    "customer_id",
   ],
   approvals: ["booking_id", "token", "decision", "decided_at"],
   events: ["id", "booking_id", "at", "actor", "type", "data"],
@@ -50,12 +52,30 @@ export const REQUIRED_SCHEMA = {
     "late_cancel_rule",
     "no_show_rule",
     "owner_email",
+    "owner_mobile",
     "updated_at",
   ],
   blocked_times: ["id", "staff_id", "during", "reason"],
   alerts: ["id", "shop_slug", "booking_id", "kind", "channel", "recipient", "status", "error", "created_at"],
   nightly_runs: ["id", "ran_at", "expired", "completed", "deposits_released", "failures"],
   agents: ["client_id", "name", "first_seen", "last_seen"],
+  owner_codes: ["id", "shop_slug", "code", "sent_to", "expires_at", "used_at"],
+  // Connector sign-in (0008_signin.sql), queried by lib/server/oauth/postgres-store.ts.
+  customers: ["id", "shop_slug", "name", "phone", "updated_at"],
+  oauth_clients: ["shop_slug", "client_id", "kind", "client_name", "redirect_uris", "fetched_at"],
+  oauth_codes: [
+    "code",
+    "shop_slug",
+    "client_id",
+    "customer_id",
+    "redirect_uri",
+    "code_challenge",
+    "scope",
+    "resource",
+    "expires_at",
+    "used_at",
+  ],
+  oauth_tokens: ["token", "kind", "shop_slug", "client_id", "customer_id", "scope", "resource", "expires_at"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type RequiredTable = keyof typeof REQUIRED_SCHEMA;

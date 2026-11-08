@@ -1,5 +1,5 @@
-// Agent identity (PAP 0.4) smoke checks: SMOKE.md items A1–A6. scripts/smoke.mjs runs them after the booking
-// loop and passes its helpers in, so this file imports nothing from it. See docs/agent-identity.md.
+// pnpm smoke feature checks: agent identity (SMOKE.md → Agent identity, docs/agent-identity.md). Loaded by
+// scripts/smoke.mjs.
 //
 // A1–A2 are read-only and run everywhere. A3–A6 book, so like the booking loop they run only where
 // /api/status says writesAllowed, and every booking they make is declined at the end, even after a failure.
@@ -22,23 +22,8 @@ export const AGENT_WRITE_CHECKS = [
   ["A6", "MCP without Poppy-Session books as before → agent unconfirmed"],
 ];
 
-/**
- * Run A1–A6 through smoke's `check`.
- * @param {object} ctx
- * @param {(item: string, title: string, run: () => Promise<unknown>) => Promise<unknown>} ctx.check
- * @param {{ request: Function, callTool: Function }} ctx.client smoke's HTTP and MCP client (sends the bypass header)
- * @param {string} ctx.baseUrl
- * @param {string | undefined} ctx.bypass
- * @param {typeof fetch} ctx.fetch
- * @param {any} ctx.status /api/status
- * @param {string | undefined} ctx.token the owner token, if smoke has one
- * @param {string} ctx.smokeAgent the name plain MCP requests report (front-desk-smoke)
- * @param {() => number} ctx.now
- * @param {() => number} ctx.random
- * @param {(ok: unknown, evidence: string) => void} ctx.expect fails the check with `evidence` unless ok
- * @param {(res: any) => string} ctx.http a response as evidence
- */
-export async function agentChecks(ctx) {
+/** @param {any} ctx the feature-check context from runSmoke */
+export default async function agents(ctx) {
   const { check, client, baseUrl, expect, http } = ctx;
   const host = new URL(baseUrl).host;
 
@@ -145,7 +130,7 @@ export async function agentChecks(ctx) {
       const booking = booked.value?.booking;
       remember(booking);
       const evidence = `agent "${booking?.agent?.name}", confirmed ${booking?.agent?.confirmed}`;
-      expect(booking?.agent?.confirmed === false && booking.agent.name === ctx.smokeAgent && !("clientId" in booking.agent), evidence);
+      expect(booking?.agent?.confirmed === false && booking.agent.name === ctx.SMOKE_AGENT && !("clientId" in booking.agent), evidence);
       return evidence;
     });
   } finally {

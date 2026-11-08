@@ -2,8 +2,9 @@ import type { PoppyDocument } from "../../types/agents";
 import { PAP_VERSION } from "./session";
 
 // PAP 0.4 discovery (section 3): the poppy.json Front Desk serves at /.well-known/poppy.json.
-// Front Desk has no OAuth issuer, so it offers signed-out Sessions only, and its Company identifier is
-// https://<host> (section 3.2): every preview and production domain is its own Company.
+// PAP agents get signed-out Sessions only: connector sign-in (docs/connector-signin.md) isn't advertised here.
+// The Company identifier is https://<host> (section 3.2), the same value as connector sign-in's issuer on an
+// HTTPS deployment: every preview and production domain is its own Company.
 
 /** The Company identifier for the host that served `requestUrl`: `https://<host>`, host lowercased, no trailing slash. */
 export function companyIdentifier(requestUrl: string): string {

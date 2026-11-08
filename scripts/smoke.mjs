@@ -21,9 +21,9 @@
 //    its four counts, and /api/status shows that run as lastNightlyRun.
 //    Its MCP requests and web bookings say they come from "front-desk-smoke", so the bookings show who
 //    made them.
-// 4. Agent identity (PAP 0.4, scripts/smoke-checks/agents.mjs): poppy.json and an invalid Poppy-Session
-//    everywhere; where writes are allowed, the demo PAP agent books a Beard trim (confirmed, with its name, in
-//    the owner's bookings and agents lists) and a plain MCP booking stays unconfirmed. Both are declined.
+// 4. Feature checks: every scripts/smoke-checks/*.mjs, in name order (loadSmokeChecks). Each one's default
+//    export is `async (ctx) => {}` and records its rows with ctx.check, like the checks here; it gets the same
+//    client, /api/status, owner token and helpers (see the ctx object in runSmoke), and cleans up after itself.
 //
 // --bypass <secret> (or VERCEL_AUTOMATION_BYPASS_SECRET) sends Vercel's x-vercel-protection-bypass header
 // on every request, for previews behind Vercel Authentication. --owner-token overrides the owner token,
@@ -31,8 +31,8 @@
 //
 // Exit codes: 0 every check passed (some may be SKIPPED), 1 a check failed, 2 BLOCKED, 64 bad arguments.
 
+import { readdir } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { agentChecks } from "./smoke-checks/agents.mjs";
 
 export const SMOKE_AGENT = "front-desk-smoke";
 export const SMOKE_CUSTOMER = "Smoke Test";
@@ -43,7 +43,7 @@ export const BYPASS_HEADER = "x-vercel-protection-bypass";
 export const EXIT = { pass: 0, fail: 1, blocked: 2, usage: 64 };
 
 const SHOP_SERVICES = ["haircut", "beard-trim", "haircut-beard"];
-const MCP_TOOLS = ["book", "cancel", "get_availability", "get_booking", "get_policies", "list_services"];
+const MCP_TOOLS = ["book", "cancel", "get_availability", "get_booking", "get_policies", "list_my_bookings", "list_services"];
 /** Tool calls use the 2026-07-28 protocol, whose per-request _meta envelope carries clientInfo (the agent's name). */
 const MCP_MODERN = "2026-07-28";
 const MCP_LEGACY = "2025-06-18";
@@ -314,9 +314,29 @@ function rfc3339(ms) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
+/** Where feature checks live: one .mjs file per feature (e.g. texting.mjs), each with a default export. */
+const SMOKE_CHECKS_DIR = new URL("./smoke-checks/", import.meta.url);
+
+/** Every feature check in scripts/smoke-checks/*.mjs, in file-name order: their default exports. */
+export async function loadSmokeChecks(dir = SMOKE_CHECKS_DIR) {
+  let names;
+  try {
+    names = (await readdir(dir)).filter((n) => n.endsWith(".mjs") && !n.endsWith(".test.mjs")).sort();
+  } catch {
+    return [];
+  }
+  const checks = [];
+  for (const name of names) {
+    const mod = await import(new URL(name, dir).href);
+    if (typeof mod.default === "function") checks.push(mod.default);
+  }
+  return checks;
+}
+
 /**
  * Run the smoke test. Prints as it goes through `print`, and returns the verdict, the exit code and the
- * rows. `fetch`, `now`, `random` and `print` are there for tests.
+ * rows. `fetch`, `now`, `random` and `print` are there for tests, and so is `checks` (the feature checks
+ * to run; default: loadSmokeChecks()).
  */
 export async function runSmoke({
   baseUrl,
@@ -327,6 +347,7 @@ export async function runSmoke({
   now = () => Date.now(),
   random = Math.random,
   print = (line) => console.log(line),
+  checks,
 }) {
   const client = createClient({ baseUrl, bypass, fetchImpl });
   const rows = [];
@@ -450,7 +471,7 @@ export async function runSmoke({
     return `server ${result.serverInfo.name} ${result.serverInfo.version}, protocol ${result.protocolVersion}`;
   });
 
-  await check("7", "MCP tools/list has the six tools", async () => {
+  await check("7", "MCP tools/list has the seven tools", async () => {
     const result = await client.mcp("tools/list", {});
     const names = Array.isArray(result?.tools) ? result.tools.map((t) => t.name).sort() : [];
     expect(JSON.stringify(names) === JSON.stringify(MCP_TOOLS), `tools: ${names.join(", ") || "none"}`);
@@ -529,6 +550,7 @@ export async function runSmoke({
     ["23", "GET /api/jobs/nightly → 200 with its four counts"],
     ["23", "/api/status shows that run as lastNightlyRun"],
   ];
+
   /** Bookings this run made: { id, token, done, approved } (done: declined or cancelled). */
   const made = [];
 
@@ -865,9 +887,16 @@ export async function runSmoke({
     });
   }
 
-  // ---- Agent identity (PAP 0.4) ----
+  // ---- Feature checks (scripts/smoke-checks/*.mjs) ----
 
-  await agentChecks({ check, client, baseUrl, bypass, fetch: fetchImpl, status, token, smokeAgent: SMOKE_AGENT, now, random, expect, http });
+  const featureCtx = { check, client, status, baseUrl, bypass, fetch: fetchImpl, token, now, random, expect, CheckFailed, http, snippet, rfc3339, SMOKE_AGENT, SMOKE_CUSTOMER };
+  for (const run of checks ?? (await loadSmokeChecks())) {
+    try {
+      await run(featureCtx);
+    } catch (err) {
+      rows.push({ item: "—", title: `Feature check ${run.name || "(unnamed)"}`, result: "FAIL", evidence: `error: ${errorText(err)}` });
+    }
+  }
 
   // ---- Report ----
 

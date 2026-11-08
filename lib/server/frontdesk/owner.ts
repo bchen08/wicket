@@ -17,6 +17,7 @@ import type {
   UpdateServiceRequest,
   WeeklyHours,
 } from "../../types/frontdesk";
+import { normalizePhone } from "../consent/crypto";
 import type { ManageAction } from "../engine/lifecycle";
 import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
@@ -181,6 +182,8 @@ function ruleText(field: string) {
 }
 
 const phoneMessage = `phone must be text of 1–${phoneMaxLength} characters, or null to remove it.`;
+const ownerMobileMessage =
+  'ownerMobile must be a mobile number in international format, starting with + and the country code (e.g. "+14015550123"), or null to remove it.';
 const ownerEmailMessage = `ownerEmail must be an email address (with an @) of at most ${ownerEmailMaxLength} characters, or null to remove it.`;
 
 const updatePoliciesSchema = z
@@ -208,6 +211,16 @@ const updatePoliciesSchema = z
       .max(ownerEmailMaxLength, { error: ownerEmailMessage })
       .refine((v) => v.includes("@"), { error: ownerEmailMessage })
       .refine(hasNoNul, noNul("ownerEmail"))
+      .nullable()
+      .optional(),
+    // Stored as E.164 (spaces, dashes, dots and parentheses removed): it's where texts go.
+    ownerMobile: z
+      .string({ error: ownerMobileMessage })
+      .transform((v, ctx) => {
+        const e164 = normalizePhone(v);
+        if (!e164) ctx.addIssue({ code: "custom", message: ownerMobileMessage });
+        return e164 ?? v;
+      })
       .nullable()
       .optional(),
   } satisfies Record<keyof Policies, z.ZodType>) // same keys as the contract, no more, no fewer

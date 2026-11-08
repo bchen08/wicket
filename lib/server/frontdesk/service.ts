@@ -24,7 +24,7 @@ import type {
   Slot,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
-import { newApprovalToken } from "../consent/crypto";
+import { newApprovalToken, normalizePhone } from "../consent/crypto";
 import {
   bookingBounds,
   checkStart,
@@ -40,6 +40,8 @@ import { decide, type LifecycleAction, type ManageAction } from "../engine/lifec
 import { depositCollected, moveDeposit, syncDeposit } from "../deposits/deposits";
 import type { DepositPayments } from "../deposits/payments";
 import type { Notifier, OwnerAlert } from "../notify/notifier";
+import type { TextSender } from "../notify/text-sender";
+import { approvalLinkText, ownerAlertText } from "../notify/texts";
 import { SlotTakenError, type BookingStore } from "./booking-store";
 import type { BusyInterval, ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
@@ -66,6 +68,11 @@ export type FrontDeskDeps = {
    * previews and in production with no setting. createFrontDeskDeps starts it at http://localhost:3000.
    */
   baseUrl: string;
+  /**
+   * Sends texts (lib/server/notify/text-sender.ts): Photon or Twilio, whichever the environment configures.
+   * null or absent: texting is off, and nothing is texted (approval links, owner alerts, sign-in codes).
+   */
+  texter?: TextSender | null;
 };
 
 /** `deps` with baseUrl set to the origin of `request`, so the bookings it returns link to where the caller is. */
@@ -115,7 +122,7 @@ export function bookingNotFound(bookingId: string): FrontDeskError {
   return new FrontDeskError(
     "booking_not_found",
     `No booking with id "${bookingId}" at this shop.`,
-    "Check the booking id. It is the booking.id (a UUID) that book returned.",
+    "Check the booking id. It is the booking.id (a UUID) that book returned, or that list_my_bookings lists for a signed-in person.",
     { booking_id: bookingId },
   );
 }
@@ -197,10 +204,11 @@ export async function listServices(
   return { shop, services };
 }
 
-/** The policies an agent sees: all but the owner's email, which only the owner routes show. */
+/** The policies an agent sees: all but the owner's email and mobile, which only the owner routes show. */
 export function agentPolicies(policies: Policies): AgentPolicies {
-  const { ownerEmail, ...rules } = policies;
+  const { ownerEmail, ownerMobile, ...rules } = policies;
   void ownerEmail;
+  void ownerMobile;
   return rules;
 }
 
@@ -461,13 +469,36 @@ export function parseMandate(raw: unknown): Mandate | null {
   return Object.keys(mandate).length > 0 ? mandate : null;
 }
 
+const CUSTOMER_PHONE_NEXT =
+  'Send customer_phone as the person\'s mobile number with its country code, e.g. "+14015550123", or leave it out.';
+
+/**
+ * Check a raw `customer_phone` (any JSON) and return it as E.164, or null when absent, null or "". Spaces,
+ * dashes, dots and parentheses are removed first; anything that still isn't E.164 is invalid_request.
+ */
+export function parseCustomerPhone(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const e164 = typeof raw === "string" ? normalizePhone(raw) : null;
+  if (!e164) {
+    throw invalidField(
+      "customer_phone",
+      "customer_phone must be a phone number in international format, starting with + and the country code.",
+      CUSTOMER_PHONE_NEXT,
+      raw,
+    );
+  }
+  return e164;
+}
+
 /**
  * Check raw `book` tool arguments (any JSON) and narrow them to BookInput, in the same style as
  * parseGetAvailabilityArgs: missing fields and wrong JSON types become invalid_request errors.
- * customer_name is returned trimmed; mandate is checked by parseMandate (omitted from the result when
- * there is none).
+ * customer_name is returned trimmed; mandate is checked by parseMandate and customer_phone by
+ * parseCustomerPhone (returned as E.164); each is omitted from the result when there is none. A signed-in
+ * agent's call has customer_name and customer_phone filled in before it gets here (bookArgsFor in
+ * lib/server/identity/customer.ts), so customer_name is always required here.
  */
-export function parseBookArgs(raw: unknown): BookInput {
+export function parseBookArgs(raw: unknown): ParsedBookInput {
   const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const { service_id, start, customer_name } = args;
 
@@ -506,18 +537,23 @@ export function parseBookArgs(raw: unknown): BookInput {
   }
 
   const mandate = parseMandate(args.mandate);
+  const phone = parseCustomerPhone(args.customer_phone);
   return {
     service_id,
     start,
     customer_name: name,
     ...(mandate ? { mandate } : {}),
+    ...(phone ? { customer_phone: phone } : {}),
   };
 }
 
+/** BookInput after parseBookArgs: customer_name is always there. */
+export type ParsedBookInput = BookInput & { customer_name: string };
+
 /**
- * What book() hands back: the contract's BookResult, plus the staff name, when the hold lapses in the
- * shop's zone (e.g. "Tue 10 Nov, 11:10 am EST") and whether this deployment collects deposits, for the
- * text summary.
+ * What book() hands back: the contract's BookResult (with `texted`), plus the staff name, when the hold
+ * lapses in the shop's zone (e.g. "Tue 10 Nov, 11:10 am EST") and whether this deployment collects deposits,
+ * for the text summary.
  */
 export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string; depositsOn?: boolean };
 
@@ -537,10 +573,12 @@ export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string
  *    hold never blocks this booking. Then check against hours, blocked time and bookings:
  *    outside_hours, or slot_taken (details.alternatives: up to 3 nearby free starts). The staff
  *    member comes from the check.
- * 5. Store it with a new approval token. If another booking got there first (SlotTakenError, i.e. the
- *    no_overlap constraint), read busy time again and, if another staff member is free at exactly this
- *    start, try once more with them. If that fails too, or nobody is free, fail with slot_taken; the
- *    database is the final word even when step 4 passed.
+ * 5. Store it with a new approval token (and customer_phone, if given). If another booking got there first
+ *    (SlotTakenError, i.e. the no_overlap constraint), read busy time again and, if another staff member is
+ *    free at exactly this start, try once more with them. If that fails too, or nobody is free, fail with
+ *    slot_taken; the database is the final word even when step 4 passed.
+ * 6. Where texting is on and customer_phone was given, text the approval link to it (textApprovalLink).
+ *    `texted` says whether that worked; a failed text doesn't fail the booking, which is stored by then.
  *
  * The owner is alerted when the booking is confirmed (lib/server/consent/approvals.ts, or
  * lib/server/deposits/deposits.ts once a deposit is paid) or the person declines, not here: a hold alone
@@ -549,6 +587,8 @@ export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string
  * `agent` is who is booking: a confirmed PAP agent ({ name, clientId }, from lib/server/identity/agent.ts),
  * stored with its client_id so Booking.agent shows it as confirmed; or a self-reported label (the MCP client's
  * name, the web API's bookedBy), unconfirmed.
+ * With `customer` (an agent signed in as that person, lib/server/identity/customer.ts) the booking belongs to
+ * them (customer_id); the caller has already filled customer_name and customer_phone from them.
  * TODO(ring-2): require a mandate once agents sign in.
  */
 export async function book(
@@ -556,6 +596,7 @@ export async function book(
   shopSlug: string,
   input: BookInput,
   agent: string | { name: string; clientId: string },
+  customer: BookingCustomer | null = null,
 ): Promise<BookOutcome> {
   const args = parseBookArgs(input);
   const start = parseRfc3339(args.start);
@@ -569,8 +610,11 @@ export async function book(
   }
 
   const who = typeof agent === "string" ? { name: agent, clientId: null } : agent;
-  return bookOnce(deps, shopSlug, args, start, { name: cleanAgentName(who.name), clientId: who.clientId });
+  return bookOnce(deps, shopSlug, args, start, { name: cleanAgentName(who.name), clientId: who.clientId }, customer);
 }
+
+/** The signed-in customer a booking belongs to. */
+export type BookingCustomer = { id: string };
 
 /** checkStart's refusals that come from the shop's rules alone, before hours and busy time count. */
 const RULE_REFUSALS: ReadonlySet<RefusedStart["reason"]> = new Set(["paused", "too_soon", "too_far"]);
@@ -579,9 +623,10 @@ const RULE_REFUSALS: ReadonlySet<RefusedStart["reason"]> = new Set(["paused", "t
 async function bookOnce(
   deps: FrontDeskDeps,
   shopSlug: string,
-  args: BookInput,
+  args: ParsedBookInput,
   start: Date,
   agent: { name: string; clientId: string | null },
+  customer: BookingCustomer | null,
 ): Promise<BookOutcome> {
   const shop = await requireShop(deps, shopSlug);
   const [service, policies, staffHours] = await Promise.all([
@@ -662,6 +707,8 @@ async function bookOnce(
         approveBy: held.approveBy,
         approvalToken: token,
         mandate: args.mandate ?? null,
+        customerId: customer?.id ?? null,
+        customerPhone: args.customer_phone ?? null,
       });
     } catch (err) {
       if (err instanceof SlotTakenError) return null;
@@ -686,7 +733,35 @@ async function bookOnce(
   const staffId = booking.staffId;
   const staffName = staffHours.find((s) => s.staffId === staffId)?.staffName ?? staffId;
   const holdDisplay = formatDisplay(DateTime.fromJSDate(held.approveBy, { zone: shop.timezone }));
-  return { booking: withApprovalOrigin(deps, booking), staffName, holdDisplay, depositsOn: deps.payments !== null };
+  const stored = withApprovalOrigin(deps, booking);
+  const texted = args.customer_phone ? await textApprovalLink(deps, shop, stored, args.customer_phone) : false;
+  return { booking: stored, texted, staffName, holdDisplay, depositsOn: deps.payments !== null };
+}
+
+/**
+ * Text the approval link of `booking` (just stored, awaiting approval) to `phone`, where texting is on:
+ * "<agent> asked <shop> to book <service> on <time> for you. Approve or decline: <link>". Returns whether
+ * the provider accepted it. Never throws: a failed text is logged (without the number), and the agent then
+ * sends the link itself.
+ */
+async function textApprovalLink(deps: FrontDeskDeps, shop: Shop, booking: Booking, phone: string): Promise<boolean> {
+  if (!deps.texter || !booking.approval) return false;
+  const body = approvalLinkText({
+    agentName: booking.agent.name,
+    shopName: shop.name,
+    serviceName: booking.serviceName,
+    display: booking.display,
+    url: booking.approval.url,
+  });
+  try {
+    await deps.texter.send(phone, body);
+    return true;
+  } catch (err) {
+    console.error(
+      JSON.stringify({ event: "booking.approval_text_failed", id: booking.id, shop: shop.slug, provider: deps.texter.provider, error: alertError(err) }),
+    );
+    return false;
+  }
 }
 
 /**
@@ -725,6 +800,8 @@ function alertError(err: unknown): string {
  * whatever happened to it. Call it after the change is committed; `booking` is the booking as stored.
  * Never throws and never changes the booking: a failed send is recorded as status "failed" with the error
  * (and logged), and if even recording fails, that is only logged. No retries. TODO(ring-2): a retry job.
+ * Where texting is on (deps.texter) and the shop has an ownerMobile, the alert is also texted there and
+ * recorded as a second alert, channel "text"; the email or log line goes out as before.
  *
  * Callers: approveBooking and declineBooking (lib/server/consent/approvals.ts), cancelBooking (agents).
  * The console link uses deps.baseUrl, the origin of the request being served.
@@ -774,9 +851,32 @@ export async function alertOwner(
       status,
       error,
     });
+    if (deps.texter && policies.ownerMobile) await textOwner(deps, deps.texter, alert, policies.ownerMobile);
   } catch (err) {
     logFailure("booking.alert_not_recorded", err);
   }
+}
+
+/** alertOwner's text to the owner's mobile, recorded as an alert with channel "text" whatever happened to it. */
+async function textOwner(deps: FrontDeskDeps, texter: TextSender, alert: OwnerAlert, ownerMobile: string): Promise<void> {
+  let status: AlertStatus = "sent";
+  let error: string | null = null;
+  try {
+    await texter.send(ownerMobile, ownerAlertText(alert));
+  } catch (err) {
+    status = "failed";
+    error = alertError(err);
+    console.error(JSON.stringify({ event: "booking.notify_failed", id: alert.booking.id, shop: alert.shop.slug, kind: alert.kind, channel: "text", error }));
+  }
+  await deps.store.recordAlert({
+    shopSlug: alert.booking.shopSlug,
+    bookingId: alert.booking.id,
+    kind: alert.kind,
+    channel: "text",
+    recipient: ownerMobile,
+    status,
+    error,
+  });
 }
 
 type RefusedStart = Exclude<StartCheck, { ok: true }>;
