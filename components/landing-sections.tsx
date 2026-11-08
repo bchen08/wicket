@@ -34,8 +34,8 @@ export function Hero() {
         </h1>
         <p className="mt-6 max-w-[410px] text-[15px] leading-[1.85] text-muted-foreground">
           Your next customer has an AI assistant. Let it book you in seconds.
-          Every booking is verified, customer-approved, and can be backed by a
-          deposit. Set your hours once. We&apos;ll take it from there.
+          Every booking is customer-approved and can be backed by a deposit. Set
+          your hours once. We&apos;ll take it from there.
         </p>
         <div className="mt-8 flex flex-wrap items-center gap-5">
           <Button asChild size="lg">
