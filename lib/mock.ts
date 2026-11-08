@@ -34,9 +34,9 @@ export const features: Feature[] = [
       "Claude, ChatGPT, or a personal assistant. Meet your customers wherever they’re already making plans.",
   },
   {
-    title: "Verified, approved bookings",
+    title: "Customer-approved bookings",
     description:
-      "A real person behind every appointment. Every booking is verified and approved by the customer.",
+      "Every booking is approved by the customer before it’s confirmed.",
   },
   {
     title: "Deposits that stop no-shows",
@@ -59,6 +59,6 @@ export const steps = [
   {
     title: "You do what you do best.",
     description:
-      "A verified appointment lands on your calendar. No back-and-forth, no extra admin.",
+      "A customer-approved appointment lands on your calendar. No back-and-forth, no extra admin.",
   },
 ];

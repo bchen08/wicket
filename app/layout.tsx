@@ -12,7 +12,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Front Desk — Let AI agents book your business",
   description:
-    "A simpler way for independent businesses to accept AI bookings. Verified customers, customer-approved appointments, and optional card deposits. Your business. Your rules.",
+    "A simpler way for independent businesses to accept AI bookings. Customer-approved appointments and optional card deposits. Your business. Your rules.",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

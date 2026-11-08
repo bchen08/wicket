@@ -11,7 +11,10 @@ import { demoBooking } from "@/lib/mock";
 export function BookingPreview() {
   const booking = demoBooking;
   return (
-    <div className="booking-stage" aria-label="Example of a verified booking">
+    <div
+      className="booking-stage"
+      aria-label="Example of a customer-approved booking"
+    >
       <div className="booking-note">
         <span className="size-1.5 rounded-full bg-primary" /> Your next booking,
         taken care of.
@@ -75,7 +78,7 @@ export function BookingPreview() {
                 className="size-3.5 text-primary"
                 aria-hidden="true"
               />{" "}
-              Customer verified{" "}
+              Customer-approved{" "}
               <Check
                 className="ml-auto size-3 text-primary"
                 aria-hidden="true"
@@ -114,7 +117,7 @@ export function BookingPreview() {
         <div>
           <p className="text-xs font-medium">One less thing on your list.</p>
           <p className="mt-1 text-[10px] text-muted-foreground">
-            Verified. Approved. On your calendar.
+            Customer-approved. On your calendar.
           </p>
         </div>
       </div>
