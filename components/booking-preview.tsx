@@ -1,128 +1,88 @@
-import {
-  CalendarDays,
-  Check,
-  CreditCard,
-  LockKeyhole,
-  Scissors,
-  ShieldCheck,
-} from "lucide-react";
-import { demoBooking } from "@/lib/mock";
+import { approvalText, shopAlert, slip } from "@/lib/mock";
 
-export function BookingPreview() {
-  const booking = demoBooking;
+export function AppointmentSlip() {
   return (
-    <div
-      className="booking-stage"
-      aria-label="Example of a customer-approved booking"
+    <figure
+      aria-label="Example appointment slip"
+      className="w-full max-w-sm border border-foreground/80 bg-background px-6 py-7 font-mono text-sm"
     >
-      <div className="booking-note">
-        <span className="size-1.5 rounded-full bg-primary" /> Your next booking,
-        taken care of.
+      <div className="flex flex-col items-center gap-1 border-b border-dashed border-foreground/40 pb-5 text-center">
+        <p className="font-serif text-2xl">{"Hart's Barbers"}</p>
+        <p className="text-xs text-muted-foreground">Appointment</p>
       </div>
-      <div className="booking-card">
-        <div className="flex items-center gap-3 border-b border-border p-6">
-          <div className="flex size-10 items-center justify-center rounded-xl bg-surface">
-            <Scissors className="size-5" strokeWidth={1.5} aria-hidden="true" />
+      <dl className="flex flex-col gap-3 border-b border-dashed border-foreground/40 py-5">
+        {slip.lines.map((line) => (
+          <div key={line.label} className="flex items-baseline justify-between gap-4">
+            <dt className="text-muted-foreground">{line.label}</dt>
+            <dd className="text-right">{line.value}</dd>
           </div>
-          <div>
-            <p className="text-sm font-semibold tracking-tight">
-              {booking.business}
-            </p>
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              {booking.category}
-            </p>
+        ))}
+      </dl>
+      <dl className="flex flex-col gap-3 pt-5">
+        {slip.footer.map((line) => (
+          <div key={line.label} className="flex items-baseline justify-between gap-4">
+            <dt className="text-muted-foreground">{line.label}</dt>
+            <dd className="text-right">{line.value}</dd>
           </div>
-          <span className="ml-auto flex size-7 items-center justify-center rounded-full bg-accent text-primary">
-            <Check className="size-4" aria-hidden="true" />
-          </span>
-        </div>
-        <div className="p-6">
-          <div className="flex items-center justify-between gap-3">
-            <span className="eyebrow text-muted-foreground">
-              New appointment
-            </span>
-            <span className="rounded-full bg-accent px-2.5 py-1 text-[10px] font-medium text-primary">
-              Confirmed
-            </span>
-          </div>
-          <h2 className="mt-5 text-[23px] font-medium tracking-[-0.04em]">
-            {booking.service}
-          </h2>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {booking.duration} <span className="mx-1.5">·</span> {booking.price}
-          </p>
-          <div className="mt-6 flex items-center gap-3 rounded-lg border border-border bg-surface/60 p-3.5">
-            <CalendarDays
-              className="size-4 text-muted-foreground"
-              aria-hidden="true"
-            />
-            <div className="text-xs">
-              <p className="font-medium">{booking.date}</p>
-              <p className="mt-1 text-muted-foreground">{booking.time}</p>
-            </div>
-          </div>
-          <div className="my-5 flex items-center gap-3">
-            <span className="flex size-8 items-center justify-center rounded-full bg-surface text-[10px] font-medium">
-              {booking.initials}
-            </span>
-            <div>
-              <p className="text-xs font-medium">{booking.customer}</p>
-              <p className="mt-0.5 text-[10px] text-muted-foreground">
-                Booked by {booking.agent.toLowerCase()}
-              </p>
-            </div>
-          </div>
-          <div className="flex flex-col gap-2.5 border-t border-border pt-4">
-            <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
-              <ShieldCheck
-                className="size-3.5 text-primary"
-                aria-hidden="true"
-              />{" "}
-              Customer-approved{" "}
-              <Check
-                className="ml-auto size-3 text-primary"
-                aria-hidden="true"
-              />
-            </p>
-            <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
-              <Check className="size-3.5 text-primary" aria-hidden="true" />{" "}
-              Approved by {booking.customer.split(" ")[0]}{" "}
-              <Check
-                className="ml-auto size-3 text-primary"
-                aria-hidden="true"
-              />
-            </p>
-            <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
-              <CreditCard
-                className="size-3.5 text-primary"
-                aria-hidden="true"
-              />{" "}
-              {booking.deposit} deposit secured{" "}
-              <Check
-                className="ml-auto size-3 text-primary"
-                aria-hidden="true"
-              />
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center justify-center gap-1.5 rounded-b-xl border-t border-border bg-surface/40 py-3 text-[9px] text-muted-foreground">
-          <LockKeyhole className="size-2.5" aria-hidden="true" /> Securely
-          coordinated by Front Desk
-        </div>
+        ))}
+      </dl>
+    </figure>
+  );
+}
+
+export function AskBubble() {
+  return (
+    <div className="flex flex-col items-end gap-1.5">
+      <p className="max-w-xs rounded-2xl rounded-br-sm bg-foreground px-4 py-3 text-sm leading-relaxed text-background">
+        {"Book me a haircut at Hart's Saturday afternoon, under $40."}
+      </p>
+      <span className="text-xs text-muted-foreground">To Claude</span>
+    </div>
+  );
+}
+
+export function ApprovalText() {
+  return (
+    <div className="flex flex-col items-start gap-1.5">
+      <p className="max-w-xs rounded-2xl rounded-bl-sm bg-muted px-4 py-3 text-sm leading-relaxed">
+        {approvalText}{" "}
+        <span className="break-all underline underline-offset-2">emergent.vercel.app/approve/…</span>
+      </p>
+      <span className="text-xs text-muted-foreground">Text message</span>
+    </div>
+  );
+}
+
+export function ApprovalCard() {
+  return (
+    <div className="flex max-w-xs flex-col gap-4 border-t border-b border-border py-4">
+      <div className="flex flex-col gap-1">
+        <p className="font-serif text-lg">Approve your booking</p>
+        <p className="font-mono text-xs text-muted-foreground">Haircut · Sat 14 Nov, 2:30 pm · $35</p>
       </div>
-      <div className="booking-receipt">
-        <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground">
-          <Check className="size-4" aria-hidden="true" />
-        </span>
-        <div>
-          <p className="text-xs font-medium">One less thing on your list.</p>
-          <p className="mt-1 text-[10px] text-muted-foreground">
-            Customer-approved. On your calendar.
-          </p>
-        </div>
-      </div>
-      <p className="mt-6 text-center font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
-        An example booking. A better kind of busy.
+      <span
+        aria-hidden="true"
+        className="inline-flex h-10 w-fit items-center rounded-md bg-accent px-5 text-sm font-medium text-accent-foreground"
+      >
+        Approve
+      </span>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        Then a <span className="font-mono">$10.00</span> hold on Stripe Checkout.
+      </p>
+    </div>
+  );
+}
+
+export function ShopNotice() {
+  return (
+    <div className="flex max-w-sm flex-col gap-3 font-mono text-xs">
+      <p className="border-b border-border pb-3">
+        <span className="text-muted-foreground">Text + email · </span>
+        {shopAlert}
+      </p>
+      <p className="flex flex-wrap justify-between gap-x-4 gap-y-1">
+        <span>Sat 2:30 pm · Haircut</span>
+        <span className="text-muted-foreground">Claude · verified agent</span>
       </p>
     </div>
   );
