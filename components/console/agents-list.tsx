@@ -3,7 +3,7 @@ import type { AgentSummary, AgentsResponse } from "@/lib/types/agents";
 import { loadSettings } from "@/components/console/load-settings";
 import { errorFeedback } from "@/components/console/api";
 import { SaveFeedback } from "@/components/console/form-parts";
-import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 function SeenTime({ value, zone }: { value: string | null; zone: string }) {
   if (!value) return <span className="text-muted-foreground">Never</span>;
@@ -29,8 +29,7 @@ export async function AgentsList() {
   }
   return <section className="flex min-w-0 flex-col gap-4" aria-label="Agent activity">
     <div className="border-t border-border">
-      <Table>
-        <TableCaption>Verified agents seen by Front Desk · Times in {data.shop.timezone}</TableCaption>
+      <Table aria-label="Verified agents" aria-describedby="agents-table-note">
         <TableHeader><TableRow>
           {["Name", "Bookings", "First seen", "Last seen", "Last booked"].map(label => <TableHead scope="col" key={label}>{label}</TableHead>)}
         </TableRow></TableHeader>
@@ -40,6 +39,7 @@ export async function AgentsList() {
         </TableBody>
       </Table>
     </div>
+    <p id="agents-table-note" className="text-center text-sm text-muted-foreground">Verified agents seen by Front Desk · Times in {data.shop.timezone}</p>
     <p className="text-center text-sm text-muted-foreground">{data.unconfirmedBookings} bookings from agents that didn&apos;t identify themselves</p>
   </section>;
 }
