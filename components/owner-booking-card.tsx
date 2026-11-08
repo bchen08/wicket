@@ -24,7 +24,7 @@ export function StatusBadge({ status }: { status: BookingStatus }) {
         "rounded-md border px-2 py-1 text-xs wrap-anywhere",
         status === "confirmed"
           ? "border-primary/15 bg-accent text-primary"
-          : "border-border bg-muted text-muted-foreground",
+          : "border-border bg-muted text-foreground",
       )}
     >
       {STATUS_LABELS[status]}

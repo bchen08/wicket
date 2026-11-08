@@ -26,7 +26,7 @@ export function ConsoleNavigation() {
               "flex min-h-12 flex-1 items-center justify-center rounded-t-lg border-b-2 px-2 text-sm font-medium transition-colors",
               pathname === href
                 ? "border-primary bg-accent text-primary"
-                : "border-transparent text-muted-foreground hover:bg-muted",
+                : "border-transparent text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:bg-muted focus-visible:text-foreground",
             )}
           >
             {label}
