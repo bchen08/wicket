@@ -35,6 +35,7 @@ export const REQUIRED_SCHEMA = {
     "pay_by",
     "deposit_state",
     "deposit_failure",
+    "agent_client_id",
     "customer_id",
   ],
   approvals: ["booking_id", "token", "decision", "decided_at"],
@@ -57,6 +58,7 @@ export const REQUIRED_SCHEMA = {
   blocked_times: ["id", "staff_id", "during", "reason"],
   alerts: ["id", "shop_slug", "booking_id", "kind", "channel", "recipient", "status", "error", "created_at"],
   nightly_runs: ["id", "ran_at", "expired", "completed", "deposits_released", "failures"],
+  agents: ["client_id", "name", "first_seen", "last_seen"],
   owner_codes: ["id", "shop_slug", "code", "sent_to", "expires_at", "used_at"],
   // Connector sign-in (0008_signin.sql), queried by lib/server/oauth/postgres-store.ts.
   customers: ["id", "shop_slug", "name", "phone", "updated_at"],

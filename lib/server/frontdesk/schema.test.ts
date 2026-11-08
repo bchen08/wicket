@@ -15,7 +15,7 @@ import { missingFromSchema, REQUIRED_SCHEMA, REQUIRED_TABLES } from "./schema";
 /** SQL keywords, functions and types the store uses. Add one here if a new query needs it. */
 const SQL_WORDS = new Set([
   "all", "and", "any", "as", "asc", "by", "case", "coalesce", "conflict", "count", "delete", "desc", "distinct",
-  "do", "else", "end", "excluded", "exists", "false", "for", "from", "in", "insert", "int", "integer", "into", "is", "join",
+  "do", "else", "end", "excluded", "exists", "false", "for", "from", "group", "in", "insert", "int", "integer", "into", "is", "join",
   "jsonb", "jsonb_build_object", "left", "limit", "lower", "max", "not", "nothing", "now", "null", "on", "or",
   "order", "returning", "select", "set", "text", "timestamptz", "to_char", "true", "tstzrange", "union",
   "update", "upper", "using", "uuid", "values", "when", "where", "with", "then",

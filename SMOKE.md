@@ -105,6 +105,18 @@ Front Desk is the OAuth authorization server for its own MCP endpoint, so a pers
 - **S8 [browser]** In Claude (Customize → Connectors → Add custom connector, URL `<origin>/api/mcp`; a preview needs a bypass link): Claude shows a sign-in step, either when connecting or as a **Connect** card the first time it needs it. Sign in with a name and number on `/signin`. Then "book me a haircut Wednesday morning" books without asking for a name (you still approve it with the link), "What appointments do I have at Hart's?" lists it, and "cancel the Wednesday one" cancels it.
 - **S9 [browser]** An agent that never signs in can still browse and book as before (it is asked for a name, and gets the approval link).
 
+## Agent identity (PAP 0.4)
+
+Agents that speak PAP 0.4 sign their MCP requests (`Poppy-Session`), and their bookings show them as confirmed. Every other agent books as before, unconfirmed. See [docs/agent-identity.md](docs/agent-identity.md). A1–A2 are read-only and run everywhere. A3–A6 book, so like the booking loop they run only where `/api/status` shows `"writesAllowed": true`, and the run declines what they book.
+
+- **A1 [smoke]** `/.well-known/poppy.json` returns `protocol_version: "0.4"`, `organization.domain` equal to this deployment's host, and an `mcp` API at `<origin>/api/mcp`. `/.well-known/front-desk.json` links to it as `poppy`.
+- **A2 [smoke]** A `POST /api/mcp` with `Poppy-Session: not-a-session-jwt` and `Poppy-Version: 0.4` → 400 `{"error":"invalid_session",…}`.
+- **A3 [smoke]** The demo PAP agent (`scripts/demo-pap-agent.mjs`, named `front-desk-smoke (PAP)`, a new key each run) books a Beard trim → `awaiting_approval` with `agent: { name: "front-desk-smoke (PAP)", confirmed: true, clientId: <its client_id> }`.
+- **A4 [smoke]** The owner's bookings list (`/api/shops/harts/bookings`, owner token) shows that booking's agent confirmed, with its name. **[browser]** The console shows that booking's agent as confirmed, with its name (once the console reads `agent.confirmed`).
+- **A5 [smoke]** `/api/shops/harts/agents` (owner token) lists the agent with `bookings: 1` and a `lastSeen`.
+- **A6 [smoke]** A plain MCP `book` (no `Poppy-Session`, as Claude or ChatGPT send) → `agent: { name: "front-desk-smoke", confirmed: false }`, with no `clientId`.
+- **A7 [by hand]** `node scripts/demo-pap-agent.mjs <PREVIEW_URL> --bypass <secret>` prints `The shop sees the agent as: Front Desk demo agent (confirmed).` and an approval link on the preview. Run it again: `/api/shops/harts/agents` shows the same agent with one more booking and a later `lastSeen`. Decline both from their links.
+
 Add a line here whenever a feature ships that must never break. Keep each one a quick pass/fail check on a URL, and mark it **[smoke]** (then add it to `scripts/smoke.mjs`), **[browser]** or **[by hand]**.
 
 ## Nightly tidy-up

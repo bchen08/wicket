@@ -360,6 +360,7 @@ export function discovery(origin: string, shopSlug: string = DEFAULT_SHOP_SLUG):
     mcp: `${origin}/api/mcp`,
     webApi: `${origin}${paths.base}`,
     agentsMd: `${origin}${paths.agentsMd}`,
+    poppy: `${origin}/.well-known/poppy.json`,
     endpoints: {
       availability: `${origin}${paths.availability}`,
       book: `${origin}${paths.book}`,

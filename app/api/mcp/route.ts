@@ -2,6 +2,7 @@ import { connection } from "next/server";
 import { getFrontDeskDeps } from "@/lib/server/frontdesk/deps";
 import { createFrontDeskMcpHandler } from "@/lib/server/frontdesk/mcp";
 import { withRequestOrigin } from "@/lib/server/frontdesk/service";
+import { identifyAgent } from "@/lib/server/identity/agent";
 import { withCustomerSignin } from "@/lib/server/identity/customer";
 
 // /api/mcp — Front Desk's MCP server (Streamable HTTP, stateless).
@@ -17,10 +18,14 @@ import { withCustomerSignin } from "@/lib/server/identity/customer";
 // Under cacheComponents, connection() makes the handler request-time only.
 async function handler(request: Request): Promise<Response> {
   await connection();
+  // PAP agents (a Poppy-Session header) are confirmed here, or refused with PAP's error; without the header
+  // nothing changes. See lib/server/identity/agent.ts and docs/agent-identity.md.
+  const agent = await identifyAgent(request, getFrontDeskDeps);
+  if (agent instanceof Response) return agent;
   // A handler per request, so approval links use this request's origin (previews and production alike,
   // with no setting). Deps are resolved on each tool call (Postgres, or in-memory locally; see deps.ts),
   // so a configuration error becomes a tool error instead of a crash.
-  const mcpHandler = createFrontDeskMcpHandler(() => withRequestOrigin(getFrontDeskDeps(), request));
+  const mcpHandler = createFrontDeskMcpHandler(() => withRequestOrigin(getFrontDeskDeps(), request), agent);
   return mcpHandler(request);
 }
 

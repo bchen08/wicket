@@ -889,7 +889,7 @@ export async function runSmoke({
 
   // ---- Feature checks (scripts/smoke-checks/*.mjs) ----
 
-  const featureCtx = { check, client, status, baseUrl, token, now, random, expect, CheckFailed, http, snippet, rfc3339, SMOKE_AGENT, SMOKE_CUSTOMER };
+  const featureCtx = { check, client, status, baseUrl, bypass, fetch: fetchImpl, token, now, random, expect, CheckFailed, http, snippet, rfc3339, SMOKE_AGENT, SMOKE_CUSTOMER };
   for (const run of checks ?? (await loadSmokeChecks())) {
     try {
       await run(featureCtx);

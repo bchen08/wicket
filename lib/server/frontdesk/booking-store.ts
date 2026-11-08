@@ -31,7 +31,10 @@ export type NewBooking = {
   end: Date;
   /** Trimmed, 1–80 characters. */
   customerName: string;
+  /** Booking.agent.name: the confirmed agent's client_name, or a self-reported label. */
   agentName: string;
+  /** The confirmed PAP agent's client_id (lib/server/identity/agent.ts), or null/absent: unconfirmed. */
+  agentClientId?: string | null;
   /** The service's deposit at booking time, in cents. Stored on the booking so later price changes don't rewrite it. */
   depositCents: number;
   /** When the hold lapses (decide()'s approveBy). */
@@ -136,6 +139,33 @@ export type NewAlert = {
   error: string | null;
 };
 
+// ---- Agent identity (PAP) ----
+
+/** A PAP agent whose Session header verified: what recordAgent stores. */
+export type SeenAgent = {
+  clientId: string;
+  /** client_name from its client metadata. */
+  name: string;
+};
+
+/** A recorded agent and its bookings at one shop. */
+export type AgentRecord = SeenAgent & {
+  firstSeen: Date;
+  lastSeen: Date;
+  /** Its bookings at the shop, any status. */
+  bookings: number;
+  /** When it last booked at the shop (the newest created_at), or null. */
+  lastBookedAt: Date | null;
+};
+
+/** listAgents' answer. */
+export type AgentActivity = {
+  /** Every recorded agent, most recently seen first (then by client_id). */
+  agents: AgentRecord[];
+  /** The shop's bookings without a confirmed agent (agent_client_id null). */
+  unconfirmedBookings: number;
+};
+
 // ---- Texting: the owner's sign-in codes ----
 
 /** A sign-in code texted to the owner (the owner_codes table). Stored as it is (MVP: no hashing). */
@@ -160,7 +190,7 @@ export interface BookingStore {
   /**
    * Store a booking awaiting approval (status awaiting_approval, approve_by, mandate), its approval
    * request (approvals: booking_id, token) and its "booked" event (actor "agent", data
-   * { status: "awaiting_approval", agentName, mandate? }) in the same transaction.
+   * { status: "awaiting_approval", agentName, agentClientId?, mandate? }) in the same transaction.
    * Throws SlotTakenError if the staff member already has an awaiting_approval, awaiting_deposit or
    * confirmed booking that overlaps [start, end), lapsed holds included: expire them first
    * (expireStaleHolds). In Postgres that's the `no_overlap` exclusion constraint (SQLSTATE 23P01).
@@ -251,6 +281,16 @@ export interface BookingStore {
   /** The newest run (by ran_at, then id), or null if it has never run. */
   lastNightlyRun(): Promise<NightlyRun | null>;
 
+  // ---- Agent identity (PAP) ----
+
+  /**
+   * Record a verified PAP agent: a new one gets first_seen = last_seen = now; a known one gets its name
+   * updated and last_seen = now (Postgres now(), the memory store's clock).
+   */
+  recordAgent(agent: SeenAgent): Promise<void>;
+  /** Every recorded agent with its bookings at `shopSlug`, and the shop's bookings by unconfirmed agents. */
+  listAgents(shopSlug: string): Promise<AgentActivity>;
+
   // ---- Texting: the owner's sign-in codes ----
 
   /** Store a code that was just texted to the owner. */
@@ -309,6 +349,8 @@ export type BookingRecord = {
   status: BookingStatus;
   customerName: string;
   agentName: string;
+  /** bookings.agent_client_id: the confirmed agent, or null. */
+  agentClientId: string | null;
   createdAt: Date;
   /** true once the person tapped Approve on the approval link (approvals.decision = approved). */
   customerApproved: boolean;
@@ -380,7 +422,7 @@ export function toBooking(r: BookingRecord): Booking {
       approved: r.customerApproved,
       ...(r.customerPhone ? { phone: r.customerPhone } : {}),
     },
-    agent: { name: r.agentName },
+    agent: { name: r.agentName, confirmed: r.agentClientId !== null, ...(r.agentClientId !== null ? { clientId: r.agentClientId } : {}) },
     depositCents: r.depositCents,
     deposit: toBookingDeposit(r),
     createdAt: toRfc3339(r.createdAt, r.timezone),

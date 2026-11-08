@@ -160,7 +160,7 @@ describe("what the texts say", () => {
     display: "Sat 14 Nov, 2:00 pm EST",
     status: "confirmed",
     customer: customerOf("Maya Lopez", true, TO),
-    agent: { name: "claude-ai" },
+    agent: { name: "claude-ai", confirmed: false },
     depositCents: 0,
     deposit: { amountCents: 0, state: "none" },
     createdAt: "2026-11-09T12:00:00-05:00",

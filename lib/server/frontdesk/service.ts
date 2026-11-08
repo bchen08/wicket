@@ -584,6 +584,9 @@ export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string
  * lib/server/deposits/deposits.ts once a deposit is paid) or the person declines, not here: a hold alone
  * is no news. A booking awaiting its deposit past pay_by is checked with Stripe in step 4 too
  * (syncDeposit), so an unpaid one never blocks this booking.
+ * `agent` is who is booking: a confirmed PAP agent ({ name, clientId }, from lib/server/identity/agent.ts),
+ * stored with its client_id so Booking.agent shows it as confirmed; or a self-reported label (the MCP client's
+ * name, the web API's bookedBy), unconfirmed.
  * With `customer` (an agent signed in as that person, lib/server/identity/customer.ts) the booking belongs to
  * them (customer_id); the caller has already filled customer_name and customer_phone from them.
  * TODO(ring-2): require a mandate once agents sign in.
@@ -592,7 +595,7 @@ export async function book(
   deps: FrontDeskDeps,
   shopSlug: string,
   input: BookInput,
-  agentName: string,
+  agent: string | { name: string; clientId: string },
   customer: BookingCustomer | null = null,
 ): Promise<BookOutcome> {
   const args = parseBookArgs(input);
@@ -606,7 +609,8 @@ export async function book(
     );
   }
 
-  return bookOnce(deps, shopSlug, args, start, cleanAgentName(agentName), customer);
+  const who = typeof agent === "string" ? { name: agent, clientId: null } : agent;
+  return bookOnce(deps, shopSlug, args, start, { name: cleanAgentName(who.name), clientId: who.clientId }, customer);
 }
 
 /** The signed-in customer a booking belongs to. */
@@ -621,7 +625,7 @@ async function bookOnce(
   shopSlug: string,
   args: ParsedBookInput,
   start: Date,
-  agentName: string,
+  agent: { name: string; clientId: string | null },
   customer: BookingCustomer | null,
 ): Promise<BookOutcome> {
   const shop = await requireShop(deps, shopSlug);
@@ -697,7 +701,8 @@ async function bookOnce(
         start,
         end,
         customerName: args.customer_name,
-        agentName,
+        agentName: agent.name,
+        agentClientId: agent.clientId,
         depositCents: service.depositCents,
         approveBy: held.approveBy,
         approvalToken: token,
@@ -963,7 +968,7 @@ function alternativesNear(engine: StartCheckInput, start: Date): Slot[] {
 /** C0 control characters, U+0000–U+001F: no use in a label, and Postgres text can't hold U+0000. */
 const CONTROL_CHARACTERS = /[\u0000-\u001F]/g;
 
-/** The MCP client's self-reported name as stored: control characters removed, trimmed, at most 80 characters. */
+/** The agent's name as stored: control characters removed, trimmed, at most 80 characters. */
 function cleanAgentName(name: string): string {
   const trimmed = name.replace(CONTROL_CHARACTERS, "").trim().slice(0, MAX_AGENT_NAME);
   return trimmed === "" ? UNKNOWN_AGENT : trimmed;

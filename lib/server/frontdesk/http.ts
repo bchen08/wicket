@@ -1,4 +1,5 @@
 import type {
+  AgentsResponse,
   AlertsResponse,
   ApiErrorCode,
   BlockResponse,
@@ -27,6 +28,7 @@ import {
   updateShopPolicies,
   updateShopService,
 } from "./owner";
+import { listShopAgents } from "../identity/agent";
 import { checkOwnerAuth, UNLOCK_NEXT_ACTION } from "./owner-auth";
 import { listServices, listShopBookings, withRequestOrigin, type FrontDeskDeps } from "./service";
 
@@ -296,4 +298,17 @@ export function alertsGet(
   options?: OwnerOptions,
 ): Promise<Response> {
   return ownerRespond<AlertsResponse>(getDeps, request, options, (deps) => listShopAlerts(deps, shopSlug), 200, UNLOCK_NEXT_ACTION);
+}
+
+/**
+ * GET /api/shops/[shop]/agents → AgentsResponse: the PAP agents seen, with their bookings here and last seen
+ * (lib/server/identity/agent.ts). Like the bookings list, its 401 says to unlock the console.
+ */
+export function agentsGet(
+  getDeps: () => FrontDeskDeps,
+  request: Request,
+  shopSlug: string,
+  options?: OwnerOptions,
+): Promise<Response> {
+  return ownerRespond<AgentsResponse>(getDeps, request, options, (deps) => listShopAgents(deps, shopSlug), 200, UNLOCK_NEXT_ACTION);
 }

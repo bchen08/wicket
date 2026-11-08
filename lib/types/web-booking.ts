@@ -120,6 +120,11 @@ export type FrontDeskDiscovery = {
   webApi: string;
   /** Plain-text instructions for agents: `<origin>/api/shops/<shop>/agents.md`. */
   agentsMd: string;
+  /**
+   * The PAP 0.4 discovery document: `<origin>/.well-known/poppy.json` (PoppyDocument in lib/types/agents.ts).
+   * Agents that speak PAP sign their MCP requests so bookings show them as confirmed.
+   */
+  poppy: string;
   /** The web API's routes, as full URLs. */
   endpoints: {
     /** GET ?service=<id>&from=<YYYY-MM-DD>&days=<1..14> → WebAvailabilityResponse. */

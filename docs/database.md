@@ -12,6 +12,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 | [`supabase/migrations/0006_nightly.sql`](../supabase/migrations/0006_nightly.sql) | The nightly tidy-up's log: the `nightly_runs` table (one row per run, with its counts), which `/api/status` shows as `lastNightlyRun`. See [nightly.md](nightly.md#database-0006_nightlysql). |
 | [`supabase/migrations/0007_texting.sql`](../supabase/migrations/0007_texting.sql) | Texting: `policies.owner_mobile`, the `text` alert channel, and the `owner_codes` table (the owner's texted sign-in codes). Additive only. See [texting.md](texting.md#database-0007_textingsql). |
 | [`supabase/migrations/0008_signin.sql`](../supabase/migrations/0008_signin.sql) | Connector sign-in: `customers` (one per shop and phone), `bookings.customer_id`, and the OAuth tables `oauth_clients`, `oauth_codes`, `oauth_tokens`. See [connector-signin.md](connector-signin.md#database-0008_signinsql). |
+| [`supabase/migrations/0009_agents.sql`](../supabase/migrations/0009_agents.sql) | Agent identity (PAP 0.4): the `agents` table and `bookings.agent_client_id`. See [agent-identity.md](agent-identity.md). |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -27,12 +28,14 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
   - `mandate`: the person's limits as the agent sent them (a JSON object), or null.
   - `cancelled_by` is `agent`, `owner` or `customer` (the person declined). Each transition stamps its own time column.
   - `deposit_cents` is a snapshot of the service's deposit when the booking was made, so a later price change doesn't rewrite history.
+  - `agent_client_id` (0009): the confirmed PAP agent's `client_id`, or null for an unconfirmed agent. `agent_name` is then that agent's verified name. No foreign key.
 - `approvals (booking_id pk, token unique, created_at, decided_at, decision)`: one per booking. `token` is the token in the approval link, stored as it is, so every booking response can carry the link while the hold is on (`Booking.approval`). `decision` is `approved` or `declined`, set together with `decided_at`. `Booking.customer.approved` is `decision = 'approved'`.
 - `policies (shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone, deposit_rule, late_cancel_rule, no_show_rule, owner_email, owner_mobile, updated_at)`: one row per shop. A shop without a row uses the column defaults (120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules, no owner email or mobile). `owner_email` (at most 254 characters, or null) is where owner alerts are emailed; `owner_mobile` (E.164, or null) is where they're texted, and where the sign-in code goes, where texting is on. Agents never see either.
 - `blocked_times (id, staff_id, during tstzrange, reason, created_at)`: holidays and time off. Half-open, like bookings. The owner sees `reason`; agents never do.
 - `events (id, booking_id, at, actor, type, data jsonb)`: one row per booking state change (`booked`, `approved`, `declined`, `expired`, `cancelled`, `completed`, `no_show`), written in the same transaction as the change. `actor` is `agent`, `owner`, `customer` or `system`.
 - `alerts (id, shop_slug, booking_id, kind, channel, recipient, status, error, created_at)`: one row per owner alert, whatever happened to it. `kind` is `booking_confirmed` or `booking_cancelled`; `channel` is `email` (to `recipient`), `text` (to `recipient`, the owner's mobile; as well as the email or log line) or `log` (`recipient` null); `status` is `sent`, `logged` or `failed` (with `error`). `id` increases. Deleting a booking deletes its alerts. The owner reads the newest 50 with `GET /api/shops/[shop]/alerts` ([frontdesk-api.md](frontdesk-api.md#owner-alerts)).
 - `owner_codes (id, shop_slug, code, sent_to, expires_at, used_at, created_at)`: 6-digit sign-in codes texted to the owner ([texting.md](texting.md#3-owner-sign-in-by-texted-code)). Valid until `expires_at` (10 minutes), once: `used_at` is set when one signs in. Stored as they are.
+- `agents (client_id pk, name, first_seen, last_seen)` (0009): one row per PAP agent whose `Poppy-Session` verified. `name` is its latest `client_name`, and `last_seen` is its latest verified request. The owner reads them with `GET /api/shops/[shop]/agents` ([agent-identity.md](agent-identity.md)).
 - `idempotency_keys`: from 0002, unused since the MVP reset, dropped by 0004.
 - `customers (id, shop_slug, name, phone, created_at, updated_at)`, unique `(shop_slug, phone)`, and `bookings.customer_id`: the person an agent signed in as (connector sign-in), null for bookings made without sign-in. `oauth_clients`, `oauth_codes` and `oauth_tokens` hold connector sign-in's clients, codes and tokens, stored as they are. See [connector-signin.md](connector-signin.md).
 
@@ -184,6 +187,10 @@ It changes no existing data, and the code already deployed never reads `nightly_
 - `owner_codes` starts empty.
 
 The code already deployed tolerates it, because it never reads the new column or table. If the new code is deployed before 0007 is applied, reading a shop's policies fails (`owner_mobile`), so most Front Desk calls fail with `internal` until it is. `/api/status` names what's missing.
+
+### Agent identity: applying 0009
+
+`0009_agents.sql` is applied like any other migration. It adds the `agents` table (RLS on, no policies) and the nullable `bookings.agent_client_id`, and seeds nothing; see [agent-identity.md](agent-identity.md). The code already deployed never reads either. The new code reads and writes `agent_client_id` on every booking, so if it's deployed before the integration has applied 0009, `/api/status` says `outdated` (missing `agents` and `bookings.agent_client_id`) and booking fails until the migration lands, as with 0005.
 
 ### 2. Get the connection string: use the transaction pooler
 
