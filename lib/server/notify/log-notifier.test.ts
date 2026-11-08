@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Booking } from "../../types/frontdesk";
+import { customerOf } from "../frontdesk/test-support";
 import { createLogNotifier, firstName } from "./log-notifier";
 
 const booking: Booking = {
@@ -12,7 +13,7 @@ const booking: Booking = {
   end: "2026-11-14T15:00:00-05:00",
   display: "Sat 14 Nov, 2:30 pm EST",
   status: "confirmed",
-  customer: { displayName: "Maya Lopez-Hart", verified: false },
+  customer: customerOf("Maya Lopez-Hart", false),
   agent: { name: "claude-ai" },
   depositCents: 1000,
   createdAt: "2026-11-07T12:00:00-05:00",

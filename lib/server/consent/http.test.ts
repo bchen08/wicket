@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ApiError, ApprovalView, ApproveResponse, DeclineResponse } from "../../types/frontdesk";
 import { book, type FrontDeskDeps } from "../frontdesk/service";
-import { approvalToken, memoryDeps, PHONE_E164, recordingNotifier } from "../frontdesk/test-support";
+import { approvalToken, customerOf, memoryDeps, PHONE_E164, recordingNotifier } from "../frontdesk/test-support";
 import { approvalApprovePost, approvalDeclinePost, approvalGet } from "./http";
 
 // The approval routes' HTTP handlers (what app/api/approvals/[token]/* call), on in-memory deps.
@@ -26,7 +26,7 @@ function post(token: string, path: "approve" | "decline", body?: unknown, header
 }
 
 describe("approval routes: the flow over HTTP", () => {
-  it("GET view → POST approve with no body → 200 confirmed, verified, no phone; the owner is alerted once", async () => {
+  it("GET view → POST approve with no body → 200 confirmed, approved, no phone; the owner is alerted once", async () => {
     const { getDeps, token, booking, notifier } = await setup();
     const view = await approvalGet(getDeps, token);
     expect(view.status).toBe(200);
@@ -39,22 +39,22 @@ describe("approval routes: the flow over HTTP", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store");
     const { booking: approved } = (await res.json()) as ApproveResponse;
-    expect(approved).toMatchObject({ id: booking.id, status: "confirmed", customer: { displayName: "Maya", verified: true } });
-    expect(approved.customer).not.toHaveProperty("phoneLast4");
+    expect(approved).toMatchObject({ id: booking.id, status: "confirmed", customer: customerOf("Maya", true) });
+    expect(approved.customer).not.toHaveProperty("phone");
     expect(notifier.alerts).toHaveLength(1);
     expect(((await (await approvalGet(getDeps, token)).json()) as ApprovalView).status).toBe("approved");
   });
 
-  it("POST approve with {} or a phone (separators ignored) → 200; phoneLast4 only with a phone", async () => {
+  it("POST approve with {} or a phone (separators ignored) → 200; customer.phone only with a phone", async () => {
     const empty = await setup();
     const res = await approvalApprovePost(empty.getDeps, post(empty.token, "approve", {}), empty.token);
     expect(res.status).toBe(200);
-    expect(((await res.json()) as ApproveResponse).booking.customer).toEqual({ displayName: "Maya", verified: true });
+    expect(((await res.json()) as ApproveResponse).booking.customer).toEqual(customerOf("Maya", true));
 
     const withPhone = await setup();
     const res2 = await approvalApprovePost(withPhone.getDeps, post(withPhone.token, "approve", { phone: "+1 (401) 555-0123" }), withPhone.token);
     expect(res2.status).toBe(200);
-    expect(((await res2.json()) as ApproveResponse).booking.customer).toEqual({ displayName: "Maya", verified: true, phoneLast4: "0123" });
+    expect(((await res2.json()) as ApproveResponse).booking.customer).toEqual(customerOf("Maya", true, PHONE_E164));
   });
 
   it("POST decline → 200 cancelled; again → 409 approval_closed", async () => {
@@ -155,5 +155,112 @@ describe("approval routes: errors and status codes", () => {
     const body = (await res.json()) as ApiError;
     expect(body.error.code).toBe("internal");
     expect(JSON.stringify(body)).not.toContain("DATABASE_URL");
+  });
+});
+
+// ---- Plain HTML form posts from the approval page (/approve/[token]) ----
+
+/** A form post from the approval page: application/x-www-form-urlencoded. */
+function formPost(token: string, path: "approve" | "decline", fields: Record<string, string> = {}): Request {
+  return new Request(`${BASE}/api/approvals/${token}/${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+/** The 303's Location, after checking the status. */
+function seeOther(res: Response): string {
+  expect(res.status).toBe(303);
+  expect(res.headers.get("cache-control")).toBe("no-store");
+  return res.headers.get("location") ?? "";
+}
+
+describe("approval routes: form posts from the approval page", () => {
+  it("approve with a phone (separators ignored) → 303 back to the page; the booking is confirmed with the phone", async () => {
+    const { deps, getDeps, token, booking, notifier } = await setup();
+    const res = await approvalApprovePost(getDeps, formPost(token, "approve", { phone: "+1 (401) 555-0123" }), token);
+    expect(seeOther(res)).toBe(`${BASE}/approve/${token}`);
+    const stored = await deps.store.getBooking(booking.id);
+    expect(stored).toMatchObject({ status: "confirmed", customer: customerOf("Maya", true, PHONE_E164) });
+    expect(notifier.alerts).toHaveLength(1);
+    // The page then shows the new status.
+    expect(((await (await approvalGet(getDeps, token)).json()) as ApprovalView).status).toBe("approved");
+  });
+
+  it("approve with an empty phone field, or none → 303; confirmed without a phone", async () => {
+    for (const fields of [{ phone: "" }, {}] as Record<string, string>[]) {
+      const { deps, getDeps, token, booking } = await setup();
+      expect(seeOther(await approvalApprovePost(getDeps, formPost(token, "approve", fields), token))).toBe(`${BASE}/approve/${token}`);
+      const stored = await deps.store.getBooking(booking.id);
+      expect(stored).toMatchObject({ status: "confirmed", customer: { approved: true } });
+      expect(stored?.customer).not.toHaveProperty("phone");
+    }
+  });
+
+  it("approve accepts multipart/form-data too", async () => {
+    const { deps, getDeps, token, booking } = await setup();
+    const form = new FormData();
+    form.set("phone", PHONE_E164);
+    const request = new Request(`${BASE}/api/approvals/${token}/approve`, { method: "POST", body: form });
+    expect(seeOther(await approvalApprovePost(getDeps, request, token))).toBe(`${BASE}/approve/${token}`);
+    expect((await deps.store.getBooking(booking.id))?.customer.phone).toBe(PHONE_E164);
+  });
+
+  it("a bad phone → 303 with ?error=invalid_request, and nothing changes", async () => {
+    const { deps, getDeps, token, booking } = await setup();
+    const res = await approvalApprovePost(getDeps, formPost(token, "approve", { phone: "555-0123" }), token);
+    expect(seeOther(res)).toBe(`${BASE}/approve/${token}?error=invalid_request`);
+    expect((await deps.store.getBooking(booking.id))?.status).toBe("awaiting_approval");
+  });
+
+  it("decline → 303 back to the page; the booking is cancelled and the slot freed", async () => {
+    const { deps, getDeps, token, booking } = await setup();
+    expect(seeOther(await approvalDeclinePost(getDeps, formPost(token, "decline"), token))).toBe(`${BASE}/approve/${token}`);
+    expect((await deps.store.getBooking(booking.id))?.status).toBe("cancelled");
+    expect(((await (await approvalGet(getDeps, token)).json()) as ApprovalView).status).toBe("declined");
+  });
+
+  it("answering again, a lapsed hold or an unknown link → 303 with the error code; the page shows the status", async () => {
+    const { getDeps, token } = await setup();
+    await approvalDeclinePost(getDeps, formPost(token, "decline"), token);
+    expect(seeOther(await approvalApprovePost(getDeps, formPost(token, "approve"), token))).toBe(
+      `${BASE}/approve/${token}?error=approval_closed`,
+    );
+    const unknown = "y".repeat(43);
+    expect(seeOther(await approvalDeclinePost(getDeps, formPost(unknown, "decline"), unknown))).toBe(
+      `${BASE}/approve/${unknown}?error=booking_not_found`,
+    );
+  });
+
+  it("redirects on the request's origin, with the token encoded", async () => {
+    const { getDeps } = await setup();
+    const odd = "a b/c";
+    const request = new Request(`https://emergent.example/api/approvals/x/decline`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "",
+    });
+    expect(seeOther(await approvalDeclinePost(getDeps, request, odd))).toBe(
+      `https://emergent.example/approve/${encodeURIComponent(odd)}?error=booking_not_found`,
+    );
+  });
+
+  it("an error building deps → 303 with ?error=internal", async () => {
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const token = "z".repeat(43);
+      const res = await approvalApprovePost(
+        () => {
+          throw new Error("DATABASE_URL is not set");
+        },
+        formPost(token, "approve"),
+        token,
+      );
+      expect(seeOther(res)).toBe(`${BASE}/approve/${token}?error=internal`);
+    } finally {
+      console.error = quiet;
+    }
   });
 });

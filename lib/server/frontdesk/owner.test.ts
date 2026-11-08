@@ -15,7 +15,7 @@ import type {
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
 import { approveBooking } from "../consent/approvals";
-import { newApprovalToken, sha256Hex } from "../consent/crypto";
+import { newApprovalToken } from "../consent/crypto";
 import type { ManageAction } from "../engine/lifecycle";
 import { DepositExceedsPriceError } from "./catalog";
 import { ConfigurationError } from "./deps";
@@ -36,7 +36,7 @@ import {
   type OwnerOptions,
 } from "./http";
 import type { FrontDeskDeps } from "./service";
-import { memoryDeps, NOW } from "./test-support";
+import { customerOf, memoryDeps, NOW, PHONE_E164 } from "./test-support";
 
 // The owner routes, through the http.ts handlers the route files call (the routes only add
 // `await connection()` and read params). In-memory store; "now" is Mon 9 Nov 2026, noon in New York.
@@ -132,7 +132,7 @@ async function createHold(
     agentName: "test agent",
     depositCents: extra.depositCents ?? 1000,
     approveBy: new Date(deps.clock.now().getTime() + 10 * 60_000),
-    approvalTokenHash: sha256Hex(token),
+    approvalToken: token,
     mandate: null,
   });
   return { booking, token };
@@ -254,7 +254,7 @@ describe("owner auth on every owner route", () => {
       const body = (await res.json()) as ApiError;
       expect(body.error).toEqual({
         code: "unauthorized",
-        message: "Missing or invalid owner token.",
+        message: "Missing or wrong owner token.",
         next_action: "Send the header Authorization: Bearer <OWNER_API_TOKEN>.",
       });
       expect(JSON.stringify(body)).not.toContain(TOKEN);
@@ -262,25 +262,32 @@ describe("owner auth on every owner route", () => {
     }
   });
 
-  it.each(HANDLERS)("%s: 503 when OWNER_API_TOKEN is unset, even with a header, before building deps", async (_name, handler) => {
-    for (const configured of [undefined, "", "too-short"]) {
-      const getDeps = vi.fn(() => memoryDeps());
-      const res = await handler(getDeps, `Bearer ${TOKEN}`, { getToken: () => configured });
-      expect(res.status).toBe(503);
-      expect(res.headers.get("www-authenticate")).toBeNull();
-      const body = (await res.json()) as ApiError;
-      expect(body.error.code).toBe("internal");
-      expect(body.error.message).toMatch(/OWNER_API_TOKEN is (not set|too short)/);
-      expect(body.error.next_action).toMatch(/Set OWNER_API_TOKEN/);
-      expect(getDeps).not.toHaveBeenCalled();
+  it.each(HANDLERS)("%s: 401 saying to set OWNER_API_TOKEN when it's unset, whatever the header, before building deps", async (_name, handler) => {
+    for (const configured of [undefined, "", "  "]) {
+      for (const auth of [`Bearer ${TOKEN}`, "Bearer ", null]) {
+        const getDeps = vi.fn(() => memoryDeps());
+        const res = await handler(getDeps, auth, { getToken: () => configured });
+        expect(res.status).toBe(401);
+        const body = (await res.json()) as ApiError;
+        expect(body.error).toEqual({
+          code: "unauthorized",
+          message: "Owner access isn't set up on this deployment.",
+          next_action: "Owner access isn't set up: set OWNER_API_TOKEN in Vercel and redeploy.",
+        });
+        expect(getDeps).not.toHaveBeenCalled();
+      }
     }
   });
 
   it.each(HANDLERS)("%s: passes auth with the right token", async (_name, handler) => {
     const getDeps = vi.fn(() => memoryDeps());
     const res = await handler(getDeps, `Bearer ${TOKEN}`, OPTIONS);
-    expect([401, 503]).not.toContain(res.status);
+    expect(res.status).not.toBe(401);
     expect(getDeps).toHaveBeenCalledTimes(1);
+  });
+
+  it("a short token works: there's no minimum length", async () => {
+    await call<PoliciesResponse>(policiesGet(() => memoryDeps(), request("GET", "/policies", { auth: "Bearer abc" }), SHOP, { getToken: () => "abc" }));
   });
 
   it("reads OWNER_API_TOKEN from the environment on every request by default", async () => {
@@ -290,7 +297,7 @@ describe("owner auth on every owner route", () => {
     vi.stubEnv("OWNER_API_TOKEN", "a-different-token-0123456789");
     await apiError(policiesGet(() => deps, request("GET", "/policies"), SHOP), 401, "unauthorized");
     vi.stubEnv("OWNER_API_TOKEN", "");
-    await apiError(policiesGet(() => deps, request("GET", "/policies"), SHOP), 503, "internal");
+    await apiError(policiesGet(() => deps, request("GET", "/policies"), SHOP), 401, "unauthorized");
   });
 
   it("is a 500 internal envelope, without leaking the cause, when deps can't be built after auth", async () => {
@@ -800,13 +807,16 @@ describe("POST /api/shops/[shop]/services and PATCH /api/shops/[shop]/services/[
 // ---- Booking detail and actions ----
 
 describe("GET /api/shops/[shop]/bookings/[id]", () => {
-  it("returns a hold awaiting approval, unverified, with its booked event", async () => {
+  it("returns a hold awaiting approval, not yet approved, with its booked event and its approval link", async () => {
     const deps = memoryDeps();
-    const { booking } = await createHold(deps, FUTURE);
+    const { booking, token } = await createHold(deps, FUTURE);
     const body = await call<BookingDetailResponse>(detail(deps, booking.id));
-    expect(body.booking).toEqual(booking);
-    expect(body.booking).toMatchObject({ status: "awaiting_approval", customer: { displayName: "Pat Owner-Test", verified: false } });
-    expect(body.booking).not.toHaveProperty("approval");
+    // The link is on the request's origin, for the owner to copy.
+    expect(body.booking).toEqual({
+      ...booking,
+      approval: { url: `http://localhost/approve/${token}`, expiresAt: "2026-11-09T12:10:00-05:00" },
+    });
+    expect(body.booking).toMatchObject({ status: "awaiting_approval", customer: customerOf("Pat Owner-Test", false) });
     expect(body.events).toEqual([
       {
         id: expect.any(String),
@@ -819,22 +829,23 @@ describe("GET /api/shops/[shop]/bookings/[id]", () => {
     ]);
   });
 
-  it("shows the verified customer once the person approved", async () => {
+  it("shows the approved customer once the person approved", async () => {
     const deps = memoryDeps();
     const { booking, token } = await createHold(deps, FUTURE);
     await approve(deps, token, "+14015550123");
     const body = await call<BookingDetailResponse>(detail(deps, booking.id));
     expect(body.booking).toEqual({
       ...booking,
+      approval: undefined,
       status: "confirmed",
-      customer: { displayName: "Pat Owner-Test", verified: true, phoneLast4: "0123" },
+      customer: customerOf("Pat Owner-Test", true, PHONE_E164),
     });
     expect(body.events.map((e) => [e.type, e.actor, e.data])).toEqual([
       ["booked", "agent", { status: "awaiting_approval", agentName: "test agent" }],
       [
         "approved",
         "customer",
-        { from: "awaiting_approval", to: "confirmed", depositEffect: "none", depositCollected: false, phoneLast4: "0123" },
+        { from: "awaiting_approval", to: "confirmed", depositEffect: "none", depositCollected: false },
       ],
     ]);
   });
@@ -998,7 +1009,7 @@ describe("POST /api/shops/[shop]/bookings/[id]/cancel, /complete and /no-show (o
     const future = await createHold(deps, FUTURE);
     const started = await createHold(deps, PAST);
     const body = await call<OwnerBookingActionResponse>(act(deps, future.booking.id, "cancel"));
-    expect(body).toEqual({ booking: { ...future.booking, status: "cancelled" }, depositEffect: "released", depositCollected: false });
+    expect(body).toEqual({ booking: { ...future.booking, approval: undefined, status: "cancelled" }, depositEffect: "released", depositCollected: false });
     expect((await call<OwnerBookingActionResponse>(act(deps, started.booking.id, "cancel"))).booking.status).toBe("cancelled");
     expect((await deps.store.listEvents(future.booking.id)).map((e) => [e.type, e.actor])).toEqual([
       ["booked", "agent"],
@@ -1050,7 +1061,7 @@ describe("POST /api/shops/[shop]/bookings/[id]/cancel, /complete and /no-show (o
 });
 
 describe("GET /api/shops/[shop]/bookings (the owner's list)", () => {
-  it("shows holds awaiting approval, verified customers with their phone's last 4 digits, and expires lapsed holds", async () => {
+  it("shows holds awaiting approval with their links, approved customers with their phone numbers, and expires lapsed holds", async () => {
     const clock = movableClock();
     const deps = memoryDeps({ clock });
     const lapsing = await createHold(deps, "2026-11-14T09:00:00-05:00");
@@ -1060,13 +1071,26 @@ describe("GET /api/shops/[shop]/bookings (the owner's list)", () => {
     await approve(deps, confirmed.token, "+14015550123");
     clock.advance(5 * 60_000); // the first hold's deadline; the second still has 5 minutes
 
-    const body = await call<BookingsResponse>(bookingsResponse(() => deps, SHOP));
+    const body = await call<BookingsResponse>(bookingsResponse(() => deps, request("GET", "/bookings"), SHOP, OPTIONS));
     expect(body.bookings.map((b) => [b.id, b.status, b.customer])).toEqual([
-      [lapsing.booking.id, "expired", { displayName: "Pat Owner-Test", verified: false }],
-      [live.booking.id, "awaiting_approval", { displayName: "Pat Owner-Test", verified: false }],
-      [confirmed.booking.id, "confirmed", { displayName: "Pat Owner-Test", verified: true, phoneLast4: "0123" }],
+      [lapsing.booking.id, "expired", customerOf("Pat Owner-Test", false)],
+      [live.booking.id, "awaiting_approval", customerOf("Pat Owner-Test", false)],
+      [confirmed.booking.id, "confirmed", customerOf("Pat Owner-Test", true, PHONE_E164)],
     ]);
-    expect(body.bookings.every((b) => !("approval" in b))).toBe(true);
+    // Only the live hold carries its link, on the request's origin.
+    expect(body.bookings.map((b) => b.approval?.url ?? null)).toEqual([null, `http://localhost/approve/${live.token}`, null]);
+    expect(body.bookings[1].approval?.expiresAt).toBe("2026-11-09T12:15:00-05:00");
     expect((await deps.store.listEvents(lapsing.booking.id)).map((e) => e.type)).toEqual(["booked", "expired"]);
+  });
+
+  it("is an owner route: 401 without the token, saying to unlock the console, before building deps", async () => {
+    for (const auth of [null, "Bearer wrong-token", "Bearer "]) {
+      const getDeps = vi.fn(() => memoryDeps());
+      const error = await apiError(bookingsResponse(getDeps, request("GET", "/bookings", { auth }), SHOP, OPTIONS), 401, "unauthorized");
+      expect(error.next_action).toBe("Open /console/unlock and enter the shop's access code.");
+      expect(getDeps).not.toHaveBeenCalled();
+    }
+    const unset = await apiError(bookingsResponse(() => memoryDeps(), request("GET", "/bookings"), SHOP, { getToken: () => undefined }), 401, "unauthorized");
+    expect(unset.next_action).toBe("Owner access isn't set up: set OWNER_API_TOKEN in Vercel and redeploy.");
   });
 });

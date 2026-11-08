@@ -7,6 +7,7 @@ import type {
   BookingStatus,
   Mandate,
 } from "../../types/frontdesk";
+import { approvalPath } from "../consent/crypto";
 import { formatDisplay } from "../engine/availability";
 import type { TimeRange } from "./catalog";
 import { toRfc3339 } from "./time";
@@ -28,15 +29,15 @@ export type NewBooking = {
   depositCents: number;
   /** When the hold lapses (decide()'s approveBy). */
   approveBy: Date;
-  /** SHA-256 hex of the approval link's token. The token itself is never stored. */
-  approvalTokenHash: string;
+  /** The approval link's token (newApprovalToken), stored as it is so every booking response can carry the link. */
+  approvalToken: string;
   /** The person's limits as validated by book, or null. */
   mandate: Mandate | null;
 };
 
 // ---- Ring 1b: consent records ----
 
-/** An approval request (one per booking), found by its token's hash. */
+/** An approval request (one per booking), found by its token. */
 export type ApprovalRecord = {
   bookingId: string;
   /** null until the person approves or declines. */
@@ -79,9 +80,8 @@ export type NewBookingEvent = {
 export interface BookingStore {
   /**
    * Store a booking awaiting approval (status awaiting_approval, approve_by, mandate), its approval
-   * request (approvals: booking_id, token_hash) and its "booked" event (actor "agent", data
-   * { status: "awaiting_approval", agentName, mandate? }) in the same transaction. The returned
-   * Booking has no `approval` (the store can't know the token); book adds it.
+   * request (approvals: booking_id, token) and its "booked" event (actor "agent", data
+   * { status: "awaiting_approval", agentName, mandate? }) in the same transaction.
    * Throws SlotTakenError if the staff member already has an awaiting_approval, awaiting_deposit or
    * confirmed booking that overlaps [start, end), lapsed holds included: expire them first
    * (expireStaleHolds). In Postgres that's the `no_overlap` exclusion constraint (SQLSTATE 23P01).
@@ -125,8 +125,8 @@ export interface BookingStore {
   listEvents(bookingId: string): Promise<BookingEvent[]>;
   // ---- Ring 1b: consent (approvals) ----
 
-  /** The approval request whose token hashes to `tokenHash`, or null. Doesn't expire anything. */
-  findApproval(tokenHash: string): Promise<ApprovalRecord | null>;
+  /** The approval request with this token, or null. Doesn't expire anything. */
+  findApproval(token: string): Promise<ApprovalRecord | null>;
   /**
    * The person's answer, in one transaction: move the booking from awaiting_approval to nextStatus only
    * if approve_by > now (approved stores `phone` as customer_phone; cancelled stamps cancelled_at and
@@ -174,15 +174,28 @@ export type BookingRecord = {
   customerName: string;
   agentName: string;
   createdAt: Date;
-  /** true once the person approved the booking through the approval link (approvals.decision = approved). */
-  customerVerified: boolean;
+  /** true once the person tapped Approve on the approval link (approvals.decision = approved). */
+  customerApproved: boolean;
   /** The phone number the person gave when approving (E.164), or null. */
   customerPhone: string | null;
+  /** The approval link's token (approvals.token), or null for a booking without an approval request. */
+  approvalToken: string | null;
+  /** When the hold lapses (bookings.approve_by), or null. */
+  approveBy: Date | null;
   /** The shop's IANA zone; times are shown in it. */
   timezone: string;
 };
 
+/**
+ * The Booking for a stored record. While it is awaiting_approval it carries `approval`, whose url is only
+ * the path ("/approve/<token>"): the store doesn't know the request's origin. The service layer puts it
+ * in front (withApprovalOrigin in service.ts) before a booking leaves the server.
+ */
 export function toBooking(r: BookingRecord): Booking {
+  const approval =
+    r.status === "awaiting_approval" && r.approvalToken && r.approveBy
+      ? { approval: { url: approvalPath(r.approvalToken), expiresAt: toRfc3339(r.approveBy, r.timezone) } }
+      : {};
   return {
     id: r.id,
     shopSlug: r.shopSlug,
@@ -195,12 +208,14 @@ export function toBooking(r: BookingRecord): Booking {
     status: r.status,
     customer: {
       displayName: r.customerName,
-      verified: r.customerVerified,
-      ...(r.customerPhone ? { phoneLast4: r.customerPhone.slice(-4) } : {}),
+      approved: r.customerApproved,
+      verified: r.customerApproved,
+      ...(r.customerPhone ? { phone: r.customerPhone } : {}),
     },
     agent: { name: r.agentName },
     depositCents: r.depositCents,
     createdAt: toRfc3339(r.createdAt, r.timezone),
+    ...approval,
   };
 }
 

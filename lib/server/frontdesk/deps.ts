@@ -1,5 +1,4 @@
 import { systemClock } from "../clock";
-import type { ConsentConfig } from "../consent/config";
 import { createLogNotifier } from "../notify/log-notifier";
 import { createMemoryStore } from "./memory-store";
 import { createPostgresStore } from "./postgres-store";
@@ -12,9 +11,8 @@ import type { FrontDeskDeps } from "./service";
 //   unset, not on Vercel          → in-memory demo data (one console warning)
 //   unset, on Vercel (VERCEL set) → configuration error; a deployment never serves fake data
 //
-// Consent (Ring 1b):
-//   PUBLIC_BASE_URL      the approval links' origin. Default: http://localhost:3000 locally,
-//                        https://${VERCEL_URL} on Vercel.
+// Approval links need no setting: each route sets deps.baseUrl to the origin of the request it serves
+// (withRequestOrigin in service.ts).
 
 /** Front Desk is deployed without the settings it needs. Surfaces as an `internal` error; the log says why. */
 export class ConfigurationError extends Error {
@@ -26,40 +24,8 @@ export class ConfigurationError extends Error {
 
 type Env = Record<string, string | undefined>;
 
-const LOCAL_BASE_URL = "http://localhost:3000";
-
-/** PUBLIC_BASE_URL, or its fallback, checked and without a trailing slash. */
-function publicBaseUrl(env: Env): string {
-  const configured = env.PUBLIC_BASE_URL?.trim();
-  const vercelUrl = env.VERCEL_URL?.trim();
-  let value: string;
-  if (configured) value = configured;
-  else if (!env.VERCEL) value = LOCAL_BASE_URL;
-  else if (vercelUrl) value = `https://${vercelUrl}`;
-  else {
-    throw new ConfigurationError(
-      "PUBLIC_BASE_URL is not set, and neither is VERCEL_URL. Set PUBLIC_BASE_URL in the Vercel project's environment " +
-        "variables to the deployment's origin, e.g. https://frontdesk.example.com. See docs/database.md.",
-    );
-  }
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new ConfigurationError(`PUBLIC_BASE_URL must be an absolute URL like https://frontdesk.example.com, got "${value}".`);
-  }
-  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.search !== "" || url.hash !== "" || url.username !== "") {
-    throw new ConfigurationError(
-      `PUBLIC_BASE_URL must be a plain http(s) origin (optionally with a path), without a query, fragment or credentials, got "${value}".`,
-    );
-  }
-  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
-}
-
-/** The consent settings from `env`. Throws ConfigurationError for a malformed setting. */
-export function consentConfigFromEnv(env: Env): ConsentConfig {
-  return { publicBaseUrl: publicBaseUrl(env) };
-}
+/** deps.baseUrl until a route sets it to its request's origin. */
+export const LOCAL_BASE_URL = "http://localhost:3000";
 
 /** Build deps from `env`, without caching. Exported for tests; the app uses getFrontDeskDeps(). */
 export function createFrontDeskDeps(env: Env, warn: (message: string) => void = console.warn): FrontDeskDeps {
@@ -73,17 +39,17 @@ export function createFrontDeskDeps(env: Env, warn: (message: string) => void = 
         "to the Supabase transaction pooler connection string (port 6543). See docs/database.md.",
     );
   }
-  const consent = consentConfigFromEnv(env);
+  const baseUrl = LOCAL_BASE_URL;
   if (url) {
     const db = createPostgresStore(url);
-    return { clock, notifier, consent, catalog: db, store: db };
+    return { clock, notifier, baseUrl, catalog: db, store: db };
   }
   warn(
     "[frontdesk] DATABASE_URL is not set: using in-memory demo data. Bookings are lost when the server restarts. " +
       "See docs/database.md to use Postgres.",
   );
   const memory = createMemoryStore({ clock });
-  return { clock, notifier, consent, catalog: memory, store: memory };
+  return { clock, notifier, baseUrl, catalog: memory, store: memory };
 }
 
 // Cached on globalThis, not in a module variable: Next.js can load this module once per route

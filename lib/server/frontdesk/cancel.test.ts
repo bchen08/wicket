@@ -12,7 +12,7 @@ import {
   getPolicies,
   type FrontDeskDeps,
 } from "./service";
-import { approvalToken, approveAsCustomer, memoryDeps, NOW, SAT, withCatalog } from "./test-support";
+import { approvalToken, approveAsCustomer, customerOf, memoryDeps, NOW, PHONE_E164, SAT, withCatalog } from "./test-support";
 
 // The agent's cancel, get_booking and get_policies use cases against the in-memory store. "Now" is
 // Mon 9 Nov 2026, noon in New York. Hart's cancel window is 24 hours; haircut has a $10 deposit,
@@ -54,14 +54,14 @@ async function holdAt(deps: FrontDeskDeps, start: string, service_id = "haircut"
   return booking;
 }
 
-/** The booking without its approval link, as every read after book shows it. */
+/** The booking without its approval link, as it is once it's no longer awaiting approval. */
 function withoutLink(booking: Booking): Booking {
   const rest = { ...booking };
   delete rest.approval;
   return rest;
 }
 
-/** A hold awaiting approval, as reads show it (no link). */
+/** A hold awaiting approval, without its link: what it becomes after a change, minus the new status. */
 async function bookAt(deps: FrontDeskDeps, start: string, service_id = "haircut"): Promise<Booking> {
   return withoutLink(await holdAt(deps, start, service_id));
 }
@@ -70,7 +70,7 @@ let phoneSeq = 0;
 /** A different phone number for each approval. */
 const nextPhone = () => `+1401555${String(1000 + (phoneSeq++ % 9000))}`;
 
-/** A booking the person approved: confirmed, with a verified customer. */
+/** A booking the person approved: confirmed, customer.approved true. */
 async function confirmedAt(deps: FrontDeskDeps, start: string, service_id = "haircut"): Promise<Booking> {
   return approveAsCustomer(deps, await holdAt(deps, start, service_id), nextPhone());
 }
@@ -257,10 +257,10 @@ describe("cancelBooking", () => {
     expect(types).toEqual(["booked", "cancelled"]);
   });
 
-  it("ignores an idempotency_key an older agent still sends", async () => {
+  it("ignores an argument it doesn't know, e.g. the retry key Ring 1a agents still send", async () => {
     const deps = memoryDeps();
     const booking = await bookAt(deps, at("14:30"));
-    const args = { booking_id: booking.id, idempotency_key: "cancel-key-0001" } as unknown as CancelInput;
+    const args = { booking_id: booking.id, retry_key: "cancel-key-0001" } as unknown as CancelInput;
     expect((await cancelBooking(deps, "harts", args)).booking.status).toBe("cancelled");
   });
 
@@ -303,7 +303,7 @@ describe("cancelBooking", () => {
         at: "2026-11-09T12:00:00-05:00",
         actor: "customer",
         type: "approved",
-        data: { from: "awaiting_approval", to: "confirmed", depositEffect: "none", depositCollected: false, phoneLast4: "0123" },
+        data: { from: "awaiting_approval", to: "confirmed", depositEffect: "none", depositCollected: false },
       },
       {
         id: expect.any(String),
@@ -330,17 +330,16 @@ describe("cancelBooking", () => {
 });
 
 describe("getBooking", () => {
-  it("returns the booking as book returned it, without the approval link", async () => {
+  it("returns the booking as book returned it, with the same approval link", async () => {
     const deps = memoryDeps();
-    const held = await holdAt(deps, at("14:30"));
-    const booking = withoutLink(held);
-    expect(held.approval).toBeDefined();
+    const booking = await holdAt(deps, at("14:30"));
+    expect(booking.approval?.url).toMatch(/^http:\/\/localhost:3000\/approve\/[A-Za-z0-9_-]{43}$/);
     expect(await getBooking(deps, "harts", { booking_id: booking.id })).toEqual({ booking, declined: false });
     // Ids are UUIDs: case and surrounding spaces don't matter.
     expect(await getBooking(deps, "harts", { booking_id: ` ${booking.id.toUpperCase()} ` })).toEqual({ booking, declined: false });
   });
 
-  it("reports what the person did: approved → confirmed and verified, declined → cancelled, lapsed → expired", async () => {
+  it("reports what the person did: approved → confirmed (customer.approved), declined → cancelled, lapsed → expired", async () => {
     const clock = mutableClock();
     const deps = memoryDeps({ clock });
     const approved = await holdAt(deps, at("10:00"));
@@ -355,10 +354,10 @@ describe("getBooking", () => {
 
     const read = (id: string) => getBooking(deps, "harts", { booking_id: id });
     expect(await read(approved.id)).toMatchObject({
-      booking: { status: "confirmed", customer: { displayName: "Maya", verified: true, phoneLast4: "0123" } },
+      booking: { status: "confirmed", customer: customerOf("Maya", true, PHONE_E164) },
       declined: false,
     });
-    expect(await read(declined.id)).toMatchObject({ booking: { status: "cancelled", customer: { verified: false } }, declined: true });
+    expect(await read(declined.id)).toMatchObject({ booking: { status: "cancelled", customer: { approved: false } }, declined: true });
     expect(await read(cancelledByAgent.id)).toMatchObject({ booking: { status: "cancelled" }, declined: false });
     expect(await read(lapsed.id)).toMatchObject({ booking: { status: "expired" }, declined: false });
     // The read itself recorded the lapse, once.

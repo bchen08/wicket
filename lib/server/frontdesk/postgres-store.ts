@@ -93,8 +93,10 @@ type BookingRow = {
   customer_name: string;
   agent_name: string;
   created_at: Date;
-  customer_verified: boolean;
+  customer_approved: boolean;
   customer_phone: string | null;
+  approval_token: string | null;
+  approve_by: Date | null;
   timezone: string;
 };
 
@@ -112,8 +114,10 @@ function toRecord(r: BookingRow): BookingRecord {
     customerName: r.customer_name,
     agentName: r.agent_name,
     createdAt: r.created_at,
-    customerVerified: r.customer_verified,
+    customerApproved: r.customer_approved,
     customerPhone: r.customer_phone,
+    approvalToken: r.approval_token,
+    approveBy: r.approve_by,
     timezone: r.timezone,
   };
 }
@@ -199,12 +203,14 @@ const tstzrange = (db: Db, range: TimeRange) =>
 
 /**
  * The columns of a Booking. `b` is bookings or a CTE with the same columns; depositCents is the
- * booking's own snapshot, and the service name and verified customer are joined in by bookingJoins.
+ * booking's own snapshot, and the service name and the approval (decision, token) are joined in by
+ * bookingJoins.
  */
 const bookingColumns = (db: Db) => db`
   b.id::text as id, b.shop_slug, b.service_id, sv.name as service_name, b.deposit_cents,
   b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at, b.status,
-  b.customer_name, b.agent_name, b.created_at, coalesce(ap.decision = 'approved', false) as customer_verified, b.customer_phone, sh.timezone
+  b.customer_name, b.agent_name, b.created_at, coalesce(ap.decision = 'approved', false) as customer_approved,
+  b.customer_phone, ap.token as approval_token, b.approve_by, sh.timezone
 `;
 const bookingJoins = (db: Db) => db`
   join services sv on sv.shop_slug = b.shop_slug and sv.id = b.service_id
@@ -244,7 +250,8 @@ async function insertBooking(db: Db, input: NewBooking): Promise<Booking> {
       )
       returning *
     ), a as (
-      insert into approvals (booking_id, token_hash) select id, ${input.approvalTokenHash}::text from b
+      insert into approvals (booking_id, token) select id, ${input.approvalToken}::text from b
+      returning booking_id, token, decision
     ), e as (
       insert into events (booking_id, actor, type, data)
       select id, 'agent', 'booked',
@@ -252,7 +259,11 @@ async function insertBooking(db: Db, input: NewBooking): Promise<Booking> {
                || case when mandate is null then '{}'::jsonb else jsonb_build_object('mandate', mandate) end
       from b
     )
-    select ${bookingColumns(db)} from b ${bookingJoins(db)}
+    select ${bookingColumns(db)}
+    from b
+    join services sv on sv.shop_slug = b.shop_slug and sv.id = b.service_id
+    join shops sh on sh.slug = b.shop_slug
+    join a ap on ap.booking_id = b.id
   `;
   if (!rows[0]) throw new Error("Insert into bookings returned no row.");
   return toBooking(toRecord(rows[0]));
@@ -397,11 +408,11 @@ function bookingStoreOn(conn: Conn): BookingStore {
 
     // ---- Ring 1b: consent ----
 
-    async findApproval(tokenHash) {
+    async findApproval(token) {
       const rows = await db<{ booking_id: string; decision: "approved" | "declined" | null; approve_by: Date | null; mandate: Mandate | null }[]>`
         select a.booking_id::text as booking_id, a.decision, b.approve_by, b.mandate
         from approvals a join bookings b on b.id = a.booking_id
-        where a.token_hash = ${tokenHash}
+        where a.token = ${token}
       `;
       const r = rows[0];
       if (!r || !r.approve_by) return null;

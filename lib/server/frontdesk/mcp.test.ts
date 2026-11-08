@@ -18,9 +18,11 @@ import type { FrontDeskDeps } from "./service";
 import {
   approvalToken,
   approveAsCustomer,
+  customerOf,
   EXAMPLE_BOOKINGS,
   memoryDeps,
   NOW,
+  PHONE_E164,
   recordingNotifier,
   withCatalog,
 } from "./test-support";
@@ -91,13 +93,13 @@ function envelopeOf(result: ToolResult): ApiError["error"] {
   return (JSON.parse(result.content[0].text) as ApiError).error;
 }
 
-/** book's result without the approval link, as get_booking and every later read show it. */
+/** book's result without the approval link, as it is once it's no longer awaiting approval. */
 function withoutLink(booking: Booking): Booking {
   const copy = { ...booking };
   delete copy.approval;
   return copy;
 }
-/** An approval link: PUBLIC_BASE_URL (localhost in tests) + /approve/ + a 43-character base64url token. */
+/** An approval link: deps.baseUrl (localhost in tests) + /approve/ + a 43-character base64url token. */
 const APPROVAL_URL = /^http:\/\/localhost:3000\/approve\/[A-Za-z0-9_-]{43}$/;
 const SAT = { from: "2026-11-14T00:00:00-05:00", to: "2026-11-15T00:00:00-05:00" };
 const SLOT = "2026-11-14T14:30:00-05:00";
@@ -109,7 +111,7 @@ const bookArgs = (extra: Record<string, unknown> = {}) => ({
 });
 
 describe("MCP /api/mcp", () => {
-  it("lists six tools: four read-only reads, book (not idempotent, not destructive), cancel (destructive, idempotent)", async () => {
+  it("lists six tools with their annotations: four read-only reads, book (not destructive) and cancel (destructive)", async () => {
     const tools = await listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "book",
@@ -149,15 +151,15 @@ describe("MCP /api/mcp", () => {
     expect(avail.inputSchema.properties?.from?.format).toBe("date-time");
   });
 
-  it("advertises the required fields and booking_id in the input schemas; no idempotency_key", async () => {
+  it("advertises the required fields and booking_id in the input schemas, and nothing else", async () => {
     const tools = await listTools();
     const schema = (name: string) => tools.find((t) => t.name === name)!.inputSchema;
     expect([...(schema("book").required ?? [])].sort()).toEqual(["customer_name", "service_id", "start"]);
     expect(schema("cancel").required).toEqual(["booking_id"]);
     expect(schema("get_booking").required).toEqual(["booking_id"]);
-    for (const name of ["book", "cancel"]) {
-      expect(schema(name).properties).not.toHaveProperty("idempotency_key");
-    }
+    // Exactly the contract's arguments: no retry key, no phone code.
+    expect(Object.keys(schema("book").properties ?? {}).sort()).toEqual(["customer_name", "mandate", "service_id", "start"]);
+    expect(Object.keys(schema("cancel").properties ?? {})).toEqual(["booking_id"]);
     for (const name of ["get_booking", "cancel"]) {
       expect(schema(name).properties?.booking_id).toMatchObject({ type: "string" });
     }
@@ -173,7 +175,8 @@ describe("MCP /api/mcp", () => {
     expect(description("get_booking")).toMatch(/awaiting_approval/);
     expect(description("get_booking")).toMatch(/confirmed \(approved/);
     expect(description("get_booking")).toMatch(/expired \(the hold ran out/);
-    expect(description("get_booking")).toMatch(/never includes the approval link/);
+    expect(description("get_booking")).toMatch(/booking\.approval\.url is the link to send them again/);
+    expect(description("get_booking")).toMatch(/customer\.approved is true/);
     expect(description("cancel")).toMatch(/awaiting approval can be cancelled any time/);
     expect(description("cancel")).toMatch(/cancelWindowHours/);
     expect(description("cancel")).toMatch(/not_cancellable/);
@@ -181,9 +184,9 @@ describe("MCP /api/mcp", () => {
     for (const code of ["slot_taken", "too_soon", "too_far", "outside_hours", "paused", "outside_mandate"]) {
       expect(description("book")).toContain(code);
     }
-    // No codes and no idempotency keys any more.
+    // No codes and no retry keys any more, and the customer is "approved", never anything stronger.
     for (const name of ["book", "cancel", "get_booking"]) {
-      expect(description(name)).not.toMatch(/idempotency|code texted|texted to their phone/);
+      expect(description(name)).not.toMatch(/\bkeys?\b|code texted|texted to their phone|verif/i);
     }
     // The server instructions: nothing is final until the person approves through the link.
     expect(SERVER_INSTRUCTIONS).toMatch(/No booking is final until the person approves it themselves/);
@@ -192,7 +195,8 @@ describe("MCP /api/mcp", () => {
     expect(SERVER_INSTRUCTIONS).toMatch(/get_booking to check the status/);
     expect(SERVER_INSTRUCTIONS).toMatch(/mandate/);
     expect(SERVER_INSTRUCTIONS).toMatch(/they open it and approve or decline/);
-    expect(SERVER_INSTRUCTIONS).not.toMatch(/idempotency|code texted/);
+    expect(SERVER_INSTRUCTIONS).not.toMatch(/\bkeys?\b|code texted|verif|identity/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/get_booking returns the same link again/);
   });
 
   it("list_services shows dollars in text and cents in structuredContent", async () => {
@@ -327,14 +331,14 @@ describe("MCP book tool", () => {
       end: "2026-11-14T15:00:00-05:00",
       display: "Sat 14 Nov, 2:30 pm EST",
       status: "awaiting_approval",
-      customer: { displayName: "Maya", verified: false },
+      customer: customerOf("Maya", false),
       agent: { name: "unknown agent" }, // 2025-era requests carry no clientInfo
       depositCents: 1000,
       createdAt: "2026-11-09T12:00:00-05:00",
       // Held for 10 minutes from now (Mon 9 Nov, noon).
       approval: { url: expect.stringMatching(APPROVAL_URL), expiresAt: "2026-11-09T12:10:00-05:00" },
     });
-    expect(booking.customer).not.toHaveProperty("phoneLast4");
+    expect(booking.customer).not.toHaveProperty("phone");
     const text = result.content[0].text;
     expect(text).toContain("Held Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. It is not confirmed yet.");
     expect(text).toContain(
@@ -432,13 +436,13 @@ describe("MCP get_booking and cancel", () => {
     // Calling book again (e.g. a retry) can't double-book: the hold is in the way.
     expect(envelopeOf(await callTool("book", bookArgs({ start }))).code).toBe("slot_taken");
 
-    // get_booking never shows the link, and says the person hasn't answered yet.
+    // get_booking shows the same link again, and says the person hasn't answered yet.
     const waiting = await callTool("get_booking", { booking_id: booking.id });
     expect(waiting.isError).toBeFalsy();
-    expect(waiting.structuredContent).toEqual({ booking: withoutLink(booking) } satisfies GetBookingResult);
+    expect(waiting.structuredContent).toEqual({ booking } satisfies GetBookingResult);
     expect(waiting.content[0].text).toContain("Status: awaiting_approval.");
-    expect(waiting.content[0].text).toContain("Waiting for Maya to approve with the link from book");
-    expect(waiting.content[0].text).not.toContain(approvalToken(booking));
+    expect(waiting.content[0].text).toContain(`Waiting for Maya to approve with this link: ${booking.approval!.url} (the hold lapses at `);
+    expect(waiting.content[0].text).toContain(approvalToken(booking));
 
     // The person approves through the link (giving their phone); get_booking reports it.
     const approved = await approveAsCustomer(deps, booking);
@@ -448,10 +452,10 @@ describe("MCP get_booking and cancel", () => {
     expect(approved).toEqual({
       ...withoutLink(booking),
       status: "confirmed",
-      customer: { displayName: "Maya", verified: true, phoneLast4: "0123" },
+      customer: customerOf("Maya", true, PHONE_E164),
     });
     expect(fetched.content[0].text).toContain("Status: confirmed.");
-    expect(fetched.content[0].text).toContain("Maya approved it (phone ending 0123). It is confirmed.");
+    expect(fetched.content[0].text).toContain("Maya approved it. It is confirmed.");
 
     const cancelled = await callTool("cancel", { booking_id: booking.id });
     expect(cancelled.isError).toBeFalsy();

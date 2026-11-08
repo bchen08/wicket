@@ -1,11 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  isWellFormedToken,
-  last4,
-  newApprovalToken,
-  normalizePhone,
-  sha256Hex,
-} from "./crypto";
+import { approvalPath, isWellFormedToken, newApprovalToken, normalizePhone } from "./crypto";
 
 describe("approval tokens", () => {
   it("are 32 random bytes as base64url: 43 URL-safe characters, never repeated", () => {
@@ -26,8 +20,9 @@ describe("approval tokens", () => {
     }
   });
 
-  it("are stored as their SHA-256 hex", () => {
-    expect(sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  it("go in the approval page's path", () => {
+    const token = newApprovalToken();
+    expect(approvalPath(token)).toBe(`/approve/${token}`);
   });
 });
 
@@ -47,8 +42,4 @@ describe("phone numbers", () => {
       expect(normalizePhone(input)).toBeNull();
     },
   );
-
-  it("last4 is the last four digits", () => {
-    expect(last4("+14015550123")).toBe("0123");
-  });
 });

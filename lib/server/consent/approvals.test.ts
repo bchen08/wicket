@@ -4,7 +4,7 @@ import type { Clock } from "../clock";
 import { FrontDeskError } from "../frontdesk/errors";
 import type { MemoryStore } from "../frontdesk/memory-store";
 import { book, cancelBooking, getAvailability, getBooking, type FrontDeskDeps } from "../frontdesk/service";
-import { approvalToken, memoryDeps, NOW, PHONE_E164, recordingNotifier, SAT } from "../frontdesk/test-support";
+import { approvalToken, customerOf, memoryDeps, NOW, PHONE_E164, recordingNotifier, SAT } from "../frontdesk/test-support";
 import { approveBooking, declineBooking, getApprovalView } from "./approvals";
 import { newApprovalToken } from "./crypto";
 
@@ -116,7 +116,7 @@ describe("GET view", () => {
 });
 
 describe("approve", () => {
-  it("with no body → confirmed, verified, no phone; owner notified exactly once; history booked → approved", async () => {
+  it("with no body → confirmed, approved, no phone; owner notified exactly once; history booked → approved", async () => {
     const booking = await hold();
     expect(booking.status).toBe("awaiting_approval");
     expect(notifier.alerts).toHaveLength(0); // never for a hold
@@ -127,12 +127,12 @@ describe("approve", () => {
     expect(approved).toMatchObject({
       id: booking.id,
       status: "confirmed",
-      customer: { displayName: "Maya Lopez", verified: true },
+      customer: customerOf("Maya Lopez", true),
     });
-    expect(approved.customer).not.toHaveProperty("phoneLast4");
+    expect(approved.customer).not.toHaveProperty("phone");
     expect(approved).not.toHaveProperty("approval");
     expect(notifier.alerts).toHaveLength(1);
-    expect(notifier.alerts[0]).toMatchObject({ id: booking.id, status: "confirmed", customer: { verified: true } });
+    expect(notifier.alerts[0]).toMatchObject({ id: booking.id, status: "confirmed", customer: { approved: true } });
 
     // get_booking and the view agree; the history shows who did what.
     expect((await getBooking(deps, "harts", { booking_id: booking.id })).booking).toEqual(approved);
@@ -156,23 +156,23 @@ describe("approve", () => {
 
   it("with {} → confirmed without a phone, like no body", async () => {
     const { booking } = await approveBooking(deps, approvalToken(await hold()), {});
-    expect(booking.customer).toEqual({ displayName: "Maya Lopez", verified: true });
+    expect(booking.customer).toEqual(customerOf("Maya Lopez", true));
     expect(store.consentRows().bookings[0].customerPhone).toBeNull();
   });
 
-  it("with a phone (separators ignored) → stored as plain E.164; phoneLast4 shown; the approved event carries it", async () => {
+  it("with a phone (separators ignored) → stored as plain E.164 and shown as customer.phone", async () => {
     const booking = await hold();
     const { booking: approved } = await approveBooking(deps, approvalToken(booking), { phone: "+1 (401) 555-0123" });
-    expect(approved.customer).toEqual({ displayName: "Maya Lopez", verified: true, phoneLast4: "0123" });
+    expect(approved.customer).toEqual(customerOf("Maya Lopez", true, PHONE_E164));
     expect(store.consentRows().bookings.find((b) => b.id === booking.id)?.customerPhone).toBe(PHONE_E164);
-    expect((await store.listEvents(booking.id))[1].data).toMatchObject({ phoneLast4: "0123" });
-    expect((await getBooking(deps, "harts", { booking_id: booking.id })).booking.customer.phoneLast4).toBe("0123");
+    expect((await store.listEvents(booking.id))[1].data).not.toHaveProperty("phone");
+    expect((await getBooking(deps, "harts", { booking_id: booking.id })).booking.customer.phone).toBe(PHONE_E164);
   });
 
   it("treats a null or empty phone as none", async () => {
     for (const phone of [null, ""]) {
       const { booking } = await approveBooking(deps, approvalToken(await hold(phone === null ? SAT_1400 : SAT_1500)), { phone });
-      expect(booking.customer).toEqual({ displayName: "Maya Lopez", verified: true });
+      expect(booking.customer).toEqual(customerOf("Maya Lopez", true));
     }
   });
 
@@ -206,7 +206,7 @@ describe("approve", () => {
     const second = await hold(SAT_1500, { name: "Lee" });
     await approveBooking(deps, approvalToken(first), { phone: PHONE_E164 });
     expect((await getApprovalView(deps, approvalToken(second))).status).toBe("pending");
-    expect((await getBooking(deps, "harts", { booking_id: second.id })).booking.customer).toEqual({ displayName: "Lee", verified: false });
+    expect((await getBooking(deps, "harts", { booking_id: second.id })).booking.customer).toEqual(customerOf("Lee", false));
   });
 
   it("at approveBy exactly → approval_expired: ask your agent to book again; nothing is notified", async () => {
@@ -224,7 +224,7 @@ describe("decline", () => {
     const booking = await hold();
     expect(await offeredStarts()).not.toContain(SAT_1400);
     const { booking: declined } = await declineBooking(deps, approvalToken(booking));
-    expect(declined).toMatchObject({ status: "cancelled", customer: { verified: false } });
+    expect(declined).toMatchObject({ status: "cancelled", customer: { approved: false } });
     expect(store.lifecycleStamps(booking.id)?.cancelledBy).toBe("customer");
     expect(await offeredStarts()).toContain(SAT_1400);
     expect(notifier.alerts).toHaveLength(0);

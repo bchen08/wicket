@@ -2,8 +2,7 @@
 import type { Booking, Policies } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
 import { approveBooking } from "../consent/approvals";
-import type { ConsentConfig } from "../consent/config";
-import { newApprovalToken, sha256Hex } from "../consent/crypto";
+import { newApprovalToken } from "../consent/crypto";
 import type { Notifier } from "../notify/notifier";
 import type { NewBooking } from "./booking-store";
 import type { NewBlock, ShopCatalog } from "./catalog";
@@ -43,24 +42,24 @@ export const EXAMPLE_BOOKINGS: InitialBooking[] = [
   },
 ];
 
-/** The consent settings tests use: localhost links. */
-export const TEST_CONSENT: ConsentConfig = Object.freeze({ publicBaseUrl: "http://localhost:3000" });
+/** The origin approval links point at in tests (deps.baseUrl). */
+export const TEST_BASE_URL = "http://localhost:3000";
 
 /** A test phone number (E.164) and another one. */
 export const PHONE_E164 = "+14015550123";
 export const OTHER_PHONE_E164 = "+14015550199";
 
-/** `base` with the Ring 1b consent deps (TEST_CONSENT) unless it has them. */
-export function withConsent(base: Omit<FrontDeskDeps, "consent"> & Partial<Pick<FrontDeskDeps, "consent">>): FrontDeskDeps {
-  return { consent: TEST_CONSENT, ...base };
+/** `base` with deps.baseUrl = TEST_BASE_URL unless it has one. */
+export function withBaseUrl(base: Omit<FrontDeskDeps, "baseUrl"> & Partial<Pick<FrontDeskDeps, "baseUrl">>): FrontDeskDeps {
+  return { baseUrl: TEST_BASE_URL, ...base };
 }
 
 /** The consent fields createBooking needs, for tests that call the store directly. */
-export function holdFields(approveBy: Date): Pick<NewBooking, "approveBy" | "approvalTokenHash" | "mandate"> {
-  return { approveBy, approvalTokenHash: sha256Hex(newApprovalToken()), mandate: null };
+export function holdFields(approveBy: Date): Pick<NewBooking, "approveBy" | "approvalToken" | "mandate"> {
+  return { approveBy, approvalToken: newApprovalToken(), mandate: null };
 }
 
-/** The token in a booking's approval link (book's result only). */
+/** The token in a booking's approval link (any booking awaiting approval carries it). */
 export function approvalToken(booking: Booking): string {
   const url = booking.approval?.url;
   if (!url) throw new Error(`Booking ${booking.id} has no approval link.`);
@@ -69,11 +68,19 @@ export function approvalToken(booking: Booking): string {
 
 /**
  * Approve a booking the way the person would, through the approval use case: open the link and
- * approve, giving `phone` (none when null). `booking` must be book's result (it carries the link).
+ * approve, giving `phone` (none when null). `booking` must be awaiting approval (it carries the link).
  * Returns the confirmed booking.
  */
 export async function approveAsCustomer(deps: FrontDeskDeps, booking: Booking, phone: string | null = PHONE_E164): Promise<Booking> {
   return (await approveBooking(deps, approvalToken(booking), phone === null ? {} : { phone })).booking;
+}
+
+/**
+ * A Booking.customer as the API returns it. `verified` is the deprecated copy of `approved`, kept for one
+ * release; this is the one place tests spell it.
+ */
+export function customerOf(displayName: string, approved: boolean, phone?: string): Booking["customer"] {
+  return { displayName, approved, verified: approved, ...(phone ? { phone } : {}) };
 }
 
 /** A notifier that remembers what it was told. */
@@ -103,8 +110,8 @@ export function withCatalog(
 
 /**
  * Deps backed by a fresh in-memory store and a fixed clock. `policies` is merged over Hart's seeded
- * policies; `initialBookings` and `initialBlocks` exist before the first call. Consent: TEST_CONSENT
- * (merged with `consent`).
+ * policies; `initialBookings` and `initialBlocks` exist before the first call. Approval links point at
+ * `baseUrl` (default TEST_BASE_URL).
  */
 export function memoryDeps(
   options: {
@@ -113,7 +120,7 @@ export function memoryDeps(
     initialBookings?: InitialBooking[];
     policies?: Partial<Policies>;
     initialBlocks?: NewBlock[];
-    consent?: Partial<ConsentConfig>;
+    baseUrl?: string;
   } = {},
 ): FrontDeskDeps {
   const clock = options.clock ?? fixedClock(NOW);
@@ -128,6 +135,6 @@ export function memoryDeps(
     catalog: store,
     store,
     notifier: options.notifier ?? recordingNotifier(),
-    consent: { ...TEST_CONSENT, ...options.consent },
+    baseUrl: options.baseUrl ?? TEST_BASE_URL,
   };
 }

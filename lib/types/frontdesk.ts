@@ -50,7 +50,8 @@ export type Slot = {
  * - `paused`: the owner paused bookings. details.phone is the shop's phone number (or null).
  * - `booking_not_found`: no booking with that id at this shop.
  * - `not_cancellable`: the booking is already final, or its start has passed. details.status.
- * - `unauthorized`: an owner route without a valid `Authorization: Bearer` token.
+ * - `unauthorized`: an owner route without `Authorization: Bearer <OWNER_API_TOKEN>` or the fd_owner cookie, or
+ *   the deployment has no OWNER_API_TOKEN set. next_action says which.
  * - `outside_mandate`: book refused a booking outside the person's mandate. details.field is
  *   "price_cap", "deposit_cap" or "window".
  * - `approval_expired`: the 10-minute hold lapsed before the person approved; the slot is free again.
@@ -242,7 +243,7 @@ export type BookingEvent = {
   type: BookingEventType;
   /**
    * Specifics. `booked`: { status, agentName, mandate? }. A transition: { from, to, depositEffect,
-   * depositCollected }; `approved` adds phoneLast4 when the person gave a phone number.
+   * depositCollected }.
    */
   data: Record<string, unknown>;
 };
@@ -282,13 +283,15 @@ export type Booking = {
   customer: {
     /** The name the agent gave for the customer. */
     displayName: string;
-    /** true once the person approved the booking through the approval link. */
+    /** true once the person tapped Approve on the approval link. */
+    approved: boolean;
+    /** @deprecated use approved; removed once the console reads approved (v0). */
     verified: boolean;
-    /** Last 4 digits of the phone number the person gave when approving, e.g. "0123". Absent if they gave none. */
-    phoneLast4?: string;
+    /** The phone number the person gave when approving, E.164, e.g. "+14015550123". Absent if they gave none. Not checked. */
+    phone?: string;
   };
   agent: {
-    /** Best-effort label for the AI agent that booked, e.g. the MCP client's name. Unverified. */
+    /** Best-effort label for the AI agent that booked: the MCP client's self-reported name. */
     name: string;
   };
   /** Deposit the service required when this booking was made, in integer cents. NOT collected until Ring 1c. 0 = none. */
@@ -296,13 +299,15 @@ export type Booking = {
   /** When the booking was made, RFC 3339. */
   createdAt: string;
   /**
-   * The link the person opens to approve or decline, and when the hold lapses. Present only while status
-   * is awaiting_approval, and only in book's result (and its idempotent replay): the link carries a
-   * secret token the server keeps only as a hash, so get_booking, the bookings list and the owner API
-   * never include it.
+   * The link the person opens to approve or decline, and when the hold lapses. Present while status is
+   * awaiting_approval, in every booking response: book, get_booking, the owner bookings list and booking
+   * detail. An agent that lost the link can fetch it again with get_booking; the owner can copy it.
    */
   approval?: {
-    /** `${PUBLIC_BASE_URL}/approve/<token>`. Send it to the person; anyone holding it can approve or decline. */
+    /**
+     * `<origin>/approve/<token>`, where origin is the origin of the request that returned it (so it works
+     * on previews and in production). Send it to the person; anyone holding it can approve or decline.
+     */
     url: string;
     /** When the hold lapses (book time + 10 minutes), RFC 3339 with the shop's offset. */
     expiresAt: string;
@@ -367,7 +372,10 @@ export type ServicesResponse = {
   services: Service[];
 };
 
-/** GET /api/shops/[shop]/bookings (public). Bookings from 7 days ago to 30 days ahead, any status, sorted by start. */
+/**
+ * GET /api/shops/[shop]/bookings (owner route: it includes customers' phone numbers). Bookings from 7 days
+ * ago to 30 days ahead, any status, sorted by start.
+ */
 export type BookingsResponse = {
   shop: Shop;
   bookings: Booking[];
@@ -375,21 +383,25 @@ export type BookingsResponse = {
 
 // ---- Owner session (stub; TODO(ring-2): owner sign-in by texted code replaces it) ----
 
-/** POST /api/owner/session body. On success the answer sets the HttpOnly fd_owner cookie. */
+/**
+ * POST /api/owner/session body, as JSON. The same route also takes a plain HTML form post with a `token`
+ * field (303 → /console, or → /console/unlock?error=1 on a wrong token). On success the answer sets the
+ * HttpOnly fd_owner cookie, which holds the token for 12 hours.
+ */
 export type OwnerSessionRequest = {
-  /** The deployment's OWNER_API_TOKEN. Never stored in the cookie or echoed back. */
+  /** The deployment's OWNER_API_TOKEN: the shop's access code. */
   token: string;
 };
 
 /** POST, GET and DELETE /api/owner/session. */
 export type OwnerSessionResponse = {
-  /** Whether this browser now holds a valid, unexpired owner session cookie. */
+  /** Whether this browser now holds an fd_owner cookie with the right token. */
   signedIn: boolean;
-  /** When the session ends, RFC 3339 in UTC (e.g. "2026-11-08T10:00:00Z"). Only when signedIn is true. */
+  /** When the cookie expires, RFC 3339 in UTC (e.g. "2026-11-08T10:00:00Z"). Only in POST's answer. */
   expiresAt?: string;
 };
 
-// ---- Owner routes (Authorization: Bearer <OWNER_API_TOKEN>, or the owner session cookie, until owner sign-in in Ring 2) ----
+// ---- Owner routes (Authorization: Bearer <OWNER_API_TOKEN>, or the fd_owner cookie, until owner sign-in in Ring 2) ----
 
 /** GET and PUT /api/shops/[shop]/policies. */
 export type PoliciesResponse = GetPoliciesResult;
@@ -467,6 +479,7 @@ export type BookingDetailResponse = {
 // ---- Approval page (public; the token in the path is the credential) ----
 // The page at /approve/[token] reads ApprovalView, then approves (ApproveRequest, optionally with the
 // person's phone number) or declines. Opening the link and tapping Approve is the consent.
+// The approve and decline routes take JSON, or a plain HTML form post (303 → /approve/<token>).
 // TODO(ring-1c): a code texted to the person's phone comes back once real texting ships.
 
 /**
@@ -493,7 +506,7 @@ export type ApprovalView = {
   depositCents: number;
   /** The shop's rules to show before the person approves. */
   policies: Pick<Policies, "cancelWindowHours" | "depositRule" | "lateCancelRule" | "noShowRule">;
-  /** Who asked for the booking: the agent's self-reported name. Unverified. */
+  /** Who asked for the booking: the agent's self-reported name. */
   agentName: string;
   /** The name the agent booked under. */
   customerName: string;
@@ -504,19 +517,18 @@ export type ApprovalView = {
 };
 
 /**
- * POST /api/approvals/[token]/approve body. Optional: an empty body (or none) approves too. Only while
- * the approval is pending.
+ * POST /api/approvals/[token]/approve body (JSON, or form fields). Optional: an empty body (or none)
+ * approves too. Only while the approval is pending.
  */
 export type ApproveRequest = {
   /**
    * The person's phone number, E.164, e.g. "+14015550123" (spaces, dashes, dots and parentheses are
-   * ignored). Stored with the booking for the shop; not verified. Booking.customer.phoneLast4 shows its
-   * last 4 digits.
+   * ignored). Stored with the booking for the shop as Booking.customer.phone; not checked.
    */
   phone?: string;
 };
 
-/** POST /api/approvals/[token]/approve response: the booking, now confirmed (customer.verified true). */
+/** POST /api/approvals/[token]/approve response: the booking, now confirmed (customer.approved true). */
 export type ApproveResponse = {
   booking: Booking;
 };

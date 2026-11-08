@@ -1,23 +1,21 @@
 import type { ApiError, OwnerSessionResponse } from "../../types/frontdesk";
 import { FrontDeskError } from "./errors";
-import { errorResponse } from "./http";
+import { errorResponse, isFormPost } from "./http";
 import {
   configuredOwnerToken,
-  OWNER_AUTH_CHALLENGE,
+  hasOwnerCookie,
+  NOT_SET_UP_NEXT_ACTION,
   OWNER_SESSION_COOKIE,
   OWNER_SESSION_MAX_AGE_S,
-  ownerSessionExpiry,
-  ownerSessionValue,
   ownerTokenMatches,
+  ownerUnauthorized,
 } from "./owner-auth";
 
-// The handlers behind POST, GET and DELETE /api/owner/session: the stub owner session. The owner's
-// console sends OWNER_API_TOKEN once; the answer sets the fd_owner cookie (HttpOnly, so page code
-// can't read it), and checkOwnerAuth accepts that cookie on every owner route.
-// The cookie holds an expiry and an HMAC of it keyed with the token, never the token itself.
-// MVP: no rate limit on sign-in attempts.
-// TODO(ring-2): owner sign-in by texted code replaces this; also move GET /api/shops/[shop]/bookings
-// behind owner auth then.
+// The handlers behind POST, GET and DELETE /api/owner/session: the stub owner session. The owner
+// enters the shop's access code (OWNER_API_TOKEN) once, at /console/unlock or as JSON; the answer sets
+// the fd_owner cookie to it (HttpOnly, so page code can't read it), and checkOwnerAuth accepts that
+// cookie on every owner route.
+// TODO(ring-2): owner sign-in by texted code replaces this.
 
 // Never cache: the answer depends on the caller's cookie.
 const NO_STORE = { "cache-control": "no-store" };
@@ -39,7 +37,7 @@ const SEND_TOKEN_NEXT_ACTION = 'Send a JSON object { "token": "<OWNER_API_TOKEN>
 export type OwnerSessionOptions = {
   /** The configured owner token. Defaults to reading process.env.OWNER_API_TOKEN on every request. */
   getToken?: () => string | undefined;
-  /** Wall-clock milliseconds. Defaults to Date.now. */
+  /** Wall-clock milliseconds, for expiresAt. Defaults to Date.now. */
   now?: () => number;
 };
 
@@ -49,14 +47,22 @@ function json(body: OwnerSessionResponse | ApiError, status: number, headers: Re
   return Response.json(body, { status, headers: { ...NO_STORE, ...headers } });
 }
 
+/** A 303 to `path` on the request's origin, with extra headers (e.g. Set-Cookie). */
+function seeOther(request: Request, path: string, headers: Record<string, string> = {}): Response {
+  return new Response(null, { status: 303, headers: { ...NO_STORE, ...headers, location: new URL(path, request.url).toString() } });
+}
+
 /** RFC 3339 in UTC, without milliseconds: "2026-11-08T10:00:00Z". */
 function rfc3339(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toISOString().replace(/\.000Z$/, "Z");
 }
 
-/** The Set-Cookie header for fd_owner. An empty value with Max-Age 0 clears it. */
+/**
+ * The Set-Cookie header for fd_owner: the token itself, URI-encoded. HttpOnly, SameSite=Lax, Path=/,
+ * Max-Age=43200, Secure except on plain-http localhost. An empty value with Max-Age 0 clears it.
+ */
 function sessionCookie(request: Request, value: string, maxAgeS: number): string {
-  const parts = [`${OWNER_SESSION_COOKIE}=${value}`, "Path=/", `Max-Age=${maxAgeS}`, "HttpOnly", "SameSite=Strict"];
+  const parts = [`${OWNER_SESSION_COOKIE}=${encodeURIComponent(value)}`, "Path=/", `Max-Age=${maxAgeS}`, "HttpOnly", "SameSite=Lax"];
   if (!isLocalHttp(request)) parts.push("Secure");
   return parts.join("; ");
 }
@@ -68,7 +74,7 @@ function invalidField(field: string, message: string): FrontDeskError {
   });
 }
 
-/** The `token` from a POST body, or invalid_request (400) naming what's wrong. */
+/** The `token` from a JSON POST body, or invalid_request (400) naming what's wrong. */
 function readToken(text: string): string {
   if (text.trim() === "") throw invalidField("body", "The request body is empty.");
   let body: unknown;
@@ -85,51 +91,52 @@ function readToken(text: string): string {
   return token;
 }
 
-function wrongToken(): ApiError {
-  return {
-    error: {
-      code: "unauthorized",
-      message: "Wrong owner token.",
-      next_action: "Check the deployment's OWNER_API_TOKEN, then send it again as { \"token\": \"…\" }.",
-    },
-  };
-}
-
 /**
- * POST /api/owner/session (OwnerSessionRequest) → OwnerSessionResponse, setting the fd_owner cookie.
- * Token not configured → 503; bad body → 400 invalid_request; wrong token → 401 unauthorized.
+ * POST /api/owner/session → sets the fd_owner cookie.
+ * - JSON (OwnerSessionRequest) → 200 OwnerSessionResponse; bad body → 400 invalid_request; wrong token,
+ *   or OWNER_API_TOKEN not set → 401 unauthorized.
+ * - Form post (`token` field) → 303 /console with the cookie; a wrong or missing token → 303
+ *   /console/unlock?error=1.
  */
 export async function ownerSessionPost(request: Request, options: OwnerSessionOptions = {}): Promise<Response> {
-  const configured = configuredOwnerToken((options.getToken ?? envToken)());
-  if (!configured.ok) return json(configured.body, configured.status, configured.headers);
+  const configured = (options.getToken ?? envToken)();
+  const cookie = () => {
+    const expiresAtS = Math.floor((options.now ?? Date.now)() / 1000) + OWNER_SESSION_MAX_AGE_S;
+    return { expiresAtS, header: sessionCookie(request, configuredOwnerToken(configured), OWNER_SESSION_MAX_AGE_S) };
+  };
 
+  if (isFormPost(request)) {
+    let given: FormDataEntryValue | null = null;
+    try {
+      given = (await request.formData()).get("token");
+    } catch {
+      // A malformed form body is a wrong token.
+    }
+    if (typeof given !== "string" || !ownerTokenMatches(given, configured)) return seeOther(request, "/console/unlock?error=1");
+    return seeOther(request, "/console", { "set-cookie": cookie().header });
+  }
+
+  if (configuredOwnerToken(configured) === "") {
+    const failure = ownerUnauthorized("Owner access isn't set up on this deployment.", NOT_SET_UP_NEXT_ACTION);
+    return json(failure.body, failure.status, failure.headers);
+  }
   let given: string;
   try {
     given = readToken(await request.text());
   } catch (err) {
     return errorResponse(err);
   }
-  if (!ownerTokenMatches(given, configured.token)) {
-    return json(wrongToken(), 401, { "www-authenticate": OWNER_AUTH_CHALLENGE });
+  if (!ownerTokenMatches(given, configured)) {
+    const failure = ownerUnauthorized("Wrong owner token.", 'Check the deployment\'s OWNER_API_TOKEN, then send it again as { "token": "…" }.');
+    return json(failure.body, failure.status, failure.headers);
   }
-
-  const expiresAtS = Math.floor((options.now ?? Date.now)() / 1000) + OWNER_SESSION_MAX_AGE_S;
-  const value = ownerSessionValue(configured.token, expiresAtS);
-  return json({ signedIn: true, expiresAt: rfc3339(expiresAtS) }, 200, {
-    "set-cookie": sessionCookie(request, value, OWNER_SESSION_MAX_AGE_S),
-  });
+  const { expiresAtS, header } = cookie();
+  return json({ signedIn: true, expiresAt: rfc3339(expiresAtS) }, 200, { "set-cookie": header });
 }
 
-/**
- * GET /api/owner/session → OwnerSessionResponse: whether this browser holds a valid, unexpired
- * session. Token not configured → 503, so the console can say so instead of offering a sign-in that
- * can't work.
- */
+/** GET /api/owner/session → OwnerSessionResponse: whether this browser holds an fd_owner cookie with the right token. */
 export function ownerSessionGet(request: Request, options: OwnerSessionOptions = {}): Response {
-  const configured = configuredOwnerToken((options.getToken ?? envToken)());
-  if (!configured.ok) return json(configured.body, configured.status, configured.headers);
-  const expiresAtS = ownerSessionExpiry(request, configured.token, (options.now ?? Date.now)());
-  return json(expiresAtS === null ? { signedIn: false } : { signedIn: true, expiresAt: rfc3339(expiresAtS) }, 200);
+  return json({ signedIn: hasOwnerCookie(request, (options.getToken ?? envToken)()) }, 200);
 }
 
 /** DELETE /api/owner/session → OwnerSessionResponse `{ signedIn: false }`, clearing the cookie. Always 200. */

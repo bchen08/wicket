@@ -12,6 +12,12 @@ Closes #
 - [ ]
 - [ ]
 
+## Security not built
+
+<!-- MVP rule (AGENTS.md): one line per security feature you think is needed but didn't build. "None" if there are none. -->
+
+-
+
 ## Checks
 
 - [ ] CI is green (lint · typecheck · build)

@@ -2,7 +2,7 @@ import { DateTime } from "luxon";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Policies } from "../../types/frontdesk";
 import { fixedClock } from "../clock";
-import { sha256Hex } from "../consent/crypto";
+import { newApprovalToken } from "../consent/crypto";
 import { expiredEventData, SlotTakenError, type NewBooking, type NewBookingEvent } from "./booking-store";
 import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
@@ -10,7 +10,7 @@ import { SEED } from "./memory-store";
 import { DEFAULT_POLICIES } from "./policies";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
 import { book } from "./service";
-import { holdFields, withConsent } from "./test-support";
+import { customerOf, holdFields, withBaseUrl } from "./test-support";
 
 // Runs against a real Postgres only when DATABASE_URL_TEST points at a database with
 // supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql and supabase/seed.sql applied
@@ -87,12 +87,16 @@ if (!url) {
       await closePostgresClients();
     });
 
-    it("0003 dropped idempotency_keys and left no customers or otp_challenges tables", async () => {
-      const [row] = await sql<{ keys: string | null; customers: string | null; otp: string | null }[]>`
-        select to_regclass('public.idempotency_keys')::text as keys, to_regclass('public.customers')::text as customers,
-               to_regclass('public.otp_challenges')::text as otp
+    it("0003 left no customers or otp_challenges tables, and approvals stores the token itself", async () => {
+      const [row] = await sql<{ customers: string | null; otp: string | null }[]>`
+        select to_regclass('public.customers')::text as customers, to_regclass('public.otp_challenges')::text as otp
       `;
-      expect(row).toEqual({ keys: null, customers: null, otp: null });
+      expect(row).toEqual({ customers: null, otp: null });
+      const columns = await sql<{ column_name: string }[]>`
+        select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'approvals' order by ordinal_position
+      `;
+      expect(columns.map((c) => c.column_name)).toEqual(["booking_id", "token", "created_at", "decided_at", "decision"]);
     });
 
     it("reads the seeded shop, services, split hours and policies", async () => {
@@ -151,7 +155,7 @@ if (!url) {
         .plus({ weeks: Math.floor(Math.random() * 4) })
         .set({ weekday: 6 });
       const start = saturday.set({ hour: 13, minute: 15 }).toISO()!;
-      const deps = withConsent({
+      const deps = withBaseUrl({
         catalog: store,
         store,
         clock: fixedClock(saturday.minus({ days: 1 }).toJSDate()),
@@ -182,9 +186,10 @@ if (!url) {
         serviceName: "Trim",
         depositCents: 777,
         status: "awaiting_approval",
-        customer: { displayName: "Postgres Test", verified: false },
+        customer: customerOf("Postgres Test", false),
+        // The store knows the token but not the request's origin: the link is a path until the service layer adds it.
+        approval: { url: `/approve/${fields.approvalToken}`, expiresAt: expect.stringMatching(/-0[45]:00$/) },
       });
-      expect(booking).not.toHaveProperty("approval"); // book adds the link; the store never knows the token
       const events = await store.listEvents(booking.id);
       expect(events).toEqual([
         {
@@ -196,15 +201,15 @@ if (!url) {
           data: { status: "awaiting_approval", agentName: "vitest" },
         },
       ]);
-      const [row] = await sql<{ approve_by: Date; mandate: unknown; customer_phone: string | null; token_hash: string; decision: string | null }[]>`
-        select b.approve_by, b.mandate, b.customer_phone, a.token_hash, a.decision
+      const [row] = await sql<{ approve_by: Date; mandate: unknown; customer_phone: string | null; token: string; decision: string | null }[]>`
+        select b.approve_by, b.mandate, b.customer_phone, a.token, a.decision
         from bookings b join approvals a on a.booking_id = b.id where b.id = ${booking.id}::uuid
       `;
       expect(row).toEqual({
         approve_by: HELD_UNTIL,
         mandate: null,
         customer_phone: null,
-        token_hash: fields.approvalTokenHash,
+        token: fields.approvalToken, // stored as it is
         decision: null,
       });
       expect(await store.getBooking(booking.id)).toEqual(booking);
@@ -226,7 +231,7 @@ if (!url) {
     it("transition() moves the status, writes its event and stamps the time, all in one statement", async () => {
       const booking = await store.createBooking(ours(at(2), at(2, 30)));
       const cancelled = await store.transition(booking.id, "awaiting_approval", "cancelled", cancelEvent("owner"));
-      expect(cancelled).toEqual({ ...booking, status: "cancelled" });
+      expect(cancelled).toEqual({ ...booking, approval: undefined, status: "cancelled" });
 
       const events = await store.listEvents(booking.id);
       expect(events.map((e) => [e.type, e.actor])).toEqual([
@@ -342,7 +347,7 @@ if (!url) {
       expect(await eventsOf(hold.id)).toEqual([["booked", "agent"]]);
 
       const expired = await store.refreshBooking(hold.id.toUpperCase(), DEADLINE); // the deadline itself counts
-      expect(expired).toEqual({ ...hold, status: "expired" });
+      expect(expired).toEqual({ ...hold, approval: undefined, status: "expired" });
       const events = await store.listEvents(hold.id);
       expect(events.map((e) => [e.type, e.actor])).toEqual([
         ["booked", "agent"],
@@ -351,7 +356,7 @@ if (!url) {
       expect(events[1].data).toEqual(expiredEventData(500));
 
       // Reading it again expires nothing more.
-      expect(await store.refreshBooking(hold.id, at(40))).toEqual({ ...hold, status: "expired" });
+      expect(await store.refreshBooking(hold.id, at(40))).toEqual({ ...hold, approval: undefined, status: "expired" });
       expect(await store.listEvents(hold.id)).toHaveLength(2);
       expect(await store.refreshBooking(crypto.randomUUID(), DEADLINE)).toBeNull();
       expect(await store.refreshBooking("not-a-uuid", DEADLINE)).toBeNull();
@@ -397,12 +402,12 @@ if (!url) {
       expect(await store.expireStaleHolds(shop, { start: at(24 + 8), end: at(24 + 9) }, DEADLINE)).toBe(1);
     });
 
-    it("findApproval() finds a hold's approval by its token hash, with the deadline and the mandate", async () => {
-      const tokenHash = sha256Hex(`token-${run}-find`);
+    it("findApproval() finds a hold's approval by its token, with the deadline and the mandate", async () => {
+      const token = newApprovalToken();
       const mandate = { depositCapCents: 500 };
-      const hold = await holdAt(5, DEADLINE, { approvalTokenHash: tokenHash, mandate });
-      expect(await store.findApproval(tokenHash)).toEqual({ bookingId: hold.id, decision: null, approveBy: DEADLINE, mandate });
-      expect(await store.findApproval(sha256Hex(`token-${run}-nobody`))).toBeNull();
+      const hold = await holdAt(5, DEADLINE, { approvalToken: token, mandate });
+      expect(await store.findApproval(token)).toEqual({ bookingId: hold.id, decision: null, approveBy: DEADLINE, mandate });
+      expect(await store.findApproval(newApprovalToken())).toBeNull();
     });
 
     it("answerApproval(): approve confirms, stores the phone and marks the approval decided, in one transaction", async () => {
@@ -416,13 +421,13 @@ if (!url) {
           nextStatus: "confirmed",
           now,
           phone: withPhone,
-          event: { actor: "customer", type: "approved", data: withPhone ? { phoneLast4: "4321" } : {} },
+          event: { actor: "customer", type: "approved", data: {} },
         });
 
       const result = await approve(hold.id, phone);
       expect(result).toEqual({
         ok: true,
-        booking: { ...hold, status: "confirmed", customer: { displayName: "Postgres Test", verified: true, phoneLast4: "4321" } },
+        booking: { ...hold, approval: undefined, status: "confirmed", customer: customerOf("Postgres Test", true, phone) },
       });
       const [row] = await sql<{ customer_phone: string | null; decision: string; decided_at: Date }[]>`
         select b.customer_phone, a.decision, a.decided_at
@@ -434,10 +439,10 @@ if (!url) {
         ["booked", "agent"],
         ["approved", "customer"],
       ]);
-      // Every read shows the verified customer, from the approval row.
+      // Every read shows the approved customer, from the approval row.
       expect(await store.getBooking(hold.id)).toEqual(result.ok && result.booking);
       expect((await store.listBookings(shop, { start: at(34), end: at(34, 30) })).map((b) => b.customer)).toEqual([
-        { displayName: "Postgres Test", verified: true, phoneLast4: "4321" },
+        customerOf("Postgres Test", true, phone),
       ]);
 
       // Answering again: refused, nothing written.
@@ -445,10 +450,10 @@ if (!url) {
       expect(await store.listEvents(hold.id)).toHaveLength(2);
       expect((await sql<{ customer_phone: string }[]>`select customer_phone from bookings where id = ${hold.id}::uuid`)[0].customer_phone).toBe(phone);
 
-      // Without a phone: still verified (approved via the link), no phoneLast4, nothing stored.
+      // Without a phone: still approved (via the link), no customer.phone, nothing stored.
       const second = await holdAt(11, DEADLINE);
       const bare = await approve(second.id, null);
-      expect(bare).toEqual({ ok: true, booking: { ...second, status: "confirmed", customer: { displayName: "Postgres Test", verified: true } } });
+      expect(bare).toEqual({ ok: true, booking: { ...second, approval: undefined, status: "confirmed", customer: customerOf("Postgres Test", true) } });
       expect((await sql<{ customer_phone: string | null }[]>`select customer_phone from bookings where id = ${second.id}::uuid`)[0].customer_phone).toBeNull();
     });
 
@@ -456,7 +461,7 @@ if (!url) {
       const hold = await holdAt(14, DEADLINE);
       await expect(sql`update bookings set customer_phone = '555-0123' where id = ${hold.id}::uuid`).rejects.toMatchObject({ code: "23514" });
       await sql`update bookings set customer_phone = ${phoneOf(8)} where id = ${hold.id}::uuid`;
-      expect((await store.getBooking(hold.id))?.customer).toEqual({ displayName: "Postgres Test", verified: false, phoneLast4: "4321" });
+      expect((await store.getBooking(hold.id))?.customer).toEqual(customerOf("Postgres Test", false, phoneOf(8)));
     });
 
     it("answerApproval(): a lapsed hold or an answered approval is not_pending, and nothing is written", async () => {
@@ -470,7 +475,7 @@ if (!url) {
         event: { actor: "customer", type: "approved", data: {} },
       });
       expect(result).toEqual({ ok: false, reason: "not_pending" });
-      expect(await store.findApproval((await sql<{ token_hash: string }[]>`select token_hash from approvals where booking_id = ${lapsed.id}::uuid`)[0].token_hash)).toMatchObject({ decision: null });
+      expect(await store.findApproval((await sql<{ token: string }[]>`select token from approvals where booking_id = ${lapsed.id}::uuid`)[0].token)).toMatchObject({ decision: null });
       expect(await statusOf(lapsed.id)).toBe("awaiting_approval");
       expect((await sql<{ customer_phone: string | null }[]>`select customer_phone from bookings where id = ${lapsed.id}::uuid`)[0].customer_phone).toBeNull();
       expect(await eventsOf(lapsed.id)).toEqual([["booked", "agent"]]);
@@ -485,7 +490,7 @@ if (!url) {
           now: at(28),
           event: { actor: "customer", type: "declined", data: { from: "awaiting_approval", to: "cancelled" } },
         });
-      expect(await decline()).toEqual({ ok: true, booking: { ...hold, status: "cancelled" } });
+      expect(await decline()).toEqual({ ok: true, booking: { ...hold, approval: undefined, status: "cancelled" } });
       const [row] = await sql<{ cancelled_by: string; cancelled_at: Date | null; decision: string }[]>`
         select b.cancelled_by, b.cancelled_at, a.decision from bookings b join approvals a on a.booking_id = b.id where b.id = ${hold.id}::uuid
       `;

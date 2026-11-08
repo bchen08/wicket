@@ -4,7 +4,7 @@ import type { ApprovalRecord } from "../frontdesk/booking-store";
 import { FrontDeskError } from "../frontdesk/errors";
 import { alertOwner, EVENT_FOR, policiesFor, type FrontDeskDeps } from "../frontdesk/service";
 import { toRfc3339 } from "../frontdesk/time";
-import { isWellFormedToken, last4, normalizePhone, sha256Hex } from "./crypto";
+import { isWellFormedToken, normalizePhone } from "./crypto";
 
 // The approval page's use cases, behind /api/approvals/[token]/*: what the person sees, and their
 // answer. The token in the link is the only credential (no sign-in, no OAuth), so it works whatever
@@ -32,7 +32,7 @@ function unknownLink(): FrontDeskError {
  */
 async function openApproval(deps: FrontDeskDeps, token: string): Promise<OpenApproval> {
   if (!isWellFormedToken(token)) throw unknownLink();
-  const approval = await deps.store.findApproval(sha256Hex(token));
+  const approval = await deps.store.findApproval(token);
   if (!approval) throw unknownLink();
   const booking = await deps.store.refreshBooking(approval.bookingId, deps.clock.now());
   if (!booking) throw unknownLink();
@@ -114,8 +114,9 @@ export async function getApprovalView(deps: FrontDeskDeps, token: string): Promi
 
 /**
  * The approve body's phone number as E.164, or null when there is none. The body is optional: none,
- * an empty body or {} approve without a phone. A number that isn't E.164 (after removing spaces,
- * dashes, dots and parentheses) is invalid_request; it isn't echoed back.
+ * an empty body or {} approve without a phone (a form post arrives here as { phone } too). A number that
+ * isn't E.164 (after removing spaces, dashes, dots and parentheses) is invalid_request; it isn't echoed
+ * back. E.164 is also what the bookings.customer_phone column accepts.
  */
 export function parseApproveBody(body: unknown): string | null {
   if (body === undefined || body === null) return null;
@@ -140,7 +141,7 @@ export function parseApproveBody(body: unknown): string | null {
 
 /**
  * Approve (ApproveRequest → ApproveResponse): opening the link and approving is the consent. The
- * booking becomes confirmed (customer.verified true; phoneLast4 when a phone was given), and the owner
+ * booking becomes confirmed (customer.approved true; customer.phone when a phone was given), and the owner
  * is alerted (once). Only while pending: already answered or cancelled → approval_closed; the hold
  * lapsed → approval_expired ("Ask your agent to book again."). In one transaction, only if the hold is
  * still on: the booking is confirmed with an "approved" event (actor customer) and the phone stored.
@@ -165,7 +166,6 @@ export async function approveBooking(deps: FrontDeskDeps, token: string, body?: 
         to: decision.nextStatus,
         depositEffect: decision.depositEffect,
         depositCollected: false,
-        ...(phone ? { phoneLast4: last4(phone) } : {}),
       },
     },
   });

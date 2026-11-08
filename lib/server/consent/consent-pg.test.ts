@@ -5,7 +5,7 @@ import type { Clock } from "../clock";
 import { FrontDeskError } from "../frontdesk/errors";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "../frontdesk/postgres-store";
 import { book, cancelBooking, getAvailability, getBooking } from "../frontdesk/service";
-import { approvalToken, recordingNotifier, TEST_CONSENT, withConsent } from "../frontdesk/test-support";
+import { approvalToken, customerOf, recordingNotifier, withBaseUrl } from "../frontdesk/test-support";
 import { approveBooking, declineBooking, getApprovalView } from "./approvals";
 
 // Ring 1b's consent flow against a real Postgres, through the approval use cases (what the
@@ -36,7 +36,7 @@ if (!url) {
     let now = new Date();
     const clock: Clock = { now: () => new Date(now.getTime()) };
     const notifier = recordingNotifier();
-    const deps = withConsent({ catalog: store, store, clock, notifier, consent: TEST_CONSENT });
+    const deps = withBaseUrl({ catalog: store, store, clock, notifier });
 
     // A random Tuesday in 2099; each test books in its own week after it.
     const firstTuesday = DateTime.fromObject({ year: 2099, month: 1, day: 6 }, { zone })
@@ -93,7 +93,7 @@ if (!url) {
       await closePostgresClients();
     });
 
-    it("the approve path: open the link → approve (with a phone) → confirmed and verified; owner alerted once", async () => {
+    it("the approve path: open the link → approve (with a phone) → confirmed and approved; owner alerted once", async () => {
       setNow(time(0, 0, 9));
       const alertsBefore = notifier.alerts.length;
       const booking = await hold(time(0, 1, 10), "Maya Lopez");
@@ -119,18 +119,18 @@ if (!url) {
         ...booking,
         approval: undefined,
         status: "confirmed",
-        customer: { displayName: "Maya Lopez", verified: true, phoneLast4: "0123" },
+        customer: customerOf("Maya Lopez", true, phone(123)),
       });
       expect(approved).not.toHaveProperty("approval");
       expect((await getBooking(deps, shop, { booking_id: booking.id })).booking).toEqual(approved);
       expect((await getApprovalView(deps, token)).status).toBe("approved");
       expect(await customerPhoneOf(booking.id)).toBe(phone(123));
 
-      const [approval] = await sql<{ decision: string; decided_at: Date; token_hash: string }[]>`
-        select decision, decided_at, token_hash from approvals where booking_id = ${booking.id}::uuid
+      const [approval] = await sql<{ decision: string; decided_at: Date; token: string }[]>`
+        select decision, decided_at, token from approvals where booking_id = ${booking.id}::uuid
       `;
       expect(approval).toMatchObject({ decision: "approved", decided_at: new Date(time(0, 0, 9)) });
-      expect(approval.token_hash).not.toBe(token);
+      expect(approval.token).toBe(token); // stored as it is
 
       const events = await store.listEvents(booking.id);
       expect(events.map((e) => [e.type, e.actor])).toEqual([
@@ -142,7 +142,6 @@ if (!url) {
         to: "confirmed",
         depositEffect: "none",
         depositCollected: false,
-        phoneLast4: "0123",
       });
       expect(notifier.alerts.slice(alertsBefore).map((b) => [b.id, b.status])).toEqual([[booking.id, "confirmed"]]);
 
@@ -152,7 +151,7 @@ if (!url) {
       expect(notifier.alerts.length - alertsBefore).toBe(1);
     });
 
-    it("approve without a phone: confirmed and verified, no phoneLast4, nothing stored; a bad phone writes nothing", async () => {
+    it("approve without a phone: confirmed and approved, no customer.phone, nothing stored; a bad phone writes nothing", async () => {
       setNow(time(0, 0, 9));
       const booking = await hold(time(0, 1, 11));
       const token = approvalToken(booking);
@@ -161,11 +160,11 @@ if (!url) {
       expect(await eventsOf(booking.id)).toEqual([["booked", "agent"]]);
 
       const { booking: approved } = await approveBooking(deps, token);
-      expect(approved).toMatchObject({ status: "confirmed", customer: { displayName: "Consent Test", verified: true } });
-      expect(approved.customer).not.toHaveProperty("phoneLast4");
+      expect(approved).toMatchObject({ status: "confirmed", customer: { displayName: "Consent Test", approved: true } });
+      expect(approved.customer).not.toHaveProperty("phone");
       expect(await customerPhoneOf(booking.id)).toBeNull();
       const [event] = (await store.listEvents(booking.id)).slice(1);
-      expect(event.data).not.toHaveProperty("phoneLast4");
+      expect(event.data).not.toHaveProperty("phone");
     });
 
     it("two approvals racing: exactly one confirms, the other is approval_closed, one owner alert", async () => {
@@ -244,7 +243,7 @@ if (!url) {
       const start = time(4, 1, 14);
       const booking = await hold(start);
       const { booking: declined } = await declineBooking(deps, approvalToken(booking));
-      expect(declined).toMatchObject({ id: booking.id, status: "cancelled", customer: { verified: false } });
+      expect(declined).toMatchObject({ id: booking.id, status: "cancelled", customer: { approved: false } });
       const [row] = await sql<{ cancelled_by: string; decision: string }[]>`
         select b.cancelled_by, a.decision from bookings b join approvals a on a.booking_id = b.id where b.id = ${booking.id}::uuid
       `;

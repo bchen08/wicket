@@ -5,7 +5,7 @@ import { policiesGet, policiesPut } from "@/lib/server/frontdesk/http";
 // GET /api/shops/[shop]/policies — the shop's booking rules (PoliciesResponse).
 // PUT /api/shops/[shop]/policies — change some of them (UpdatePoliciesRequest → PoliciesResponse).
 // Types in lib/types/frontdesk.ts. Errors use the ApiError envelope.
-// Owner route: Authorization: Bearer <OWNER_API_TOKEN>. TODO(ring-2): owner sign-in replaces the token.
+// Owner route: Authorization: Bearer <OWNER_API_TOKEN>, or the fd_owner cookie. TODO(ring-2): owner sign-in replaces the token.
 
 export async function GET(request: Request, ctx: RouteContext<"/api/shops/[shop]/policies">) {
   // Reads the database: request-time only, never prerendered.

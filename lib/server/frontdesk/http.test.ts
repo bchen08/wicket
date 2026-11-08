@@ -2,13 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApiError, ApiErrorCode, BookingsResponse, ServicesResponse } from "../../types/frontdesk";
 import { ConfigurationError } from "./deps";
 import { FrontDeskError } from "./errors";
-import { bookingsResponse, errorResponse, servicesResponse, STATUS } from "./http";
+import { bookingsResponse, errorResponse, servicesResponse, STATUS, type OwnerOptions } from "./http";
 import type { InitialBooking } from "./memory-store";
-import { memoryDeps } from "./test-support";
+import { customerOf, memoryDeps } from "./test-support";
 
-// The handlers behind the public GET /api/shops/[shop]/services and /bookings (no token), and the
-// error-code → status mapping every /api/shops/* route shares. The owner routes are in owner.test.ts.
-// The route files only add `await connection()` and read the [shop] param.
+// The handlers behind GET /api/shops/[shop]/services (public) and /bookings (an owner route: it shows
+// phone numbers), and the error-code → status mapping every /api/shops/* route shares. The other owner
+// routes are in owner.test.ts. The route files only add `await connection()` and read the [shop] param.
 // "Now" is Mon 9 Nov 2026, noon in New York: the bookings window is 2 Nov 12:00 → 9 Dec 12:00.
 
 const booking = (start: string, end: string, extra: Partial<InitialBooking> = {}): InitialBooking => ({
@@ -25,6 +25,12 @@ const booking = (start: string, end: string, extra: Partial<InitialBooking> = {}
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+const TOKEN = "owner-token-for-tests-0123456789";
+const OWNER: OwnerOptions = { getToken: () => TOKEN };
+/** The owner's GET /api/shops/[shop]/bookings, with the bearer token. */
+const listRequest = (shop = "harts") =>
+  new Request(`http://localhost/api/shops/${shop}/bookings`, { headers: { authorization: `Bearer ${TOKEN}` } });
 
 describe("GET /api/shops/[shop]/services", () => {
   it("returns ServicesResponse", async () => {
@@ -58,7 +64,7 @@ describe("GET /api/shops/[shop]/bookings", () => {
       ],
     });
 
-    const res = await bookingsResponse(() => deps, "harts");
+    const res = await bookingsResponse(() => deps, listRequest(), "harts", OWNER);
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store");
     const body = (await res.json()) as BookingsResponse;
@@ -71,18 +77,18 @@ describe("GET /api/shops/[shop]/bookings", () => {
     expect(body.bookings[0]).toMatchObject({
       serviceName: "Haircut",
       display: "Tue 3 Nov, 10:00 am EST",
-      customer: { displayName: "Test Customer", verified: false },
+      customer: customerOf("Test Customer", false),
       depositCents: 1000,
     });
   });
 
   it("returns an empty list for a shop with no bookings", async () => {
-    const body = (await (await bookingsResponse(() => memoryDeps(), "harts")).json()) as BookingsResponse;
+    const body = (await (await bookingsResponse(() => memoryDeps(), listRequest(), "harts", OWNER)).json()) as BookingsResponse;
     expect(body.bookings).toEqual([]);
   });
 
   it("is 404 with the ApiError envelope for an unknown shop", async () => {
-    const res = await bookingsResponse(() => memoryDeps(), "nope");
+    const res = await bookingsResponse(() => memoryDeps(), listRequest("nope"), "nope", OWNER);
     expect(res.status).toBe(404);
     const body = (await res.json()) as ApiError;
     expect(body.error).toMatchObject({ code: "not_found", details: { shop: "nope" } });
@@ -90,9 +96,14 @@ describe("GET /api/shops/[shop]/bookings", () => {
 
   it("is a 500 internal envelope, without leaking the cause, when deps can't be built", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const res = await bookingsResponse(() => {
-      throw new ConfigurationError("DATABASE_URL is not set.");
-    }, "harts");
+    const res = await bookingsResponse(
+      () => {
+        throw new ConfigurationError("DATABASE_URL is not set.");
+      },
+      listRequest(),
+      "harts",
+      OWNER,
+    );
     expect(res.status).toBe(500);
     const body = (await res.json()) as ApiError;
     expect(body.error.code).toBe("internal");

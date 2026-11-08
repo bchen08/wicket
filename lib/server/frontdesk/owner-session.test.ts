@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ApiError, OwnerSessionRequest, OwnerSessionResponse, PoliciesResponse } from "../../types/frontdesk";
-import { policiesGet, policiesPut, type OwnerOptions } from "./http";
-import { OWNER_SESSION_COOKIE, OWNER_SESSION_MAX_AGE_S, ownerSessionValue } from "./owner-auth";
+import type { ApiError, BookingsResponse, OwnerSessionRequest, OwnerSessionResponse, PoliciesResponse } from "../../types/frontdesk";
+import { bookingsResponse, policiesGet, policiesPut, type OwnerOptions } from "./http";
+import { NOT_SET_UP_NEXT_ACTION, OWNER_SESSION_COOKIE, UNLOCK_NEXT_ACTION } from "./owner-auth";
 import { ownerSessionDelete, ownerSessionGet, ownerSessionPost, type OwnerSessionOptions } from "./owner-session";
 import { memoryDeps } from "./test-support";
 
 // The stub owner session: POST, GET and DELETE /api/owner/session through the handlers the route file
-// calls, and the fd_owner cookie it sets used on a real owner route (policies).
+// calls, and the fd_owner cookie it sets used on real owner routes (policies, the bookings list).
 // TODO(ring-2): owner sign-in by texted code replaces this.
 
 const TOKEN = "owner-token-for-tests-0123456789";
@@ -25,13 +25,16 @@ function options(extra: OwnerSessionOptions = {}): OwnerSessionOptions {
 
 function sessionRequest(
   method: "POST" | "GET" | "DELETE",
-  init: { origin?: string; body?: unknown; raw?: string; cookie?: string } = {},
+  init: { origin?: string; body?: unknown; raw?: string; form?: Record<string, string>; cookie?: string } = {},
 ): Request {
   const headers: Record<string, string> = {};
   if (init.cookie !== undefined) headers.cookie = init.cookie;
   let body: string | undefined;
   if (init.raw !== undefined) body = init.raw;
-  else if (init.body !== undefined) {
+  else if (init.form !== undefined) {
+    body = new URLSearchParams(init.form).toString();
+    headers["content-type"] = "application/x-www-form-urlencoded";
+  } else if (init.body !== undefined) {
     body = JSON.stringify(init.body);
     headers["content-type"] = "application/json";
   }
@@ -40,6 +43,9 @@ function sessionRequest(
 
 const signIn = (token: string, opts = options(), init: { origin?: string } = {}) =>
   ownerSessionPost(sessionRequest("POST", { ...init, body: { token } satisfies OwnerSessionRequest }), opts);
+
+const formSignIn = (form: Record<string, string>, opts = options(), init: { origin?: string } = {}) =>
+  ownerSessionPost(sessionRequest("POST", { ...init, form }), opts);
 
 /** The Set-Cookie attributes, split on "; ", with the name=value first. */
 function setCookieParts(res: Response): string[] {
@@ -60,20 +66,21 @@ async function json<T>(res: Response, status: number): Promise<T> {
   return body;
 }
 
-describe("POST /api/owner/session", () => {
-  it("with the right token: 200 { signedIn: true, expiresAt } and an HttpOnly, SameSite=Strict, 12-hour cookie", async () => {
+describe("POST /api/owner/session (JSON)", () => {
+  it("with the right token: 200 { signedIn: true, expiresAt } and an HttpOnly, SameSite=Lax, 12-hour cookie holding the token", async () => {
     const res = await signIn(TOKEN);
     expect(await json<OwnerSessionResponse>(res, 200)).toEqual({ signedIn: true, expiresAt: EXPIRES_AT });
 
     const [pair, ...attributes] = setCookieParts(res);
-    expect(pair).toBe(`${OWNER_SESSION_COOKIE}=${ownerSessionValue(TOKEN, NOW_MS / 1000 + OWNER_SESSION_MAX_AGE_S)}`);
-    expect(attributes).toEqual(["Path=/", "Max-Age=43200", "HttpOnly", "SameSite=Strict"]);
+    expect(pair).toBe(`${OWNER_SESSION_COOKIE}=${TOKEN}`);
+    expect(attributes).toEqual(["Path=/", "Max-Age=43200", "HttpOnly", "SameSite=Lax"]);
   });
 
-  it("never puts the token in the cookie or the body", async () => {
-    const res = await signIn(TOKEN);
-    expect(res.headers.get("set-cookie")).not.toContain(TOKEN);
-    expect(await res.text()).not.toContain(TOKEN);
+  it("stores the configured token, trimmed and URI-encoded", async () => {
+    const odd = "code; with=odd,chars";
+    const res = await signIn(odd, options({ getToken: () => ` ${odd}\n` }));
+    expect(res.status).toBe(200);
+    expect(cookieFrom(res)).toBe(`${OWNER_SESSION_COOKIE}=${encodeURIComponent(odd)}`);
   });
 
   it("marks the cookie Secure everywhere except http on localhost", async () => {
@@ -90,6 +97,7 @@ describe("POST /api/owner/session", () => {
   it("always marks the cookie Secure on Vercel, whatever request.url says", async () => {
     vi.stubEnv("VERCEL", "1");
     expect(setCookieParts(await signIn(TOKEN)).includes("Secure")).toBe(true);
+    expect(setCookieParts(await formSignIn({ token: TOKEN })).includes("Secure")).toBe(true);
     expect(setCookieParts(ownerSessionDelete(sessionRequest("DELETE"))).includes("Secure")).toBe(true);
   });
 
@@ -98,7 +106,7 @@ describe("POST /api/owner/session", () => {
   });
 
   it.each([
-    ["a wrong token of the same length", "x".repeat(TOKEN.length)],
+    ["a wrong token", "x".repeat(TOKEN.length)],
     ["a prefix of the token", TOKEN.slice(0, -1)],
     ["the token in different case", TOKEN.toUpperCase()],
     ["an empty token", ""],
@@ -117,15 +125,17 @@ describe("POST /api/owner/session", () => {
   });
 
   it.each([
-    ["unset", undefined, /not set/],
-    ["blank", "  ", /not set/],
-    ["too short", "short-token", /too short/],
-  ])("is 503 internal, with no cookie, when OWNER_API_TOKEN is %s", async (_name, configured, message) => {
-    const res = await signIn(TOKEN, options({ getToken: () => configured }));
-    const body = await json<ApiError>(res, 503);
-    expect(body.error.code).toBe("internal");
-    expect(body.error.message).toMatch(message);
-    expect(res.headers.get("set-cookie")).toBeNull();
+    ["unset", undefined],
+    ["empty", ""],
+    ["blank", "  "],
+  ])("is 401 with the set-up next_action, and no cookie, when OWNER_API_TOKEN is %s", async (_name, configured) => {
+    for (const token of [TOKEN, "", "  "]) {
+      const res = await signIn(token, options({ getToken: () => configured }));
+      const body = await json<ApiError>(res, 401);
+      expect(body.error.code).toBe("unauthorized");
+      expect(body.error.next_action).toBe(NOT_SET_UP_NEXT_ACTION);
+      expect(res.headers.get("set-cookie")).toBeNull();
+    }
   });
 
   it.each([
@@ -151,7 +161,54 @@ describe("POST /api/owner/session", () => {
     vi.stubEnv("OWNER_API_TOKEN", TOKEN);
     expect((await signIn(TOKEN, opts)).status).toBe(200);
     vi.stubEnv("OWNER_API_TOKEN", "");
-    expect((await signIn(TOKEN, opts)).status).toBe(503);
+    expect((await signIn(TOKEN, opts)).status).toBe(401);
+  });
+});
+
+describe("POST /api/owner/session (form post from /console/unlock)", () => {
+  it("with the right token: 303 → /console, setting the cookie", async () => {
+    const res = await formSignIn({ token: TOKEN });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`${LOCAL}/console`);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(setCookieParts(res)).toEqual([`${OWNER_SESSION_COOKIE}=${TOKEN}`, "Path=/", "Max-Age=43200", "HttpOnly", "SameSite=Lax"]);
+  });
+
+  it("redirects on the request's origin", async () => {
+    const res = await formSignIn({ token: TOKEN }, options(), { origin: DEPLOYED });
+    expect(res.headers.get("location")).toBe(`${DEPLOYED}/console`);
+    expect(setCookieParts(res)).toContain("Secure");
+  });
+
+  it("trims the token", async () => {
+    expect((await formSignIn({ token: `  ${TOKEN} ` })).headers.get("location")).toBe(`${LOCAL}/console`);
+  });
+
+  it.each([
+    ["a wrong token", { token: "wrong" }],
+    ["an empty token", { token: "" }],
+    ["no token field", { code: TOKEN }],
+  ])("with %s: 303 → /console/unlock?error=1 and no cookie", async (_name, form) => {
+    const res = await formSignIn(form);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`${LOCAL}/console/unlock?error=1`);
+    expect(res.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("is a wrong token when OWNER_API_TOKEN isn't set", async () => {
+    for (const configured of [undefined, ""]) {
+      const res = await formSignIn({ token: "" }, options({ getToken: () => configured }));
+      expect(res.headers.get("location")).toBe(`${LOCAL}/console/unlock?error=1`);
+      expect(res.headers.get("set-cookie")).toBeNull();
+    }
+  });
+
+  it("accepts multipart/form-data too", async () => {
+    const form = new FormData();
+    form.set("token", TOKEN);
+    const res = await ownerSessionPost(new Request(`${LOCAL}/api/owner/session`, { method: "POST", body: form }), options());
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`${LOCAL}/console`);
   });
 });
 
@@ -162,28 +219,24 @@ describe("GET /api/owner/session", () => {
     });
   });
 
-  it("is { signedIn: true, expiresAt } with the cookie POST set, until it expires", async () => {
+  it("is { signedIn: true } with the cookie POST set", async () => {
     const cookie = cookieFrom(await signIn(TOKEN));
-    const get = (nowMs: number) => ownerSessionGet(sessionRequest("GET", { cookie }), options({ now: () => nowMs }));
-    expect(await json<OwnerSessionResponse>(get(NOW_MS + 60_000), 200)).toEqual({ signedIn: true, expiresAt: EXPIRES_AT });
-    expect(await json<OwnerSessionResponse>(get(Date.parse(EXPIRES_AT)), 200)).toEqual({ signedIn: false });
+    expect(await json<OwnerSessionResponse>(ownerSessionGet(sessionRequest("GET", { cookie }), options()), 200)).toEqual({
+      signedIn: true,
+    });
   });
 
-  it("is { signedIn: false } with a tampered cookie, or after OWNER_API_TOKEN changes", async () => {
+  it("is { signedIn: false } with a wrong cookie, after OWNER_API_TOKEN changes, or when it isn't set", async () => {
     const cookie = cookieFrom(await signIn(TOKEN));
-    const [name, value] = cookie.split("=");
-    const [expiry, signature] = value.split(".");
-    const tampered = `${name}=${Number(expiry) + 3600}.${signature}`;
-    expect(await json(ownerSessionGet(sessionRequest("GET", { cookie: tampered }), options()), 200)).toEqual({
+    expect(await json(ownerSessionGet(sessionRequest("GET", { cookie: `${OWNER_SESSION_COOKIE}=wrong` }), options()), 200)).toEqual({
       signedIn: false,
     });
-    const rotated = options({ getToken: () => "rotated-owner-token-0123456789" });
+    const rotated = options({ getToken: () => "rotated-owner-token" });
     expect(await json(ownerSessionGet(sessionRequest("GET", { cookie }), rotated), 200)).toEqual({ signedIn: false });
-  });
-
-  it("is 503 when OWNER_API_TOKEN is unset, so the console can say so instead of offering a sign-in", async () => {
-    const body = await json<ApiError>(ownerSessionGet(sessionRequest("GET"), options({ getToken: () => undefined })), 503);
-    expect(body.error.code).toBe("internal");
+    const unset = options({ getToken: () => undefined });
+    expect(await json(ownerSessionGet(sessionRequest("GET", { cookie: `${OWNER_SESSION_COOKIE}=` }), unset), 200)).toEqual({
+      signedIn: false,
+    });
   });
 });
 
@@ -191,7 +244,7 @@ describe("DELETE /api/owner/session", () => {
   it("is { signedIn: false } and clears the cookie with the same attributes", async () => {
     const res = ownerSessionDelete(sessionRequest("DELETE", { cookie: cookieFrom(await signIn(TOKEN)) }));
     expect(await json<OwnerSessionResponse>(res, 200)).toEqual({ signedIn: false });
-    expect(setCookieParts(res)).toEqual([`${OWNER_SESSION_COOKIE}=`, "Path=/", "Max-Age=0", "HttpOnly", "SameSite=Strict"]);
+    expect(setCookieParts(res)).toEqual([`${OWNER_SESSION_COOKIE}=`, "Path=/", "Max-Age=0", "HttpOnly", "SameSite=Lax"]);
   });
 
   it("clears a Secure cookie with Secure", () => {
@@ -201,12 +254,12 @@ describe("DELETE /api/owner/session", () => {
   });
 });
 
-// ---- The cookie on an owner route ----
+// ---- The cookie on owner routes ----
 
-describe("the fd_owner cookie on an owner route (policies)", () => {
+describe("the fd_owner cookie on owner routes", () => {
   const OWNER: OwnerOptions = { getToken: () => TOKEN };
 
-  function policies(method: "GET" | "PUT", init: { cookie?: string; bearer?: boolean } = {}) {
+  function ownerRequest(path: string, method: "GET" | "PUT", init: { cookie?: string; bearer?: boolean } = {}) {
     const headers: Record<string, string> = {};
     if (init.cookie !== undefined) headers.cookie = init.cookie;
     if (init.bearer) headers.authorization = `Bearer ${TOKEN}`;
@@ -215,12 +268,13 @@ describe("the fd_owner cookie on an owner route (policies)", () => {
       body = JSON.stringify({ leadTimeMin: 60 });
       headers["content-type"] = "application/json";
     }
-    return new Request(`${DEPLOYED}/api/shops/harts/policies`, { method, headers, body });
+    return new Request(`${DEPLOYED}${path}`, { method, headers, body });
   }
+  const policies = (method: "GET" | "PUT", init: { cookie?: string; bearer?: boolean } = {}) =>
+    ownerRequest("/api/shops/harts/policies", method, init);
 
-  /** A real cookie from POST /api/owner/session, on the wall clock the owner routes check against. */
   async function realCookie(): Promise<string> {
-    return cookieFrom(await signIn(TOKEN, options({ now: Date.now }), { origin: DEPLOYED }));
+    return cookieFrom(await signIn(TOKEN, options(), { origin: DEPLOYED }));
   }
 
   it("accepts the cookie on a read (GET)", async () => {
@@ -239,30 +293,29 @@ describe("the fd_owner cookie on an owner route (policies)", () => {
     expect((await json<PoliciesResponse>(res, 200)).policies.leadTimeMin).toBe(60);
   });
 
-  it("rejects an expired or tampered cookie with 401 unauthorized", async () => {
-    const nowS = Math.floor(Date.now() / 1000);
-    const valid = ownerSessionValue(TOKEN, nowS + 3600);
-    const [expiry, signature] = valid.split(".");
-    for (const value of [
-      ownerSessionValue(TOKEN, nowS - 1), // expired
-      `${Number(expiry) + 3600}.${signature}`, // expiry pushed out, old signature
-      ownerSessionValue("someone-elses-token-0123456789", nowS + 3600), // signed with another key
-    ]) {
-      const getDeps = vi.fn(() => memoryDeps());
-      const res = await policiesGet(getDeps, policies("GET", { cookie: `${OWNER_SESSION_COOKIE}=${value}` }), "harts", OWNER);
-      expect((await json<ApiError>(res, 401)).error.code).toBe("unauthorized");
-      expect(getDeps).not.toHaveBeenCalled();
-    }
+  it("rejects a wrong cookie with 401 unauthorized, before touching the database", async () => {
+    const getDeps = vi.fn(() => memoryDeps());
+    const res = await policiesGet(getDeps, policies("GET", { cookie: `${OWNER_SESSION_COOKIE}=wrong` }), "harts", OWNER);
+    expect((await json<ApiError>(res, 401)).error.code).toBe("unauthorized");
+    expect(getDeps).not.toHaveBeenCalled();
   });
 
-  it("sign in → read → sign out → refused, with a browser-like cookie jar", async () => {
+  it("the bookings list accepts the cookie, and without it says to unlock the console", async () => {
+    const bookings = (cookie?: string) => bookingsResponse(() => memoryDeps(), ownerRequest("/api/shops/harts/bookings", "GET", { cookie }), "harts", OWNER);
+    expect((await json<BookingsResponse>(await bookings(await realCookie()), 200)).shop.slug).toBe("harts");
+    const refused = await json<ApiError>(await bookings(), 401);
+    expect(refused.error.code).toBe("unauthorized");
+    expect(refused.error.next_action).toBe(UNLOCK_NEXT_ACTION);
+  });
+
+  it("sign in (form) → read → sign out → refused, with a browser-like cookie jar", async () => {
     let jar: string | undefined;
     const keep = (res: Response) => {
       const [pair, ...attributes] = setCookieParts(res);
       jar = attributes.includes("Max-Age=0") ? undefined : pair;
     };
 
-    keep(await signIn(TOKEN, options({ now: Date.now }), { origin: DEPLOYED }));
+    keep(await formSignIn({ token: TOKEN }, options(), { origin: DEPLOYED }));
     expect((await policiesGet(() => memoryDeps(), policies("GET", { cookie: jar }), "harts", OWNER)).status).toBe(200);
 
     keep(ownerSessionDelete(sessionRequest("DELETE", { origin: DEPLOYED, cookie: jar })));

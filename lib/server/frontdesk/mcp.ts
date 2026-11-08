@@ -57,6 +57,7 @@ export const SERVER_INSTRUCTIONS = [
   "and returns an approval link (booking.approval.url). Send the person that link right away; they open it and",
   "approve or decline. Then call get_booking to check the status: confirmed",
   "(approved), cancelled (declined) or expired (the hold ran out; book again if they still want it).",
+  "While the hold is on, get_booking returns the same link again, so you never need to book twice to get it.",
   "cancel works on a hold too. On a confirmed booking it follows the shop's cancellation policy (the deposit is",
   "released or kept depending on how close the start is), so tell the person the consequence before cancelling.",
   "No money is collected yet.",
@@ -259,10 +260,11 @@ const bookingSchema = z.object({
     ),
   customer: z.object({
     displayName: z.string(),
-    verified: z.boolean().describe("true once the person approved the booking through the approval link."),
-    phoneLast4: z.string().optional().describe("Last 4 digits of the phone number the person gave when approving, if any."),
+    approved: z.boolean().describe("true once the person tapped Approve on the approval link."),
+    verified: z.boolean().describe("Deprecated: the same as approved. Read approved."),
+    phone: z.string().optional().describe("The phone number the person gave when approving (E.164), if any."),
   }),
-  agent: z.object({ name: z.string().describe("Best-effort label for the booking agent. Unverified.") }),
+  agent: z.object({ name: z.string().describe("Best-effort label for the booking agent: the client's self-reported name.") }),
   depositCents: z
     .number()
     .int()
@@ -274,7 +276,7 @@ const bookingSchema = z.object({
       expiresAt: z.string().describe("When the hold lapses, RFC 3339."),
     })
     .optional()
-    .describe("Only in book's result, while the booking awaits approval. get_booking never includes it."),
+    .describe("Present while the booking awaits approval, in book's and get_booking's results."),
 });
 
 const bookOutputSchema = z.object({ booking: bookingSchema });
@@ -431,16 +433,15 @@ export function cancelText({ booking, depositEffect }: CancelResult): string {
 function statusNote({ booking, declined }: GetBookingOutcome): string | null {
   const name = booking.customer.displayName;
   switch (booking.status) {
-    case "awaiting_approval":
-      return (
-        `Waiting for ${name} to approve with the link from book (the hold lasts ${APPROVAL_HOLD_MINUTES} minutes from ` +
-        "booking). Remind them if needed, then call get_booking again."
-      );
+    case "awaiting_approval": {
+      const link = booking.approval
+        ? `Waiting for ${name} to approve with this link: ${booking.approval.url} (the hold lapses at ` +
+          `${displayInstant(booking.approval.expiresAt)}).`
+        : `Waiting for ${name} to approve with the link from book (the hold lasts ${APPROVAL_HOLD_MINUTES} minutes from booking).`;
+      return `${link} Remind them if needed, then call get_booking again.`;
+    }
     case "confirmed":
-      if (!booking.customer.verified) return "It is confirmed.";
-      return booking.customer.phoneLast4
-        ? `${name} approved it (phone ending ${booking.customer.phoneLast4}). It is confirmed.`
-        : `${name} approved it. It is confirmed.`;
+      return booking.customer.approved ? `${name} approved it. It is confirmed.` : "It is confirmed.";
     case "expired":
       return `The hold ran out before ${name} approved, so the time is free again. Book again if they still want it.`;
     case "cancelled":
@@ -467,7 +468,7 @@ function bookingText(outcome: GetBookingOutcome): string {
  * The calling agent's name, best effort: the MCP client's self-reported name (clientInfo.name).
  * On the 2026-07-28 protocol every request carries it in its _meta envelope. Stateless 2025-era
  * requests don't (it was only sent with initialize), so those get "unknown agent".
- * TODO(ring-2): a verified agent identity instead of a self-reported label.
+ * TODO(ring-2): a signed-in agent identity instead of a self-reported label.
  */
 export function agentNameFrom(ctx: { mcpReq?: { envelope?: unknown } } | undefined): string {
   const envelope = ctx?.mcpReq?.envelope as Record<string, unknown> | undefined;
@@ -511,7 +512,7 @@ export function createFrontDeskMcpHandler(
 ): (request: Request) => Promise<Response> {
   const getDeps = typeof deps === "function" ? deps : () => deps;
   return createMcpHandler((server) => registerFrontDeskTools(server, getDeps), {
-    serverInfo: { name: "front-desk", version: "0.4.0" },
+    serverInfo: { name: "front-desk", version: "0.5.0" },
     instructions: SERVER_INSTRUCTIONS,
   });
 }
@@ -681,9 +682,10 @@ export function registerFrontDeskTools(
       description:
         "Read one booking at Hart's Barbers by its id (booking.id from book): the service, start, staff member, " +
         "customer name, deposit and status. Call it after sending the approval link to see what the person did: " +
-        "awaiting_approval (not answered yet), confirmed (approved; customer.verified is true and customer.phoneLast4 " +
-        "is set), cancelled (declined, or cancelled by you or the shop), expired (the hold ran out; book again if " +
-        "they still want it). Also awaiting_deposit, completed or no_show. It never includes the approval link. " +
+        "awaiting_approval (not answered yet; booking.approval.url is the link to send them again if they lost it), " +
+        "confirmed (approved; customer.approved is true, and customer.phone is set if they gave a number), cancelled " +
+        "(declined, or cancelled by you or the shop), expired (the hold ran out; book again if they still want it). " +
+        "Also awaiting_deposit, completed or no_show. " +
         "Until agents sign in, anyone holding a booking id can read it. Read-only, apart from recording that a hold ran out. " +
         `${ERROR_FORMAT} code booking_not_found: no booking with that id at this shop; check the id. ` +
         "code invalid_request: fix the arguments as next_action says.",

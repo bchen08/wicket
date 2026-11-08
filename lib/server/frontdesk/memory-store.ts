@@ -87,7 +87,7 @@ export const SEED: {
  * A booking to preload, for tests (e.g. a cancelled one). Preloaded bookings get no events and
  * aren't checked for overlaps.
  */
-export type InitialBooking = Omit<NewBooking, "depositCents" | "approveBy" | "approvalTokenHash" | "mandate"> & {
+export type InitialBooking = Omit<NewBooking, "depositCents" | "approveBy" | "approvalToken" | "mandate"> & {
   /** Defaults to "confirmed". */
   status?: BookingStatus;
   /** Defaults to the store clock's now. */
@@ -96,8 +96,8 @@ export type InitialBooking = Omit<NewBooking, "depositCents" | "approveBy" | "ap
   depositCents?: number;
   /** When the hold lapses. Required for status awaiting_approval. */
   approveBy?: Date;
-  /** With it, the booking gets an undecided approval request with this token hash. */
-  approvalTokenHash?: string;
+  /** With it, the booking gets an undecided approval request with this token. */
+  approvalToken?: string;
   mandate?: Mandate | null;
 };
 
@@ -123,7 +123,7 @@ export type LifecycleStamps = {
 /** A stored approval request (the approvals table). */
 export type StoredApproval = {
   bookingId: string;
-  tokenHash: string;
+  token: string;
   createdAt: Date;
   decidedAt: Date | null;
   decision: "approved" | "declined" | null;
@@ -145,7 +145,10 @@ export type MemoryStore = ShopCatalog &
     consentRows(): ConsentRows;
   };
 
-type StoredBooking = Omit<BookingRecord, "serviceName" | "timezone" | "customerVerified" | "customerPhone"> &
+type StoredBooking = Omit<
+  BookingRecord,
+  "serviceName" | "timezone" | "customerApproved" | "customerPhone" | "approvalToken" | "approveBy"
+> &
   LifecycleStamps & { approveBy: Date | null; customerPhone: string | null; mandate: Mandate | null };
 
 type StoredEvent = NewBookingEvent & { seq: number; bookingId: string; at: Date };
@@ -259,8 +262,10 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       agentName: b.agentName,
       createdAt: copyDate(b.createdAt),
       // Like the Postgres left join on approvals.
-      customerVerified: approvals.get(b.id)?.decision === "approved",
+      customerApproved: approvals.get(b.id)?.decision === "approved",
       customerPhone: b.customerPhone,
+      approvalToken: approvals.get(b.id)?.token ?? null,
+      approveBy: b.approveBy && copyDate(b.approveBy),
       timezone: shop.timezone,
     };
   }
@@ -273,10 +278,10 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
     }
     if (!staff.some((s) => s.id === input.staffId)) throw new Error(`Unknown staff member: ${input.staffId}`);
     const status = input.status ?? "confirmed";
-    // The bookings_hold_has_deadline and bookings_mandate_is_object checks, and approvals.token_hash unique.
+    // The bookings_hold_has_deadline check, and approvals.token unique.
     if (status === "awaiting_approval" && !input.approveBy) throw new Error("A booking awaiting approval needs approveBy.");
-    if (input.approvalTokenHash && [...approvals.values()].some((a) => a.tokenHash === input.approvalTokenHash)) {
-      throw new Error("approvals.token_hash must be unique.");
+    if (input.approvalToken && [...approvals.values()].some((a) => a.token === input.approvalToken)) {
+      throw new Error("approvals.token must be unique.");
     }
     const stored: StoredBooking = {
       id: crypto.randomUUID(),
@@ -299,8 +304,8 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       mandate: input.mandate ? jsonCopy(input.mandate) : null,
     };
     bookings.push(stored);
-    if (input.approvalTokenHash) {
-      approvals.set(stored.id, { bookingId: stored.id, tokenHash: input.approvalTokenHash, createdAt: at, decidedAt: null, decision: null });
+    if (input.approvalToken) {
+      approvals.set(stored.id, { bookingId: stored.id, token: input.approvalToken, createdAt: at, decidedAt: null, decision: null });
     }
     return stored;
   }
@@ -558,8 +563,8 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
     // ---- Ring 1b: consent. Each method checks and writes in one synchronous step (no await), so it
     // is atomic like its Postgres transaction, and it checks everything before writing anything. ----
 
-    async findApproval(tokenHash) {
-      const approval = [...approvals.values()].find((a) => a.tokenHash === tokenHash);
+    async findApproval(token) {
+      const approval = [...approvals.values()].find((a) => a.token === token);
       const b = approval && bookings.find((x) => x.id === approval.bookingId);
       if (!approval || !b?.approveBy) return null;
       return {

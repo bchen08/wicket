@@ -7,7 +7,7 @@ import { FrontDeskError } from "./errors";
 import { SEED, type MemoryStore } from "./memory-store";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
 import { book, getAvailability, getBooking, listServices, type FrontDeskDeps } from "./service";
-import { approveAsCustomer, memoryDeps, NOW, recordingNotifier, SAT, withCatalog, withConsent } from "./test-support";
+import { approveAsCustomer, customerOf, memoryDeps, NOW, PHONE_E164, recordingNotifier, SAT, withBaseUrl, withCatalog } from "./test-support";
 
 // book() against the in-memory store with a fixed clock: Mon 9 Nov 2026, noon in New York (Hart's is
 // closed on Mondays). Dana works Tue–Sat 09:00–12:00 and 12:30–17:00. Saturday 14 Nov (5 days ahead)
@@ -102,7 +102,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** The approval link book returns: PUBLIC_BASE_URL (localhost in tests) + /approve/ + a 43-character base64url token. */
+/** The approval link book returns: deps.baseUrl (localhost in tests) + /approve/ + a 43-character base64url token. */
 const APPROVAL_URL = /^http:\/\/localhost:3000\/approve\/[A-Za-z0-9_-]{43}$/;
 /** NOW + 10 minutes, in New York: when a hold placed at NOW lapses. */
 const HOLD_EXPIRES = "2026-11-09T12:10:00-05:00";
@@ -126,7 +126,7 @@ describe("book", () => {
       end: at("15:00"),
       display: "Sat 14 Nov, 2:30 pm EST",
       status: "awaiting_approval",
-      customer: { displayName: "Maya Lopez", verified: false },
+      customer: customerOf("Maya Lopez", false),
       agent: { name: "claude-ai" },
       depositCents: 1000,
       createdAt: "2026-11-09T12:00:00-05:00",
@@ -137,7 +137,7 @@ describe("book", () => {
     expect(notifier.alerts).toEqual([]);
     const confirmed = await approveAsCustomer(deps, booking);
     expect(notifier.alerts).toEqual([confirmed]);
-    expect(confirmed).toMatchObject({ status: "confirmed", customer: { verified: true, phoneLast4: "0123" } });
+    expect(confirmed).toMatchObject({ status: "confirmed", customer: { approved: true, phone: PHONE_E164 } });
 
     const after = await saturdayStarts(deps);
     // A 30-minute haircut at 14:30 blocks 14:15 (would run to 14:45), 14:30 and 14:45.
@@ -484,7 +484,7 @@ describe("book: a start that isn't bookable gets the most specific code", () => 
   });
 });
 
-describe("book: no idempotency keys", () => {
+describe("book: a repeated call", () => {
   it("calling twice for the same time doesn't double-book: the second is slot_taken while the hold is on", async () => {
     const notifier = recordingNotifier();
     const deps = memoryDeps({ notifier });
@@ -518,9 +518,9 @@ describe("book: no idempotency keys", () => {
     expect(a.booking.approval?.url).not.toBe(b.booking.approval?.url);
   });
 
-  it("ignores an idempotency_key an older agent still sends", async () => {
+  it("ignores an argument it doesn't know, e.g. the retry key Ring 1a agents still send", async () => {
     const deps = memoryDeps();
-    const args = { ...haircut(at("14:30")), idempotency_key: "old-client-key-0001" } as unknown as BookInput;
+    const args = { ...haircut(at("14:30")), retry_key: "old-client-key-0001" } as unknown as BookInput;
     const { booking } = await book(deps, "harts", args, "agent");
     expect(booking.status).toBe("awaiting_approval");
   });
@@ -714,7 +714,7 @@ if (!pgUrl) {
       .set({ weekday: 2 })
       .startOf("day");
     const time = (hh: number, mm = 0) => tuesday.set({ hour: hh, minute: mm }).toISO({ suppressMilliseconds: true })!;
-    const deps: FrontDeskDeps = withConsent({
+    const deps: FrontDeskDeps = withBaseUrl({
       catalog: store,
       store,
       clock: fixedClock(new Date(time(8))),

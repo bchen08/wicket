@@ -3,7 +3,8 @@ import { approvalDeclinePost } from "@/lib/server/consent/http";
 import { getFrontDeskDeps } from "@/lib/server/frontdesk/deps";
 
 // POST /api/approvals/[token]/decline — decline (DeclineResponse): the booking is cancelled and the
-// slot freed. No body. Public: the token in the path is the credential.
+// slot freed. No body. Also takes a plain HTML form post and answers 303 → /approve/<token>.
+// Public: the token in the path is the credential.
 export async function POST(request: Request, ctx: RouteContext<"/api/approvals/[token]/decline">) {
   // Reads the clock and writes the database: request-time only, never prerendered.
   await connection();

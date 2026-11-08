@@ -5,7 +5,7 @@ import type { Clock } from "../clock";
 import { FrontDeskError } from "./errors";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
 import { book, cancelBooking, getAvailability, getBooking, transitionBooking } from "./service";
-import { approveAsCustomer, recordingNotifier, TEST_CONSENT, withConsent } from "./test-support";
+import { approveAsCustomer, recordingNotifier, TEST_BASE_URL, withBaseUrl } from "./test-support";
 
 // Issue #8's lifecycle flow against a real Postgres, through the service layer (what
 // the MCP tools and owner routes call), when DATABASE_URL_TEST points at a database with 0001, 0002,
@@ -14,9 +14,9 @@ import { approveAsCustomer, recordingNotifier, TEST_CONSENT, withConsent } from 
 // Tue–Sat 09:00–17:00, a 30-minute service with a deposit and a 20-minute one without, and a policies
 // row like Hart's), books only in 2099, and deletes everything it made in afterAll.
 // Ring 1b: book places a hold; a booking is confirmed when the person approves it through the link
-// (approveAsCustomer, through the approval use case), and the owner is alerted then. book and cancel
-// take no idempotency key: a repeated book of a held time is slot_taken, a repeated cancel
-// not_cancellable. Phone numbers carry a 6-digit prefix of this run's own.
+// (approveAsCustomer, through the approval use case), and the owner is alerted then. A repeated book of
+// a held time is slot_taken, a repeated cancel not_cancellable. Phone numbers carry a 6-digit prefix of
+// this run's own.
 const url = process.env.DATABASE_URL_TEST?.trim();
 
 if (!url) {
@@ -36,12 +36,12 @@ if (!url) {
     let now = new Date();
     const clock: Clock = { now: () => new Date(now.getTime()) };
     const notifier = recordingNotifier();
-    const deps = withConsent({
+    const deps = withBaseUrl({
       catalog: store,
       store,
       clock,
       notifier,
-      consent: TEST_CONSENT,
+      baseUrl: TEST_BASE_URL,
     });
     /** 6 digits of this run's own, in every phone number this file uses. */
     const PHONE_PREFIX = String(100000 + Math.floor(Math.random() * 900000));
@@ -127,25 +127,25 @@ if (!url) {
       expect(listed.map((b) => b.id)).toEqual([first.booking.id]);
       expect(await eventsOf(first.booking.id)).toEqual([["booked", "agent"]]);
       expect(notifier.alerts.length - alertsBefore).toBe(0); // a hold isn't news for the owner
-      const stored: Booking = { ...first.booking };
-      delete stored.approval; // reads never show the link
-      expect((await getBooking(deps, shop, { booking_id: first.booking.id })).booking).toEqual(stored);
+      // get_booking returns the same booking, with the same approval link, while the hold is on.
+      expect((await getBooking(deps, shop, { booking_id: first.booking.id })).booking).toEqual(first.booking);
+      expect(first.booking.approval?.url).toMatch(new RegExp(`^${TEST_BASE_URL}/approve/[A-Za-z0-9_-]{43}$`));
 
       const phone = phoneNumber();
       const approved = await approveAsCustomer(deps, first.booking, phone);
-      expect(approved).toMatchObject({ id: first.booking.id, status: "confirmed", customer: { verified: true, phoneLast4: phone.slice(-4) } });
+      expect(approved).toMatchObject({ id: first.booking.id, status: "confirmed", customer: { approved: true, phone } });
       expect(notifier.alerts.length - alertsBefore).toBe(1);
       expect((await getBooking(deps, shop, { booking_id: first.booking.id })).booking).toEqual(approved);
       const [row] = await sql<{ customer_phone: string | null }[]>`select customer_phone from bookings where id = ${first.booking.id}::uuid`;
       expect(row.customer_phone).toBe(phone);
     });
 
-    it("approve without a phone: confirmed and verified, no phoneLast4, nothing stored", async () => {
+    it("approve without a phone: confirmed and approved, no customer.phone, nothing stored", async () => {
       setNow(time(0, 0, 10));
       const held = await bookTrim(time(0, 1, 13));
       const approved = await approveAsCustomer(deps, held.booking, null);
-      expect(approved).toMatchObject({ status: "confirmed", customer: { verified: true } });
-      expect(approved.customer).not.toHaveProperty("phoneLast4");
+      expect(approved).toMatchObject({ status: "confirmed", customer: { approved: true } });
+      expect(approved.customer).not.toHaveProperty("phone");
       const [row] = await sql<{ customer_phone: string | null }[]>`select customer_phone from bookings where id = ${held.booking.id}::uuid`;
       expect(row.customer_phone).toBeNull();
     });

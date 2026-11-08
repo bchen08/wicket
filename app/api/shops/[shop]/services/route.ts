@@ -12,7 +12,7 @@ export async function GET(_request: Request, ctx: RouteContext<"/api/shops/[shop
 }
 
 // POST /api/shops/[shop]/services — add a service (CreateServiceRequest → 201 ServiceResponse).
-// Owner route: Authorization: Bearer <OWNER_API_TOKEN>. TODO(ring-2): owner sign-in replaces the token.
+// Owner route: Authorization: Bearer <OWNER_API_TOKEN>, or the fd_owner cookie. TODO(ring-2): owner sign-in replaces the token.
 // (GET above stays public.)
 export async function POST(request: Request, ctx: RouteContext<"/api/shops/[shop]/services">) {
   await connection();

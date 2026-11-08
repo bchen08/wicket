@@ -6,16 +6,13 @@
 -- link and tapping Approve is the consent. A hold nobody answers is expired lazily.
 -- TODO(ring-1c): a code texted to the person's phone comes back once real texting ships.
 -- Same access model as 0001: RLS on, no policies.
---
--- Also drops idempotency_keys (from 0002): book and cancel no longer take an idempotency_key.
--- Double booking stays impossible through the no_overlap constraint.
 
 -- ---- Bookings: the hold, the person's phone and the mandate ----
 -- Each multi-part ALTER TABLE below is one statement, so the table is never without its constraints.
 alter table bookings
   -- When the hold lapses. Set for every booking book creates; null for older rows.
   add column approve_by     timestamptz,
-  -- The phone number the person gave when approving, E.164 (e.g. '+14015550123'). Optional; not verified.
+  -- The phone number the person gave when approving, E.164 (e.g. '+14015550123'). Optional; not checked.
   add column customer_phone text check (customer_phone ~ '^\+[1-9][0-9]{7,14}$'),
   -- The person's limits as the agent sent them (priceCapCents, depositCapCents, window). Null if none.
   add column mandate        jsonb,
@@ -45,8 +42,8 @@ alter table events
 -- ---- Approvals: one per booking; the link's token is the credential ----
 create table approvals (
   booking_id uuid        primary key references bookings (id) on delete cascade,
-  -- SHA-256 of the token in the approval link, hex. The token itself is never stored.
-  token_hash text        not null unique check (token_hash ~ '^[0-9a-f]{64}$'),
+  -- The token in the approval link, stored as it is, so every booking response can carry the link.
+  token      text        not null unique,
   created_at timestamptz not null default now(),
   decided_at timestamptz,
   decision   text        check (decision in ('approved', 'declined')),
@@ -55,5 +52,4 @@ create table approvals (
 
 alter table approvals enable row level security;
 
--- ---- Idempotency keys: no longer used ----
-drop table idempotency_keys;
+-- TODO: drop idempotency_keys in the next migration; unused since the MVP reset.

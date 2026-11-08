@@ -21,8 +21,7 @@ import type {
   Slot,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
-import { approvalUrl, type ConsentConfig } from "../consent/config";
-import { newApprovalToken, sha256Hex } from "../consent/crypto";
+import { newApprovalToken } from "../consent/crypto";
 import {
   bookingBounds,
   checkStart,
@@ -51,9 +50,27 @@ export type FrontDeskDeps = {
   clock: Clock;
   store: BookingStore;
   notifier: Notifier;
-  /** Approval links (Ring 1b). */
-  consent: ConsentConfig;
+  /**
+   * The origin approval links point at, without a trailing slash, e.g. "https://emergent.vercel.app".
+   * Each route sets it to the origin of the request it's serving (withRequestOrigin), so links work on
+   * previews and in production with no setting. createFrontDeskDeps starts it at http://localhost:3000.
+   */
+  baseUrl: string;
 };
+
+/** `deps` with baseUrl set to the origin of `request`, so the bookings it returns link to where the caller is. */
+export function withRequestOrigin(deps: FrontDeskDeps, request: Request): FrontDeskDeps {
+  return { ...deps, baseUrl: new URL(request.url).origin };
+}
+
+/**
+ * The booking as it leaves the server: its approval link (a path, from the store) gets deps.baseUrl in
+ * front. Every use case that returns a booking passes it through here.
+ */
+export function withApprovalOrigin(deps: Pick<FrontDeskDeps, "baseUrl">, booking: Booking): Booking {
+  if (!booking.approval || !booking.approval.url.startsWith("/")) return booking;
+  return { ...booking, approval: { ...booking.approval, url: `${deps.baseUrl}${booking.approval.url}` } };
+}
 
 const MIN_MS = 60_000;
 const HOUR_MS = 60 * MIN_MS;
@@ -147,7 +164,9 @@ export async function transitionBooking(
         depositCollected: false,
       },
     });
-    if (updated) return { booking: updated, depositEffect: decision.depositEffect, depositCollected: false };
+    if (updated) {
+      return { booking: withApprovalOrigin(deps, updated), depositEffect: decision.depositEffect, depositCollected: false };
+    }
   }
   throw new Error(`Booking ${bookingId} kept changing status during ${action}; gave up after ${MAX_TRANSITION_ATTEMPTS} attempts.`);
 }
@@ -478,8 +497,8 @@ export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string
 /**
  * Hold `input.start` for `input.service_id` until the person approves it. Returns the booking in
  * awaiting_approval with booking.approval: the link to send the person, and when the hold lapses (10
- * minutes). Calling it twice places two holds; the second for the same time is slot_taken (the
- * no_overlap constraint), so a retried call can't double-book.
+ * minutes). Calling it twice for the same time gets slot_taken the second time (the no_overlap
+ * constraint), so a retried call can't double-book; get_booking shows the hold and its link again.
  *
  * 1. Validate the input (invalid_request), the mandate included.
  * 2. Check the start against the shop's rules (engine checkStart): paused, too_soon
@@ -491,7 +510,7 @@ export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string
  *    hold never blocks this booking. Then check against hours, blocked time and bookings:
  *    outside_hours, or slot_taken (details.alternatives: up to 3 nearby free starts). The staff
  *    member comes from the check.
- * 5. Store it with a new approval token's hash. If another booking got there first (SlotTakenError, i.e. the
+ * 5. Store it with a new approval token. If another booking got there first (SlotTakenError, i.e. the
  *    no_overlap constraint), read busy time again and, if another staff member is free at exactly this
  *    start, try once more with them. If that fails too, or nobody is free, fail with slot_taken; the
  *    database is the final word even when step 4 passed.
@@ -591,7 +610,7 @@ async function bookOnce(
   const check = checkStart(engine, start);
   if (!check.ok) throw refused(check, engine);
 
-  // The link's secret. Only its hash is stored; the link itself is returned once, here.
+  // The link's secret, stored as it is: every booking response while the hold is on carries the link.
   const token = newApprovalToken();
   /** The stored booking, or null if another booking holds that staff member's time (SlotTakenError). */
   const create = async (staffId: string): Promise<Booking | null> => {
@@ -606,7 +625,7 @@ async function bookOnce(
         agentName,
         depositCents: service.depositCents,
         approveBy: held.approveBy,
-        approvalTokenHash: sha256Hex(token),
+        approvalToken: token,
         mandate: args.mandate ?? null,
       });
     } catch (err) {
@@ -631,9 +650,8 @@ async function bookOnce(
 
   const staffId = booking.staffId;
   const staffName = staffHours.find((s) => s.staffId === staffId)?.staffName ?? staffId;
-  const approval = { url: approvalUrl(deps.consent, token), expiresAt: toRfc3339(held.approveBy, shop.timezone) };
   const holdDisplay = formatDisplay(DateTime.fromJSDate(held.approveBy, { zone: shop.timezone }));
-  return { booking: { ...booking, approval }, staffName, holdDisplay };
+  return { booking: withApprovalOrigin(deps, booking), staffName, holdDisplay };
 }
 
 /**
@@ -787,7 +805,8 @@ export type GetBookingOutcome = GetBookingResult & { declined: boolean };
 
 /**
  * One booking at the shop, after lazy expiry (a lapsed hold reads as expired). An unknown, malformed
- * or other shop's id is booking_not_found. It never includes booking.approval (see Booking.approval).
+ * or other shop's id is booking_not_found. While the hold is on it includes booking.approval, the same
+ * link book returned.
  * TODO(ring-2): get_booking and cancel still trust anyone holding the booking id; agent identity fixes this.
  */
 export async function getBooking(
@@ -800,7 +819,7 @@ export async function getBooking(
   const booking = await requireBooking(deps, shopSlug, booking_id);
   const declined =
     booking.status === "cancelled" && (await deps.store.listEvents(booking.id)).some((e) => e.type === "declined");
-  return { booking, declined };
+  return { booking: withApprovalOrigin(deps, booking), declined };
 }
 
 /** Check raw `cancel` arguments (any JSON) and narrow them to CancelInput. booking_id is returned trimmed. */
@@ -834,10 +853,9 @@ export const BOOKINGS_FUTURE_DAYS = 30;
 
 /**
  * The shop and its bookings of any status from 7 days ago to 30 days ahead, sorted by start. Lapsed
- * holds in that range are expired first (lazy expiry), so the list never shows a stale hold. Bookings
- * never include their approval link.
- *
- * TODO(ring-2): owner sign-in. Until then anyone with the URL can read customer names.
+ * holds in that range are expired first (lazy expiry), so the list never shows a stale hold. A booking
+ * awaiting approval includes its approval link, for the owner to copy. An owner route (it shows
+ * customers' phone numbers): the HTTP layer checks owner auth first.
  */
 export async function listShopBookings(deps: FrontDeskDeps, shopSlug: string): Promise<BookingsResponse> {
   const shop = await requireShop(deps, shopSlug);
@@ -848,5 +866,5 @@ export async function listShopBookings(deps: FrontDeskDeps, shopSlug: string): P
   };
   await deps.store.expireStaleHolds(shopSlug, range, now);
   const bookings = await deps.store.listBookings(shopSlug, range);
-  return { shop, bookings };
+  return { shop, bookings: bookings.map((b) => withApprovalOrigin(deps, b)) };
 }

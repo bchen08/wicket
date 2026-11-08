@@ -20,9 +20,10 @@ import type { Clock } from "../clock";
 import { approvalApprovePost, approvalDeclinePost, approvalGet } from "../consent/http";
 import { bookingActionPost, bookingDetailGet, bookingsResponse, policiesGet, policiesPut, type OwnerOptions } from "./http";
 import { createFrontDeskMcpHandler } from "./mcp";
+import { NOT_SET_UP_NEXT_ACTION, UNLOCK_NEXT_ACTION } from "./owner-auth";
 import { SEED } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
-import { approvalToken, memoryDeps, PHONE_E164, recordingNotifier } from "./test-support";
+import { approvalToken, customerOf, memoryDeps, PHONE_E164, recordingNotifier } from "./test-support";
 
 // Issue #8's "Done when" list, end to end: the real MCP handler (what /api/mcp mounts) and the real
 // owner HTTP handlers (what the /api/shops/* route files call) over ONE deps object, the way
@@ -133,7 +134,8 @@ function ownerRequest(method: string, path: string, body?: unknown, auth: string
   const headers: Record<string, string> = {};
   if (auth !== null) headers.authorization = auth;
   if (body !== undefined) headers["content-type"] = "application/json";
-  return new Request(`http://localhost/api/shops/harts${path}`, {
+  // The same origin as the MCP door's links (deps.baseUrl), so the owner sees the same approval link.
+  return new Request(`http://localhost:3000/api/shops/harts${path}`, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -178,13 +180,6 @@ const approveWith = (token: string, body?: unknown, status = 200) =>
 /** The person approves `booking` (book's result) on the page, giving their phone number. */
 async function approveOnPage(booking: Booking, phone = PHONE_E164): Promise<Booking> {
   return (await approveWith(approvalToken(booking), { phone })).booking;
-}
-
-/** book's result without the approval link, as every later read shows it. */
-function withoutLink(booking: Booking): Booking {
-  const copy = { ...booking };
-  delete copy.approval;
-  return copy;
 }
 
 const local = (slot: Slot) => slot.start.slice(11, 16);
@@ -261,7 +256,7 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect(stored.map((b) => b.id)).toEqual([first.data.booking.id]);
 
     const detail = await bookingDetail(first.data.booking.id);
-    expect(detail.booking).toEqual(withoutLink(first.data.booking));
+    expect(detail.booking).toEqual(first.data.booking); // the same link, for the owner to copy
     expect(detail.events.map((e) => [e.type, e.actor])).toEqual([["booked", "agent"]]);
     expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
   });
@@ -345,7 +340,6 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
       to: "confirmed",
       depositEffect: "none",
       depositCollected: false,
-      phoneLast4: "0123",
     });
     expect(cancelled.events[2].data).toEqual({ from: "confirmed", to: "cancelled", depositEffect: "released", depositCollected: false });
 
@@ -374,7 +368,7 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     }
   });
 
-  it("8. owner routes answer 401 without the token and 503 when OWNER_API_TOKEN is unset", async () => {
+  it("8. owner routes answer 401 without the token, and when OWNER_API_TOKEN is unset", async () => {
     const noToken = await policiesGet(getDeps, ownerRequest("GET", "/policies", undefined, null), "harts", OWNER);
     expect(noToken.status).toBe(401);
     expect(noToken.headers.get("www-authenticate")).toMatch(/^Bearer /);
@@ -390,14 +384,19 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect((await ok<GetPoliciesResult>("get_policies")).data.policies.paused).toBe(false);
 
     const unset = await policiesGet(getDeps, ownerRequest("GET", "/policies"), "harts", { getToken: () => undefined });
-    expect(unset.status).toBe(503);
+    expect(unset.status).toBe(401);
     const body = (await unset.json()) as ApiError;
-    expect(body.error.message).toMatch(/OWNER_API_TOKEN/);
+    expect(body.error).toMatchObject({ code: "unauthorized", next_action: NOT_SET_UP_NEXT_ACTION });
     expect(JSON.stringify(body)).not.toContain(TOKEN);
+
+    // The bookings list (what the console reads) says to unlock.
+    const locked = await bookingsResponse(getDeps, ownerRequest("GET", "/bookings", undefined, null), "harts", OWNER);
+    expect(locked.status).toBe(401);
+    expect(((await locked.json()) as ApiError).error.next_action).toBe(UNLOCK_NEXT_ACTION);
 
     // The default reads process.env.OWNER_API_TOKEN, like the route files.
     vi.stubEnv("OWNER_API_TOKEN", undefined);
-    expect((await policiesGet(getDeps, ownerRequest("GET", "/policies"), "harts")).status).toBe(503);
+    expect((await policiesGet(getDeps, ownerRequest("GET", "/policies"), "harts")).status).toBe(401);
     vi.stubEnv("OWNER_API_TOKEN", TOKEN);
     expect((await policiesGet(getDeps, ownerRequest("GET", "/policies"), "harts")).status).toBe(200);
   });
@@ -408,9 +407,9 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
 // Opening the link and approving is the consent (no phone code until Ring 1c). "Now" is Tue 10 Nov 2026,
 // 10:20 in New York; the hold lasts until 10:30.
 describe("Done when (issue #15): consent, through MCP, the approval API and the owner routes over shared deps", () => {
-  const bookingsList = () => json<BookingsResponse>(bookingsResponse(getDeps, "harts"));
+  const bookingsList = () => json<BookingsResponse>(bookingsResponse(getDeps, ownerRequest("GET", "/bookings"), "harts", OWNER));
 
-  it("book → link → approve (with a phone) → get_booking confirmed and verified → the owner's list shows the customer", async () => {
+  it("book → link → approve (with a phone) → get_booking confirmed and approved → the owner's list shows the customer", async () => {
     const { data, text } = await ok<BookResult>("book", bookArgs(THU_1000, "Maya Lopez"));
     const booking = data.booking;
     expect(booking.status).toBe("awaiting_approval");
@@ -433,19 +432,25 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
     });
     expect(view).not.toHaveProperty("codeSentTo");
 
+    // While it's pending, get_booking and the owner's list carry the same link book returned.
+    const pending = await ok<GetBookingResult>("get_booking", { booking_id: booking.id });
+    expect(pending.data.booking.approval).toEqual(booking.approval);
+    expect(pending.text).toContain(`Waiting for Maya Lopez to approve with this link: ${booking.approval!.url}`);
+    expect((await bookingsList()).bookings.find((b) => b.id === booking.id)?.approval).toEqual(booking.approval);
+
     // The person approves on the page, typing their number with separators.
     const approved = await approveWith(token, { phone: "+1 (401) 555-0123" });
     expect(approved.booking).toMatchObject({
       id: booking.id,
       status: "confirmed",
-      customer: { displayName: "Maya Lopez", verified: true, phoneLast4: "0123" },
+      customer: customerOf("Maya Lopez", true, PHONE_E164),
     });
     expect(approved.booking).not.toHaveProperty("approval");
     expect((await approvalView(token)).status).toBe("approved");
 
     const fetched = await ok<GetBookingResult>("get_booking", { booking_id: booking.id });
     expect(fetched.data.booking).toEqual(approved.booking);
-    expect(fetched.text).toContain("Maya Lopez approved it (phone ending 0123). It is confirmed.");
+    expect(fetched.text).toContain("Maya Lopez approved it. It is confirmed.");
 
     const list = await bookingsList();
     expect(list.bookings.find((b) => b.id === booking.id)).toEqual(approved.booking);
@@ -490,17 +495,17 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
     const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
     const token = approvalToken(held);
     const declined = await json<DeclineResponse>(approvalDeclinePost(getDeps, pageRequest(`/${token}/decline`), token));
-    expect(declined.booking).toMatchObject({ id: held.id, status: "cancelled", customer: { verified: false } });
+    expect(declined.booking).toMatchObject({ id: held.id, status: "cancelled", customer: { approved: false } });
     expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).toContain(THU_1000);
     expect((await approvalView(token)).status).toBe("declined");
     expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
   });
 
-  it("approving with no body (no phone): confirmed and verified, no phoneLast4", async () => {
+  it("approving with no body (no phone): confirmed and approved, no customer.phone", async () => {
     const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
     const approved = await approveWith(approvalToken(held));
-    expect(approved.booking).toMatchObject({ id: held.id, status: "confirmed", customer: { verified: true } });
-    expect(approved.booking.customer).not.toHaveProperty("phoneLast4");
+    expect(approved.booking).toMatchObject({ id: held.id, status: "confirmed", customer: { approved: true } });
+    expect(approved.booking.customer).not.toHaveProperty("phone");
     const fetched = await ok<GetBookingResult>("get_booking", { booking_id: held.id });
     expect(fetched.text).toContain("E2E Maya approved it. It is confirmed.");
   });

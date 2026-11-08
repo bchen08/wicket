@@ -1,13 +1,8 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 
 // The approval link's token and the person's phone number.
-//   approval token: 32 random bytes, base64url, in the link; stored as SHA-256 hex. Never logged.
-//   phone number:   optional, given on approve; E.164, stored as it is (an MVP decision; no hashing).
-
-/** SHA-256 of `value` (UTF-8), hex. */
-export function sha256Hex(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
-}
+//   approval token: 32 random bytes, base64url, in the link and stored as it is (approvals.token).
+//   phone number:   optional, given on approve; E.164, stored as it is.
 
 /** A new approval token: 32 random bytes, base64url (43 characters, no padding). */
 export function newApprovalToken(): string {
@@ -21,6 +16,11 @@ export function isWellFormedToken(token: string): boolean {
   return TOKEN.test(token);
 }
 
+/** The approval page's path for `token`, e.g. "/approve/<token>". The service layer puts the request's origin in front. */
+export function approvalPath(token: string): string {
+  return `/approve/${token}`;
+}
+
 /** Characters people type in phone numbers that E.164 doesn't have. */
 const PHONE_SEPARATORS = /[\s\-().]/g;
 /** E.164: "+", a country code that doesn't start with 0, 8–15 digits in all. */
@@ -30,9 +30,4 @@ const E164 = /^\+[1-9]\d{7,14}$/;
 export function normalizePhone(value: string): string | null {
   const compact = value.replace(PHONE_SEPARATORS, "");
   return E164.test(compact) ? compact : null;
-}
-
-/** The last 4 digits of an E.164 number. */
-export function last4(phoneE164: string): string {
-  return phoneE164.slice(-4);
 }
