@@ -161,7 +161,7 @@ Transitions of a booking with a held deposit say `depositCollected: true`.
 
 ## Database: `0005_deposits.sql`
 
-[`supabase/migrations/0005_deposits.sql`](../supabase/migrations/0005_deposits.sql) adds to `bookings` (0004 is taken by the owner-alerts PR):
+[`supabase/migrations/0005_deposits.sql`](../supabase/migrations/0005_deposits.sql) adds to `bookings`:
 
 | Column | Type | What |
 |---|---|---|

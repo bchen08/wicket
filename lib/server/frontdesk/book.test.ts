@@ -7,7 +7,18 @@ import { FrontDeskError } from "./errors";
 import { SEED, type MemoryStore } from "./memory-store";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
 import { book, getAvailability, getBooking, listServices, type FrontDeskDeps } from "./service";
-import { approveAsCustomer, customerOf, memoryDeps, NOW, PHONE_E164, recordingNotifier, SAT, withBaseUrl, withCatalog } from "./test-support";
+import {
+  approveAsCustomer,
+  customerOf,
+  failingNotifier,
+  memoryDeps,
+  NOW,
+  PHONE_E164,
+  recordingNotifier,
+  SAT,
+  withBaseUrl,
+  withCatalog,
+} from "./test-support";
 
 // book() against the in-memory store with a fixed clock: Mon 9 Nov 2026, noon in New York (Hart's is
 // closed on Mondays). Dana works Tue–Sat 09:00–12:00 and 12:30–17:00. Saturday 14 Nov (5 days ahead)
@@ -137,7 +148,7 @@ describe("book", () => {
     // The owner hears about it only once the person approves.
     expect(notifier.alerts).toEqual([]);
     const confirmed = await approveAsCustomer(deps, booking);
-    expect(notifier.alerts).toEqual([confirmed]);
+    expect(notifier.alerts.map((a) => [a.kind, a.booking])).toEqual([["booking_confirmed", confirmed]]);
     expect(confirmed).toMatchObject({ status: "confirmed", customer: { approved: true, phone: PHONE_E164 } });
 
     const after = await saturdayStarts(deps);
@@ -210,24 +221,32 @@ describe("book", () => {
     expect((await book(deps, "harts", haircut(at("09:30")), "\u0000\u001f")).booking.agent.name).toBe("unknown agent");
   });
 
-  it("still approves when the notifier throws, and logs the failure", async () => {
+  it("still approves when the alert fails: the alert is recorded as failed, with the error, and logged", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-    const deps = memoryDeps({
-      notifier: {
-        async alertOwner() {
-          throw new Error("SMTP is down");
-        },
-      },
-    });
+    const deps = memoryDeps({ notifier: failingNotifier("Resend answered HTTP 500: down") });
 
     const { booking: held } = await book(deps, "harts", haircut(at("11:00")), "agent");
     expect(errors).not.toHaveBeenCalled(); // book itself never notifies
     const booking = await approveAsCustomer(deps, held);
     expect(booking.status).toBe("confirmed");
+    expect((await deps.store.getBooking(booking.id))?.status).toBe("confirmed");
     expect(await saturdayStarts(deps)).not.toContain(at("11:00"));
+    expect(await deps.store.listAlerts("harts", 50)).toEqual([
+      {
+        id: expect.any(String),
+        shopSlug: "harts",
+        bookingId: booking.id,
+        kind: "booking_confirmed",
+        channel: "email",
+        recipient: "dana@example.com",
+        status: "failed",
+        error: "Resend answered HTTP 500: down",
+        createdAt: "2026-11-09T12:00:00-05:00",
+      },
+    ]);
     expect(errors).toHaveBeenCalledTimes(1);
     const logged = JSON.parse(String(errors.mock.calls[0][0]));
-    expect(logged).toMatchObject({ event: "booking.notify_failed", id: booking.id, error: "SMTP is down" });
+    expect(logged).toMatchObject({ event: "booking.notify_failed", id: booking.id, kind: "booking_confirmed", error: "Resend answered HTTP 500: down" });
   });
 });
 
@@ -317,7 +336,7 @@ describe("book: slot_taken", () => {
     expect(loser.booking.approval?.url).not.toBe(winner.booking.approval?.url);
     await approveAsCustomer(deps, winner.booking, "+14015550101");
     await approveAsCustomer(deps, loser.booking, "+14015550102");
-    expect(notifier.alerts.map((b) => b.id)).toEqual([winner.booking.id, loser.booking.id]);
+    expect(notifier.alerts.map((a) => a.booking.id)).toEqual([winner.booking.id, loser.booking.id]);
   });
 
   it("is slot_taken after one retry, and keeps the start in the alternatives while someone is still free then", async () => {

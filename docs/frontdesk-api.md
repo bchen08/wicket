@@ -13,16 +13,17 @@ Front Desk lets AI agents (Claude, ChatGPT, personal agents) ask a small busines
 | Tools | `list_services`, `get_policies`, `get_availability`, `get_booking` (read-only), `book` and `cancel` |
 | Public routes | `GET /api/shops/[shop]/services` |
 | Approval routes | `GET /api/approvals/[token]`, `POST /api/approvals/[token]/approve`, `/decline` (the approval page at `/approve/[token]` uses them) |
-| Owner routes | the bookings list, policies, hours, blocked time, services, booking actions and booking history under `/api/shops/[shop]/`; the owner session at `/api/owner/session` |
+| Owner routes | the bookings list, policies, hours, blocked time, services, booking actions, booking history and owner alerts under `/api/shops/[shop]/`; the owner session at `/api/owner/session` |
 | Pages | `/approve/[token]` (the link the person opens), `/console` and `/console/unlock` (the owner's bookings) |
 | Data | Postgres (Supabase). See [database.md](database.md). |
 
 Request and response shapes are exported from [`lib/types/frontdesk.ts`](../lib/types/frontdesk.ts):
-- Shared: `Shop`, `Service`, `Slot`, `Policies`, `Booking`, `BookingStatus`, `DepositEffect`, `BookingEvent`, `BookingActor`, `BookingEventType`, `Mandate`, `ApiError`, `ApiErrorCode`.
+- Shared: `Shop`, `Service`, `Slot`, `Policies`, `AgentPolicies`, `Booking`, `BookingStatus`, `DepositEffect`, `BookingEvent`, `BookingActor`, `BookingEventType`, `Mandate`, `ApiError`, `ApiErrorCode`.
 - Tools: `ListServicesResult`, `GetPoliciesResult`, `GetAvailabilityInput`, `GetAvailabilityResult`, `BookInput`, `BookResult`, `GetBookingInput`, `GetBookingResult`, `CancelInput`, `CancelResult` (= `BookingTransitionResult`).
 - Public routes: `ServicesResponse`.
 - Approval routes: `ApprovalView`, `ApproveRequest`, `ApproveResponse`, `DeclineResponse`.
-- Owner routes: `BookingsResponse`, `OwnerSessionRequest`, `OwnerSessionResponse`, `PoliciesResponse`, `UpdatePoliciesRequest`, `HoursResponse`, `UpdateHoursRequest`, `WeeklyHours`, `StaffWeeklyHours`, `BlocksResponse`, `CreateBlockRequest`, `BlockResponse`, `BlockedTime`, `CreateServiceRequest`, `UpdateServiceRequest`, `ServiceResponse`, `OwnerBookingActionResponse`, `BookingDetailResponse`.
+- Owner routes: `BookingsResponse`, `OwnerSessionRequest`, `OwnerSessionResponse`, `PoliciesResponse`, `UpdatePoliciesRequest`, `HoursResponse`, `UpdateHoursRequest`, `WeeklyHours`, `StaffWeeklyHours`, `BlocksResponse`, `CreateBlockRequest`, `BlockResponse`, `BlockedTime`, `CreateServiceRequest`, `UpdateServiceRequest`, `ServiceResponse`, `OwnerBookingActionResponse`, `BookingDetailResponse`, `Alert`, `AlertKind`, `AlertChannel`, `AlertStatus`, `AlertsResponse`.
+- Environment: `StatusResponse`.
 
 ## Conventions
 
@@ -110,6 +111,8 @@ Reads the shop's booking rules. No arguments. Read-only. Agents should call it b
 | `depositRule`, `lateCancelRule`, `noShowRule` | string | Plain-language rules to read to the person. `""` if not set. |
 
 A shop without a policies row gets the defaults: 120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules.
+
+`policies` is `AgentPolicies`: every `Policies` field except `ownerEmail`, which only the owner routes show. It isn't a rule an agent needs, and the owner's address isn't for every agent that connects.
 
 **Input**
 
@@ -483,7 +486,7 @@ The agent should tell the person the consequence and get their go-ahead first.
 - **Nothing is collected yet.** `depositEffect` is what the policy decides; `depositCollected` is always `false` until Ring 1c.
 - **Retrying is harmless.** Cancelling an already-cancelled booking is `not_cancellable`, so a retry never cancels twice or writes a second event.
 - **Anyone holding a booking id can cancel it** (`TODO(ring-2)`: agent identity fixes this).
-- The owner isn't alerted about agent cancellations yet (`TODO(ring-1c)`).
+- Once it's cancelled, the owner is alerted (`booking_cancelled`; see [Owner alerts](#owner-alerts)). A failed alert never undoes the cancel.
 - Annotations: `readOnlyHint: false`, `destructiveHint: true`, `idempotentHint: true`, `openWorldHint: false`.
 
 | Field | Type | Notes |
@@ -568,15 +571,16 @@ agent                         Front Desk                         person
   │                                │ ◄── GET  /approve/[token]        │ the page shows the booking,
   │                                │                                  │ the rules and the mandate
   │                                │ ◄── POST …/approve (phone?)      │ or POST …/decline
-  │                                │ confirmed, owner alerted         │
+  │                                │ confirmed (or cancelled),        │
+  │                                │ owner alerted                    │
   │  get_booking(id) ────────────► │                                  │
   │ ◄───────────────────────────── │ confirmed / cancelled / expired  │
 ```
 
 1. `book` returns the booking in `awaiting_approval` with `approval.url` = `<origin>/approve/<token>` and `approval.expiresAt` (now + 10 minutes). The origin is the origin of the request the agent made to `/api/mcp`, so links work on previews and in production with no setting. The token is 32 random bytes, base64url, stored as it is (`approvals.token`), so every booking response carries the link while the hold is on: `get_booking`, the owner's bookings list and booking detail.
 2. The agent sends the person the link. The page at `/approve/[token]` shows the shop, service, time, price, deposit ("not charged yet"), the cancellation rules, the agent's name, the name booked under and the mandate, plus an optional phone field, **Approve** and **Decline**, and when the hold expires. It's a plain server-rendered page with HTML forms (no client JS), a stand-in until v0 restyles it. Other clients can use [the approval API](#approval-api).
-3. **Approve** (`POST …/approve`): opening the link and tapping Approve is the consent. The booking becomes `confirmed`, `customer.approved` becomes `true`, and the owner is alerted. That's the only owner alert: a hold alone never notifies anyone. The person may give a phone number; it's stored with the booking as plain E.164 and shown as `customer.phone`. Nothing checks that it's theirs. `TODO(ring-1c)`: a code texted to that number comes back once real texting ships, and a service with a deposit will go to `awaiting_deposit` instead of `confirmed`.
-   **Decline** (`POST …/decline`): the booking becomes `cancelled` (`cancelled_by` `customer`) and the slot is free.
+3. **Approve** (`POST …/approve`): opening the link and tapping Approve is the consent. The booking becomes `confirmed`, `customer.approved` becomes `true`, and the owner is alerted (`booking_confirmed`; see [Owner alerts](#owner-alerts)). A hold alone never alerts anyone. The person may give a phone number; it's stored with the booking as plain E.164 and shown as `customer.phone`. Nothing checks that it's theirs. `TODO(ring-1c)`: a code texted to that number comes back once real texting ships, and a service with a deposit will go to `awaiting_deposit` instead of `confirmed`.
+   **Decline** (`POST …/decline`): the booking becomes `cancelled` (`cancelled_by` `customer`), the slot is free, and the owner is alerted (`booking_cancelled`).
    **No answer:** after 10 minutes the hold expires (`expired`) and the slot is free.
 4. The agent calls `get_booking` to see which happened, and tells the person.
 
@@ -637,7 +641,7 @@ Expires the hold first if it lapsed. `status` is `pending` (the person can answe
 
 Body (optional): no body, `{}`, or `{ "phone": "+14015550123" }`. The phone is E.164; spaces, dashes, dots and parentheses are ignored, and anything else is `invalid_request` (`details.field: "phone"`, the number isn't echoed). Checks, in order:
 1. The approval is pending: already answered or cancelled → `approval_closed`; the hold ran out → `approval_expired` ("Ask your agent to book again.").
-2. In one transaction, only if the hold is still on: the booking becomes `confirmed` with an `approved` event (actor `customer`), the phone is stored on the booking, and the approval is marked decided. The owner is then alerted once.
+2. In one transaction, only if the hold is still on: the booking becomes `confirmed` with an `approved` event (actor `customer`), the phone is stored on the booking, and the approval is marked decided. After that commits, the owner is alerted once (`booking_confirmed`). A failed alert is recorded as `failed` and the answer is still 200 with the confirmed booking.
 
 ```json
 {
@@ -672,7 +676,7 @@ Body (optional): no body, `{}`, or `{ "phone": "+14015550123" }`. The phone is E
 
 #### `POST /api/approvals/[token]/decline` → `DeclineResponse`
 
-No body. The booking becomes `cancelled` (a `declined` event, actor `customer`) and the slot is free. Only while pending.
+No body. The booking becomes `cancelled` (a `declined` event, actor `customer`) and the slot is free; then the owner is alerted (`booking_cancelled`). Only while pending.
 
 #### Try it with curl
 
@@ -834,6 +838,7 @@ Public: no token, and it never shows a secret value or a connection string. Alwa
   },
   "ownerAccess": "configured",
   "approvalLinks": { "origin": "https://emergent-git-my-branch.vercel.app" },
+  "alerts": "log",
   "problems": [
     "The database schema is outdated, missing approvals.token: rebuild the Preview database from this branch with GitHub → Actions → Preview database → Run workflow (docs/database.md)."
   ]
@@ -846,6 +851,7 @@ Public: no token, and it never shows a secret value or a connection string. Alwa
 - `database.schema` is `current` only if every table and column Front Desk reads and writes exists (`REQUIRED_SCHEMA` in `lib/server/frontdesk/schema.ts`), `outdated` with `missing` naming what isn't there (`table.column`, or a bare table name), or `unknown` when the database couldn't be inspected.
 - `database.writesAllowed`: never in production; elsewhere only when `shopName` ends in "(preview)" (the Preview database) or the data is in memory. A preview on a database without that mark is `not_ready`, since it might be production's.
 - `ownerAccess` is whether `OWNER_API_TOKEN` is set. `approvalLinks.origin` is the request's origin: approval links are built on the origin of the request that creates them.
+- `alerts` is how [owner alerts](#owner-alerts) go out: `email` when `RESEND_API_KEY` is set (Production), else `log`. Neither is a problem.
 
 ## Owner routes
 
@@ -986,13 +992,14 @@ curl -s -b jar.txt -c jar.txt -X DELETE http://localhost:3000/api/owner/session
 | `POST /api/shops/[shop]/bookings/[id]/complete` | no body | `OwnerBookingActionResponse` | 200 |
 | `POST /api/shops/[shop]/bookings/[id]/no-show` | no body | `OwnerBookingActionResponse` | 200 |
 | `GET /api/shops/[shop]/bookings/[id]` | | `BookingDetailResponse` | 200 |
+| `GET /api/shops/[shop]/alerts` | | `AlertsResponse` | 200 |
 
 Other statuses: **400** `invalid_request`, **401** `unauthorized` (including no `OWNER_API_TOKEN` set), **404** `not_found` (shop, staff member, service, blocked time) or `booking_not_found`, **500** `internal`.
 
 **Validation.** Request bodies are checked with zod:
 - The body must be a JSON object. An empty body or invalid JSON is 400 with `details.field: "body"`.
 - Unknown fields are rejected.
-- Text can't contain the NUL character (U+0000), which Postgres can't store: `phone`, the three rules, a service's `id` and `name`, a block's `reason`, and `staffId`. A shop slug, service id or booking id in the path that contains it is simply 404.
+- Text can't contain the NUL character (U+0000), which Postgres can't store: `phone`, `ownerEmail`, the three rules, a service's `id` and `name`, a block's `reason`, and `staffId`. A shop slug, service id or booking id in the path that contains it is simply 404.
 - A failure is 400 `invalid_request`. The message is the first problem; `details.field` is its dot path (e.g. `weekly.1.close`, or `body` for the body as a whole); `details.issues` lists every problem as `{ path, message }`.
 
 ```json
@@ -1016,7 +1023,7 @@ The examples below assume `export OWNER_API_TOKEN=<the deployment's token>`.
 
 ### Policies
 
-`GET` returns the shop and its policies (`PoliciesResponse`, the same shape as `get_policies`). `PUT` changes some of them.
+`GET` returns the shop and its policies (`PoliciesResponse`: the shape of `get_policies`, plus `ownerEmail`). `PUT` changes some of them.
 
 `PUT` body (`UpdatePoliciesRequest`): send only the fields to change, at least one. The others keep their values. Changes apply to the next tool call.
 
@@ -1029,6 +1036,7 @@ The examples below assume `export OWNER_API_TOKEN=<the deployment's token>`.
 | `paused` | `true` or `false` |
 | `phone` | 1–40 characters, or `null` to remove it |
 | `depositRule`, `lateCancelRule`, `noShowRule` | At most 1000 characters; `""` clears it |
+| `ownerEmail` | An email address with an `@`, at most 254 characters, or `null` to remove it. Where [owner alerts](#owner-alerts) are emailed. Nothing else is checked: Resend refuses what it can't send to, and the alert is recorded as `failed` with its message. |
 
 Text is stored trimmed. A shop without a policies row gets one, starting from the defaults. The change is merged into the stored row in one step, so two `PUT`s of different fields at the same moment both take effect.
 
@@ -1053,9 +1061,18 @@ curl -s -X PUT http://localhost:3000/api/shops/harts/policies \
     "phone": "+1 212-555-0142",
     "depositRule": "Services with a deposit need it when you book. We hold the deposit on your card at booking; it is only charged if you miss the appointment or cancel late.",
     "lateCancelRule": "Cancel at least 24 hours before your appointment and the deposit is released. Cancel within 24 hours and we keep the deposit as a late-cancellation fee.",
-    "noShowRule": "If you don't show up, we keep the deposit. Otherwise it is released after your appointment."
+    "noShowRule": "If you don't show up, we keep the deposit. Otherwise it is released after your appointment.",
+    "ownerEmail": null
   }
 }
+```
+
+Set where alerts go:
+
+```bash
+curl -s -X PUT http://localhost:3000/api/shops/harts/policies \
+  -H "Authorization: Bearer $OWNER_API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"ownerEmail": "dana@example.com"}'
 ```
 
 ### Hours
@@ -1254,6 +1271,89 @@ curl -s http://localhost:3000/api/shops/harts/bookings/<booking id> -H "Authoriz
 }
 ```
 
+## Owner alerts
+
+The owner hears about every booking that is confirmed or cancelled, and every alert is recorded, so it can be checked without reading anyone's inbox.
+
+| `kind` | When | Sent by |
+|---|---|---|
+| `booking_confirmed` | The person approved a booking (`POST /api/approvals/[token]/approve`). | `approveBooking` (`lib/server/consent/approvals.ts`) |
+| `booking_cancelled` | The agent cancelled a confirmed booking or a hold (`cancel`), or the person declined a hold (`POST …/decline`). | `cancelBooking` (`lib/server/frontdesk/service.ts`), `declineBooking` |
+
+No alert for a hold on its own, a hold that lapses, or anything the owner does themselves (their cancel, complete or no-show).
+
+**Channel.** Picked per alert (`createNotifier` in `lib/server/notify/notifier.ts`):
+- `email` when `RESEND_API_KEY` is set **and** the shop has an `ownerEmail` ([Policies](#policies)). One plain-text email through Resend's HTTP API, from `Front Desk <onboarding@resend.dev>` (`TODO(ring-3)`: the shop's own domain). With that shared sender, **Resend only delivers to the Resend account's own email address**, so the account must be created with the address the owner's alerts go to.
+- `log` everywhere else: one JSON line in the function log (Vercel → Logs), e.g. `{"event":"booking.confirmed","id":"…","shop":"harts","service":"haircut","start":"…","customer_first_name":"Maya","subject":"New booking: Haircut, Sat 14 Nov 2:30 pm"}`. It has the customer's first name only. Previews have no `RESEND_API_KEY`, so their alerts are always logged.
+
+`/api/status` says which (`"alerts": "email"` or `"log"`); neither is a problem.
+
+**When.** After the change is committed, before the response. A failed alert never changes the booking or the answer: Resend refusing the email or not answering within 8 seconds is recorded with `status: "failed"` and the error, and logged as `booking.notify_failed`. There are no retries (`TODO(ring-2)`).
+
+**The email** (fewer than 15 lines; times in the shop's zone):
+
+```
+Subject: New booking: Haircut, Sat 14 Nov 2:30 pm
+
+New booking at Hart's Barbers: the customer approved it.
+
+Service: Haircut
+When: Sat 14 Nov, 2:30 pm EST
+Customer: Maya Lopez
+Phone: +14015550123
+Booked by: claude-ai
+Price: $35 (deposit $10, not collected yet)
+
+All bookings: https://<origin>/console
+```
+
+A cancellation's subject is `Cancelled: Haircut, Sat 14 Nov 2:30 pm`, and its first line is `The agent cancelled a booking at Hart's Barbers. The time is free again.` or `The customer declined a booking at Hart's Barbers. The time is free again.` The phone line appears only when the person gave one. `<origin>` is the deployment that served the approval, decline or cancel.
+
+### `GET /api/shops/[shop]/alerts` → `AlertsResponse`
+
+**An owner route**: Bearer token or the `fd_owner` cookie. Like the bookings list, its 401 says `"Open /console/unlock and enter the shop's access code."`. It returns the shop's newest 50 alerts, newest first, whatever happened to them (`sent`, `logged` or `failed`).
+
+```bash
+curl -s http://localhost:3000/api/shops/harts/alerts -H "Authorization: Bearer $OWNER_API_TOKEN"
+```
+
+```json
+{
+  "shop": { "slug": "harts", "name": "Hart's Barbers", "timezone": "America/New_York" },
+  "alerts": [
+    {
+      "id": "12",
+      "shopSlug": "harts",
+      "bookingId": "632aa35c-4e9e-4a08-8880-b5b1165939e2",
+      "kind": "booking_cancelled",
+      "channel": "email",
+      "recipient": "dana@example.com",
+      "status": "failed",
+      "error": "Resend answered HTTP 403: You can only send testing emails to your own email address (owner@example.com).",
+      "createdAt": "2026-11-10T10:05:00-05:00"
+    },
+    {
+      "id": "11",
+      "shopSlug": "harts",
+      "bookingId": "632aa35c-4e9e-4a08-8880-b5b1165939e2",
+      "kind": "booking_confirmed",
+      "channel": "log",
+      "recipient": null,
+      "status": "logged",
+      "error": null,
+      "createdAt": "2026-11-10T10:01:00-05:00"
+    }
+  ]
+}
+```
+
+| Field | Notes |
+|---|---|
+| `id` | Increasing. Newest first: by `createdAt`, then `id`. |
+| `channel` | `email` or `log`. `recipient` is the address for `email`, `null` for `log`. |
+| `status` | `sent` (Resend accepted the email), `logged` (the log line was written) or `failed` (`error` says why; `null` otherwise). |
+| `createdAt` | When it was sent, in the shop's zone. Set by the database, like event times (see [database.md](database.md#database-time-and-frontdesk_now)). |
+
 ## Try the full loop
 
 Start the app. With `DATABASE_URL` set (see [database.md](database.md)), bookings go to Postgres. Without it, they go to an in-memory store that resets when the server restarts. Put an owner token in `.env.local` (git-ignored) so the owner routes work:
@@ -1316,8 +1416,11 @@ curl -s $O/bookings -H "$AUTH"
 $I --method tools/call --tool-name get_booking --tool-arg booking_id=$B
 $I --method tools/call --tool-name cancel --tool-arg booking_id=$B
 
-# 10. The owner's view: booked (agent), approved (customer), then cancelled (agent)
+# 10. The owner's view: booked (agent), approved (customer), then cancelled (agent); and the owner's
+#     alerts for it: booking_cancelled, then booking_confirmed (by log, logged, without RESEND_API_KEY;
+#     the dev server's terminal shows the log lines)
 curl -s $O/bookings/$B -H "$AUTH"
+curl -s $O/alerts -H "$AUTH"
 
 # 11. The owner pauses bookings → get_availability returns nothing and book returns paused
 curl -s -X PUT $O/policies -H "$AUTH" -H "Content-Type: application/json" -d '{"paused": true}'
@@ -1412,7 +1515,8 @@ These are marked `TODO(ring-N)` in the code:
 | ring-1c | Collect deposits and move money (`depositEffect` is the policy's decision; `depositCollected` is always `false`) | `lib/server/frontdesk/service.ts` (`book`, `transitionBooking`), `lib/server/engine/lifecycle.ts` |
 | ring-1c | `awaiting_deposit`: approval confirms a booking even when its service has a deposit, until deposits come with Stripe | `lib/server/engine/lifecycle.ts` (`decideAnswer`), `lib/server/consent/approvals.ts` (`approveBooking`), `lib/server/frontdesk/service.ts` (`book`) |
 | ring-1c | A code texted to the person's phone (Photon iMessage, Resend as a fallback) comes back once real texting ships; today the link alone is the consent | `lib/server/consent/approvals.ts`, `lib/types/frontdesk.ts` (approval page types), `supabase/migrations/0003_consent.sql` |
-| ring-1c | Owner alerts on a real channel (Photon) instead of a log line, including when an agent cancels | `lib/server/notify/log-notifier.ts`, `lib/server/frontdesk/service.ts` (`cancelBooking`) |
+| ring-2 | Retry owner alerts that failed (today a failed email is only recorded as `failed`) | `lib/server/frontdesk/service.ts` (`alertOwner`) |
+| ring-3 | Send owner alerts from the shop's own domain instead of Resend's onboarding sender (which only delivers to the Resend account's own address) | `lib/server/notify/email.ts` (`ALERT_FROM`) |
 | ring-2 | Let agents pick the shop (by slug or URL) instead of hard-coding Hart's | `lib/server/frontdesk/mcp.ts` (`DEFAULT_SHOP_SLUG`) |
 | ring-2 | Owner sign-in replaces `OWNER_API_TOKEN` and the `fd_owner` cookie | `lib/server/frontdesk/owner-auth.ts`, `lib/server/frontdesk/owner-session.ts`, `app/api/owner/session/route.ts`, `lib/server/frontdesk/http.ts`, the owner route files |
 | ring-2 | MCP sign-in: authenticate callers (`book` and `cancel` are open to anyone) | `app/api/mcp/route.ts` |

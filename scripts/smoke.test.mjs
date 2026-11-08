@@ -29,8 +29,9 @@ const readyStatus = (overrides = {}) => ({
     missing: [],
   },
   ownerAccess: "configured",
-  deposits: "off",
   approvalLinks: { origin: BASE },
+  alerts: "log",
+  deposits: "off",
   problems: [],
   ...overrides,
 });
@@ -43,13 +44,23 @@ const toolError = (code) => ({ isError: true, content: [{ type: "text", text: JS
 
 /**
  * A fake deployment. `route(url, init, state)` may answer a request first (return a Response) to change one
- * behavior. `doubleBook: true` lets the same start be booked twice (a broken server). Approving waits for
- * a deposit (with a Stripe URL) when status.deposits is "stripe_test", and confirms (not_collected) otherwise.
+ * behavior. `doubleBook: true` lets the same start be booked twice (a broken server). `ownerToken` is the
+ * token its owner routes accept. Approving, declining and cancelling record owner alerts, like the real one.
+ * Approving a service with a deposit (anything but a beard-trim) waits for it, with a Stripe URL, when
+ * status.deposits is "stripe_test", and confirms it (deposit not_collected) otherwise.
  */
-function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = {}) {
-  const state = { requests: [], bookings: [], mcp: [] };
+function fakeDeployment({ status = readyStatus(), route, doubleBook = false, ownerToken = PREVIEW_OWNER_TOKEN } = {}) {
+  const state = { requests: [], bookings: [], mcp: [], alerts: [] };
+  const alert = (b, kind) => state.alerts.unshift({ id: String(state.alerts.length + 1), bookingId: b.id, kind, channel: "log", status: "logged", error: null });
+  const isOwner = (headers) => headers.get("authorization") === `Bearer ${ownerToken}`;
   const ACTIVE = ["awaiting_approval", "awaiting_deposit", "confirmed"];
   const held = (start) => state.bookings.some((b) => b.start === start && ACTIVE.includes(b.status));
+  const newBooking = (start, service, agent) => {
+    const n = state.bookings.length + 1;
+    const b = { id: `booking-${n}`, token: `token-${n}`, start, service, status: "awaiting_approval", deposit: "none", agent };
+    state.bookings.push(b);
+    return b;
+  };
   const view = (b) => ({
     id: b.id,
     status: b.status,
@@ -57,7 +68,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = 
     display: `Tue 10 Nov, ${b.start.slice(11, 16)}`,
     agent: { name: b.agent },
     deposit: {
-      amountCents: 1000,
+      amountCents: b.service === "beard-trim" ? 0 : 1000,
       state: b.deposit,
       ...(b.status === "awaiting_deposit" ? { payUrl: `https://checkout.stripe.com/c/pay/cs_test_${b.id}`, payBy: "x" } : {}),
     },
@@ -83,28 +94,64 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = 
       });
     }
     if (method === "GET" && url.pathname === "/api/shops/harts/bookings") {
-      return headers.get("authorization") === `Bearer ${PREVIEW_OWNER_TOKEN}`
-        ? json({ bookings: [] })
-        : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
+      return isOwner(headers) ? json({ bookings: [] }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
+    }
+    if (method === "GET" && url.pathname === "/api/shops/harts/alerts") {
+      return isOwner(headers) ? json({ alerts: state.alerts.slice(0, 50) }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
     }
     if (url.pathname === "/api/shops/nope/services") return apiError(404, "not_found");
     if (method === "GET" && url.pathname === "/api/mcp") return new Response(null, { status: 405 });
 
-    const approve = /^\/api\/approvals\/([^/]+)\/approve$/.exec(url.pathname);
-    if (method === "POST" && approve) {
-      const b = state.bookings.find((x) => x.token === approve[1]);
-      if (!b || b.status !== "awaiting_approval") return apiError(409, "approval_closed");
-      const withStripe = status.deposits === "stripe_test";
-      b.status = withStripe ? "awaiting_deposit" : "confirmed";
-      b.deposit = withStripe ? "awaiting_payment" : "not_collected";
-      return json({ booking: view(b) });
+    // The web booking API.
+    if (method === "GET" && url.pathname === "/api/shops/harts/availability") {
+      const free = STARTS.filter((start) => !held(start)).map((start) => ({ start, display: `Tue 10 Nov, ${start.slice(11, 16)}` }));
+      const days = Array.from({ length: 7 }, (_, i) => ({ date: `2026-11-${10 + i}`, display: "x", slots: i === 0 ? free : [] }));
+      return json({ from: "2026-11-10", to: "2026-11-17", days });
+    }
+    if (method === "GET" && url.pathname === "/api/shops/harts/agents.md") {
+      const text = `MCP: ${BASE}/api/mcp\nGET ${BASE}/api/shops/harts/availability\nPOST ${BASE}/api/shops/harts/book\nSend booking.approval.url.`;
+      return new Response(text, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+    }
+    if (method === "GET" && url.pathname === "/.well-known/front-desk.json") {
+      return json({ mcp: `${BASE}/api/mcp`, webApi: `${BASE}/api/shops/harts`, agentsMd: `${BASE}/api/shops/harts/agents.md` });
+    }
+    if (method === "POST" && url.pathname === "/api/shops/harts/book") {
+      const form = (headers.get("content-type") ?? "").startsWith("application/x-www-form-urlencoded");
+      const fields = form ? Object.fromEntries(new URLSearchParams(init.body)) : JSON.parse(init.body);
+      if (held(fields.start) && !doubleBook) {
+        if (!form) return apiError(409, "slot_taken");
+        const back = new URL(headers.get("referer"));
+        back.searchParams.set("error", "slot_taken");
+        back.searchParams.set("message", "That time is already booked.");
+        return new Response(null, { status: 303, headers: { location: back.href } });
+      }
+      const b = newBooking(fields.start, fields.service, fields.bookedBy ?? "web");
+      if (form) return new Response(null, { status: 303, headers: { location: `${BASE}/approve/${b.token}` } });
+      return json({ booking: view(b), statusUrl: `${BASE}/api/approvals/${b.token}`, next_action: "Send the link." }, 201);
     }
 
     const decline = /^\/api\/approvals\/([^/]+)\/decline$/.exec(url.pathname);
     if (method === "POST" && decline) {
       const b = state.bookings.find((x) => x.token === decline[1]);
-      if (!b || b.status !== "awaiting_approval") return apiError(409, "not_pending");
+      if (!b || b.status !== "awaiting_approval") return apiError(409, "approval_closed");
       b.status = "cancelled";
+      alert(b, "booking_cancelled");
+      return json({ booking: view(b) });
+    }
+    const approve = /^\/api\/approvals\/([^/]+)\/approve$/.exec(url.pathname);
+    if (method === "POST" && approve) {
+      const b = state.bookings.find((x) => x.token === approve[1]);
+      if (!b || b.status !== "awaiting_approval") return apiError(409, "approval_closed");
+      if (b.service === "beard-trim") {
+        b.status = "confirmed";
+      } else if (status.deposits === "stripe_test") {
+        b.status = "awaiting_deposit";
+        b.deposit = "awaiting_payment";
+      } else {
+        b.status = "confirmed";
+        b.deposit = "not_collected";
+      }
+      if (b.status === "confirmed") alert(b, "booking_confirmed");
       return json({ booking: view(b) });
     }
 
@@ -129,9 +176,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = 
       }
       if (name === "book") {
         if (held(args.start) && !doubleBook) return reply(toolError("slot_taken"));
-        const n = state.bookings.length + 1;
-        const b = { id: `booking-${n}`, token: `token-${n}`, start: args.start, status: "awaiting_approval", deposit: "none", agent: _meta?.["io.modelcontextprotocol/clientInfo"]?.name ?? "unknown agent" };
-        state.bookings.push(b);
+        const b = newBooking(args.start, args.service_id, _meta?.["io.modelcontextprotocol/clientInfo"]?.name ?? "unknown agent");
         return reply(toolResult({ booking: view(b) }));
       }
       if (name === "get_booking") {
@@ -143,6 +188,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = 
         if (!b || !ACTIVE.includes(b.status)) return reply(toolError("not_cancellable"));
         if (b.status === "awaiting_deposit") b.deposit = "released";
         b.status = "cancelled";
+        alert(b, "booking_cancelled");
         return reply(toolResult({ booking: view(b) }));
       }
     }
@@ -175,16 +221,22 @@ describe("pnpm smoke", () => {
 
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(results(run.rows)).toEqual(Array(19).fill("PASS"));
-    expect(run.line).toBe("PASS: 19 passed.");
-    expect(run.output).toMatch(/\nPASS: 19 passed\.$/);
-    // Every booking it made is declined or cancelled. With deposits off, the approved Haircut was confirmed.
-    expect(deployment.state.bookings.map((b) => b.status)).toEqual(["cancelled", "cancelled"]);
+    expect(results(run.rows)).toEqual(Array(31).fill("PASS"));
+    expect(run.line).toBe("PASS: 31 passed.");
+    expect(run.output).toMatch(/\nPASS: 31 passed\.$/);
+    // Over MCP: one booking declined, a Beard trim approved and then cancelled by the cleanup, and the deposit
+    // check's Haircut approved and cancelled. Over the web: the JSON booking declined, and the form post's
+    // booking declined by the cleanup. All by front-desk-smoke.
+    expect(deployment.state.bookings.map((b) => [b.status, b.agent])).toEqual(Array(5).fill(["cancelled", SMOKE_AGENT]));
+    expect(deployment.state.bookings.map((b) => b.service)).toEqual(["haircut", "beard-trim", "haircut", "haircut", "haircut"]);
+    // Deposits off: the approved Haircut was confirmed without collecting its deposit.
     expect(run.rows.find((r) => r.title.startsWith("Approve a Haircut"))).toMatchObject({
       item: "19",
       title: "Approve a Haircut (deposits off) → confirmed, deposit not_collected",
       evidence: "Tue 10 Nov, 10:30: confirmed, deposit not_collected",
     });
+    expect(run.rows.find((r) => r.title.includes("booking_cancelled"))).toMatchObject({ item: "14", evidence: "booking_cancelled by log, logged" });
+    expect(run.rows.find((r) => r.title.includes("booking_confirmed"))).toMatchObject({ item: "17", evidence: "booking_confirmed by log, logged" });
     // The bypass secret went on every request, and the secret itself is never printed.
     expect(deployment.state.requests.every((r) => r.headers.get(BYPASS_HEADER) === "bypass-secret")).toBe(true);
     expect(run.output).not.toContain("bypass-secret");
@@ -211,8 +263,8 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("FAIL");
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.item === "2")).toMatchObject({ result: "FAIL", evidence: "HTTP 500 boom" });
-    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(18);
-    expect(run.line).toBe("FAIL: 1 failed, 18 passed, 0 skipped.");
+    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(30);
+    expect(run.line).toBe("FAIL: 1 failed, 30 passed, 0 skipped.");
   });
 
   it("BLOCKED: not_ready prints the problems, runs nothing else and exits 2", async () => {
@@ -275,27 +327,58 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
     expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual([
-      "5", "11", "11", "12", "14", "14", "19", "19", "19", "19",
+      "5", "5", "11", "11", "12", "14", "14", "14", "17", "17", "19", "19", "19", "19", "W4", "W4", "W4", "W5",
     ]);
-    // No cleanup row either: it made no bookings.
-    expect(run.line).toBe("PASS: 8 passed, 10 skipped (a skipped check is not a pass: verify those by hand).");
+    // The read-only web checks still run; no cleanup row: it made no bookings.
+    expect(run.rows.filter((r) => r.item.startsWith("W") && r.result === "PASS").map((r) => r.item)).toEqual(["W1", "W2", "W3"]);
+    expect(run.line).toBe("PASS: 12 passed, 18 skipped (a skipped check is not a pass: verify those by hand).");
     expect(deployment.state.mcp.some((c) => c.params?.name === "book")).toBe(false);
+    expect(deployment.state.requests.some((r) => r.path === "/api/shops/harts/book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.headers.get("authorization"))).toBe(false);
   });
 
   it("--owner-token overrides the preview token, and is never printed", async () => {
-    let sent;
-    const deployment = fakeDeployment({
-      route: (url, init) => {
-        if (url.pathname !== "/api/shops/harts/bookings") return undefined;
-        sent = new Headers(init.headers).get("authorization");
-        return sent ? json({ bookings: [] }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
-      },
-    });
+    const deployment = fakeDeployment({ ownerToken: "prod-secret-token" });
     const run = await smoke(deployment, { ownerToken: "prod-secret-token" });
-    expect(sent).toBe("Bearer prod-secret-token");
+    const sent = deployment.state.requests.map((r) => r.headers.get("authorization")).filter(Boolean);
+    expect(sent.length).toBeGreaterThan(0);
+    expect(new Set(sent)).toEqual(new Set(["Bearer prod-secret-token"]));
     expect(run.exitCode).toBe(EXIT.pass);
     expect(run.output).not.toContain("prod-secret-token");
+  });
+
+  it("FAIL: an alert that's missing, or recorded as failed", async () => {
+    // A server that records no booking_cancelled alert, and a failed booking_confirmed one.
+    const deployment = fakeDeployment({
+      route: (url, init, state) => {
+        if (url.pathname !== "/api/shops/harts/alerts" || !new Headers(init.headers).get("authorization")) return undefined;
+        const confirmed = state.alerts.filter((a) => a.kind === "booking_confirmed").map((a) => ({ ...a, channel: "email", status: "failed", error: "Resend answered HTTP 403: nope" }));
+        return json({ alerts: confirmed });
+      },
+    });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.fail);
+    expect(run.rows.find((r) => r.title.includes("booking_cancelled"))).toMatchObject({
+      result: "FAIL",
+      evidence: "no booking_cancelled alert for booking-1 among the newest 0",
+    });
+    expect(run.rows.find((r) => r.title.includes("booking_confirmed"))).toMatchObject({
+      result: "FAIL",
+      evidence: "booking_confirmed by email, failed: Resend answered HTTP 403: nope",
+    });
+  });
+
+  it("without an owner token (not a preview), the alert checks are SKIPPED, but the approval still runs", async () => {
+    const deployment = fakeDeployment({ status: readyStatus({ environment: "development", database: { ...readyStatus().database, mode: "memory" } }) });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.pass);
+    expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.title)).toEqual([
+      `Owner bookings with Bearer ${PREVIEW_OWNER_TOKEN} → 200`,
+      `Owner alerts with Bearer ${PREVIEW_OWNER_TOKEN} → 200`,
+      "The owner's alerts list has booking_cancelled for it",
+      "The owner's alerts list has booking_confirmed for it",
+    ]);
+    expect(run.rows.find((r) => r.item === "17" && r.title.startsWith("Book a Beard trim"))).toMatchObject({ result: "PASS" });
   });
 
   it("declines every booking it made even when a booking check fails", async () => {
@@ -305,8 +388,36 @@ describe("pnpm smoke", () => {
     const run = await smoke(deployment);
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.title.includes("slot_taken"))).toMatchObject({ result: "FAIL", evidence: "booked again: booking-2" });
-    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "3 made, 3 declined: none left behind" });
-    expect(deployment.state.bookings.map((b) => b.status)).toEqual(["cancelled", "cancelled", "cancelled"]);
+    // The web form post at the held start books it again too, and fails.
+    expect(run.rows.find((r) => r.title.includes("?error=slot_taken"))).toMatchObject({ result: "FAIL" });
+    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "6 made, 6 declined or cancelled: none left behind" });
+    expect(deployment.state.bookings.map((b) => b.status)).toEqual(Array(6).fill("cancelled"));
+  });
+
+  it("web booking: a form post that doesn't redirect to /approve/ fails W5, and the JSON booking is still declined", async () => {
+    const deployment = fakeDeployment({
+      route: (url, init) => {
+        const form = new Headers(init.headers).get("content-type")?.startsWith("application/x-www-form-urlencoded");
+        if (url.pathname === "/api/shops/harts/book" && form) return new Response("<html>Booked!</html>", { status: 200 });
+        return undefined;
+      },
+    });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.fail);
+    const web = run.rows.filter((r) => r.item.startsWith("W")).map((r) => [r.item, r.result]);
+    expect(web).toEqual([
+      ["W1", "PASS"],
+      ["W2", "PASS"],
+      ["W3", "PASS"],
+      ["W4", "PASS"],
+      ["W4", "FAIL"],
+      ["W4", "PASS"],
+      ["W5", "FAIL"],
+    ]);
+    expect(run.rows.find((r) => r.item === "W5").evidence).toBe("HTTP 200 <html>Booked!</html>");
+    // The MCP loop's approved booking is cancelled; the deposit check cancelled its own; the web JSON
+    // booking was declined by W4.
+    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "4 made, 4 declined or cancelled: none left behind" });
   });
 
   it("deposits stripe_test: approving a Haircut waits for its deposit with a Stripe URL; cancelling releases it and frees the start", async () => {
@@ -321,11 +432,10 @@ describe("pnpm smoke", () => {
       ["The cancelled start is free again", "PASS"],
     ]);
     expect(deposits[0].evidence).toBe("Tue 10 Nov, 10:30: awaiting_deposit, deposit awaiting_payment, pay at https://checkout.stripe.com/c/pay/cs_test_…");
-    // It never pays: the booking ends cancelled with the deposit released.
-    expect(deployment.state.bookings.map((b) => [b.status, b.deposit])).toEqual([
-      ["cancelled", "none"],
-      ["cancelled", "released"],
-    ]);
+    // The Beard trim (no deposit) still confirms at once, so item 17's alert check passes.
+    expect(run.rows.find((r) => r.title.includes("booking_confirmed"))).toMatchObject({ result: "PASS" });
+    // It never pays: the deposit check's Haircut ends cancelled with the deposit released.
+    expect(deployment.state.bookings[2]).toMatchObject({ service: "haircut", status: "cancelled", deposit: "released" });
   });
 
   it("deposits stripe_test: FAIL when approving confirms at once instead of waiting for the deposit", async () => {
@@ -336,8 +446,8 @@ describe("pnpm smoke", () => {
         if (!m) return undefined;
         const b = state.bookings.find((x) => x.token === m[1]);
         b.status = "confirmed";
-        b.deposit = "not_collected";
-        return json({ booking: { id: b.id, status: "confirmed", display: "Tue 10 Nov, 10:30", deposit: { amountCents: 1000, state: "not_collected" } } });
+        b.deposit = b.service === "beard-trim" ? "none" : "not_collected";
+        return json({ booking: { id: b.id, status: "confirmed", display: `Tue 10 Nov, ${b.start.slice(11, 16)}`, deposit: { amountCents: 1000, state: b.deposit } } });
       },
     });
     const run = await smoke(deployment);
@@ -360,8 +470,10 @@ describe("pnpm smoke", () => {
     });
     const run = await smoke(deployment);
     expect(run.exitCode).toBe(EXIT.fail);
-    // booking-1 can be neither declined nor cancelled; booking-2 is the deposit check's, whose cancel fails too.
-    expect(run.rows.at(-1)).toMatchObject({ result: "FAIL", evidence: "still held: booking-1 (internal), booking-2 (internal)" });
+    expect(run.rows.at(-1)).toMatchObject({
+      result: "FAIL",
+      evidence: "still held: booking-1 (internal), booking-2 (internal), booking-3 (internal)",
+    });
   });
 });
 

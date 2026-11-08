@@ -48,9 +48,11 @@ export const REQUIRED_SCHEMA = {
     "deposit_rule",
     "late_cancel_rule",
     "no_show_rule",
+    "owner_email",
     "updated_at",
   ],
   blocked_times: ["id", "staff_id", "during", "reason"],
+  alerts: ["id", "shop_slug", "booking_id", "kind", "channel", "recipient", "status", "error", "created_at"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type RequiredTable = keyof typeof REQUIRED_SCHEMA;

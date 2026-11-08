@@ -246,7 +246,7 @@ describe("paid → confirmed (no webhook: reads ask Stripe)", () => {
     expect(confirmed).toMatchObject({ status: "confirmed", deposit: { amountCents: 1000, state: "held" } });
     expect(confirmed.deposit).not.toHaveProperty("payUrl");
     expect(confirmed).not.toHaveProperty("approval");
-    expect(notifier.alerts.map((b) => b.id)).toEqual([waiting.id]);
+    expect(notifier.alerts.map((a) => [a.kind, a.booking.id, a.booking.deposit.state])).toEqual([["booking_confirmed", waiting.id, "held"]]);
     expect((await events(deps, waiting.id)).at(-1)).toEqual([
       "deposit.paid",
       "system",

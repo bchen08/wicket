@@ -1,5 +1,8 @@
 import { DateTime } from "luxon";
 import type {
+  AgentPolicies,
+  AlertKind,
+  AlertStatus,
   BookInput,
   Booking,
   BookingEventType,
@@ -36,7 +39,7 @@ import {
 import { decide, type LifecycleAction, type ManageAction } from "../engine/lifecycle";
 import { depositCollected, moveDeposit, syncDeposit } from "../deposits/deposits";
 import type { DepositPayments } from "../deposits/payments";
-import type { Notifier } from "../notify/notifier";
+import type { Notifier, OwnerAlert } from "../notify/notifier";
 import { SlotTakenError, type BookingStore } from "./booking-store";
 import type { BusyInterval, ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
@@ -193,10 +196,20 @@ export async function listServices(
   return { shop, services };
 }
 
-/** The shop and its booking rules (lead time, horizons, cancellation window, pause, phone, rule texts). */
+/** The policies an agent sees: all but the owner's email, which only the owner routes show. */
+export function agentPolicies(policies: Policies): AgentPolicies {
+  const { ownerEmail, ...rules } = policies;
+  void ownerEmail;
+  return rules;
+}
+
+/**
+ * The shop and its booking rules (lead time, horizons, cancellation window, pause, phone, rule texts), for
+ * agents (get_policies). The owner routes use getShopPolicies (owner.ts), which includes ownerEmail.
+ */
 export async function getPolicies(deps: FrontDeskDeps, shopSlug: string): Promise<GetPoliciesResult> {
   const shop = await requireShop(deps, shopSlug);
-  return { shop, policies: await policiesFor(deps, shopSlug) };
+  return { shop, policies: agentPolicies(await policiesFor(deps, shopSlug)) };
 }
 
 // ---- Wording shared with the MCP text summaries ----
@@ -529,8 +542,9 @@ export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string
  *    database is the final word even when step 4 passed.
  *
  * The owner is alerted when the booking is confirmed (lib/server/consent/approvals.ts, or
- * lib/server/deposits/deposits.ts once a deposit is paid), not here. A booking awaiting its deposit past
- * pay_by is checked with Stripe in step 4 too (syncDeposit), so an unpaid one never blocks this booking.
+ * lib/server/deposits/deposits.ts once a deposit is paid) or the person declines, not here: a hold alone
+ * is no news. A booking awaiting its deposit past pay_by is checked with Stripe in step 4 too
+ * (syncDeposit), so an unpaid one never blocks this booking.
  * TODO(ring-2): require a mandate once agents sign in.
  */
 export async function book(
@@ -690,23 +704,71 @@ function busyRange(service: Service, start: Date) {
   };
 }
 
+/** Longest Alert.error stored. */
+const MAX_ALERT_ERROR = 500;
+
+/** An error as Alert.error: its message, without NUL (Postgres text can't hold it), at most 500 characters. */
+function alertError(err: unknown): string {
+  const message = (err instanceof Error ? err.message : String(err)).replaceAll(NUL, "").trim() || "Unknown error.";
+  return message.length > MAX_ALERT_ERROR ? `${message.slice(0, MAX_ALERT_ERROR - 1)}…` : message;
+}
+
 /**
- * Tell the owner about a booking the person just approved. It's already stored, so a failure is only
- * logged. Called by the approve use case (lib/server/consent/approvals.ts), once per booking.
+ * Tell the owner that `booking` was confirmed or cancelled, and record the alert (deps.store.recordAlert)
+ * whatever happened to it. Call it after the change is committed; `booking` is the booking as stored.
+ * Never throws and never changes the booking: a failed send is recorded as status "failed" with the error
+ * (and logged), and if even recording fails, that is only logged. No retries. TODO(ring-2): a retry job.
+ *
+ * Callers: approveBooking and declineBooking (lib/server/consent/approvals.ts), cancelBooking (agents).
+ * The console link uses deps.baseUrl, the origin of the request being served.
  */
-export async function alertOwner(notifier: Notifier, booking: Booking): Promise<void> {
+export async function alertOwner(
+  deps: FrontDeskDeps,
+  kind: AlertKind,
+  booking: Booking,
+  cancelledBy: "agent" | "customer" | null = null,
+): Promise<void> {
+  const logFailure = (event: string, err: unknown) =>
+    console.error(JSON.stringify({ event, id: booking.id, shop: booking.shopSlug, kind, error: alertError(err) }));
   try {
-    await notifier.alertOwner(booking);
+    const [shop, policies, services] = await Promise.all([
+      deps.catalog.getShop(booking.shopSlug),
+      policiesFor(deps, booking.shopSlug),
+      deps.catalog.listServices(booking.shopSlug),
+    ]);
+    const service = services.find((s) => s.id === booking.serviceId);
+    if (!shop || !service) throw new Error(`Booking ${booking.id} has no shop or service: ${booking.shopSlug}/${booking.serviceId}.`);
+    const alert: OwnerAlert = {
+      kind,
+      booking,
+      shop,
+      priceCents: service.priceCents,
+      ownerEmail: policies.ownerEmail,
+      cancelledBy,
+      consoleUrl: `${deps.baseUrl}/console`,
+    };
+    const route = deps.notifier.route(alert);
+    let status: AlertStatus = route.channel === "email" ? "sent" : "logged";
+    let error: string | null = null;
+    try {
+      await deps.notifier.send(alert, route);
+    } catch (err) {
+      // Failing the request now would make the agent retry into slot_taken for a booking that exists.
+      status = "failed";
+      error = alertError(err);
+      logFailure("booking.notify_failed", err);
+    }
+    await deps.store.recordAlert({
+      shopSlug: booking.shopSlug,
+      bookingId: booking.id,
+      kind,
+      channel: route.channel,
+      recipient: route.recipient,
+      status,
+      error,
+    });
   } catch (err) {
-    // Failing now would make the agent retry into slot_taken (or a replay) for a booking that exists.
-    console.error(
-      JSON.stringify({
-        event: "booking.notify_failed",
-        id: booking.id,
-        shop: booking.shopSlug,
-        error: err instanceof Error ? err.message : String(err),
-      }),
-    );
+    logFailure("booking.alert_not_recorded", err);
   }
 }
 
@@ -859,8 +921,10 @@ export function parseCancelArgs(raw: unknown): CancelInput {
  * released; later but before the start → captured; after the start or from a final status, a lapsed
  * hold included → not_cancellable). The deposit then moves in Stripe (transitionBooking). A second cancel
  * of the same booking is not_cancellable (it's already cancelled), so a retry is harmless.
+ * Once it's cancelled, the owner is alerted (booking_cancelled): a cancel only succeeds from a status that
+ * holds the time, so that's a confirmed booking, a hold awaiting approval or one awaiting its deposit. The
+ * owner's own cancel (owner.ts) sends no alert.
  * TODO(ring-2): get_booking and cancel still trust anyone holding the booking id; agent identity fixes this.
- * TODO(ring-1c): alert the owner when an agent cancels (the Notifier only knows new bookings).
  */
 export async function cancelBooking(
   deps: FrontDeskDeps,
@@ -868,7 +932,9 @@ export async function cancelBooking(
   input: CancelInput,
 ): Promise<CancelResult> {
   const args = parseCancelArgs(input);
-  return transitionBooking(deps, shopSlug, args.booking_id, "cancel", "agent");
+  const result = await transitionBooking(deps, shopSlug, args.booking_id, "cancel", "agent");
+  await alertOwner(deps, "booking_cancelled", result.booking, "agent");
+  return result;
 }
 
 // ---- Bookings list (UI) ----

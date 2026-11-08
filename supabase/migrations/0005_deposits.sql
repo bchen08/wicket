@@ -1,5 +1,5 @@
 -- Front Desk, Ring 1c: deposits through Stripe Checkout (test mode, the platform account).
--- Apply once per database, after 0003_consent.sql. Seeds nothing. See docs/deposits.md and docs/database.md.
+-- Apply once per database, after 0004_alerts.sql. Seeds nothing. See docs/deposits.md and docs/database.md.
 --
 -- Approving a booking whose service has a deposit (within the deposit horizon) moves it to
 -- 'awaiting_deposit' and opens a Stripe Checkout Session that places a hold (manual capture) on the

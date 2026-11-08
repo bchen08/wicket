@@ -117,7 +117,8 @@ async function confirmPaid(deps: FrontDeskDeps, booking: Booking, checkout: Chec
   // Another read confirmed it (or something else changed it) first: show it as it is now.
   if (!updated) return (await deps.store.getBooking(booking.id)) ?? booking;
   // The owner hears about a booking once it's confirmed, never about one still waiting for its deposit.
-  await alertOwner(deps.notifier, updated);
+  // A failed alert is recorded, not thrown.
+  await alertOwner(deps, "booking_confirmed", updated);
   return updated;
 }
 

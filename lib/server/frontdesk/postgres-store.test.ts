@@ -10,10 +10,10 @@ import { SEED } from "./memory-store";
 import { DEFAULT_POLICIES } from "./policies";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
 import { book } from "./service";
-import { customerOf, holdFields, withBaseUrl } from "./test-support";
+import { customerOf, holdFields, recordingNotifier, withBaseUrl } from "./test-support";
 
 // Runs against a real Postgres only when DATABASE_URL_TEST points at a database with
-// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql and supabase/seed.sql applied
+// every migration in supabase/migrations/ (0001–0004) and supabase/seed.sql applied
 // (see docs/database.md).
 // Use a scratch database. Other test files may share it, so this file only adds rows of its own and
 // deletes them afterwards: bookings in 2099 and a throwaway shop (with its own staff member and
@@ -101,6 +101,57 @@ if (!url) {
       expect(columns.map((c) => c.column_name)).toEqual(["booking_id", "token", "created_at", "decided_at", "decision"]);
     });
 
+    it("0004 dropped idempotency_keys and added alerts and policies.owner_email", async () => {
+      const [row] = await sql<{ keys: string | null; alerts: string | null }[]>`
+        select to_regclass('public.idempotency_keys')::text as keys, to_regclass('public.alerts')::text as alerts
+      `;
+      expect(row).toEqual({ keys: null, alerts: "alerts" });
+      const [policies] = await sql<{ n: number }[]>`
+        select count(*)::int as n from information_schema.columns
+        where table_schema = 'public' and table_name = 'policies' and column_name = 'owner_email'
+      `;
+      expect(policies.n).toBe(1);
+    });
+
+    it("recordAlert stores an alert; listAlerts returns the shop's newest first, limited, in its zone", async () => {
+      const booking = await store.createBooking(ours(at(9), at(9, 30)));
+      const recordedAlerts = [];
+      for (const status of ["logged", "sent", "failed"] as const) {
+        recordedAlerts.push(
+          await store.recordAlert({
+            shopSlug: shop,
+            bookingId: booking.id.toUpperCase(), // ids are matched however they're written
+            kind: status === "failed" ? "booking_cancelled" : "booking_confirmed",
+            channel: status === "logged" ? "log" : "email",
+            recipient: status === "logged" ? null : "owner@example.com",
+            status,
+            error: status === "failed" ? "Resend answered HTTP 403: nope" : null,
+          }),
+        );
+      }
+      expect(recordedAlerts[2]).toEqual({
+        id: expect.stringMatching(/^\d+$/),
+        shopSlug: shop,
+        bookingId: booking.id,
+        kind: "booking_cancelled",
+        channel: "email",
+        recipient: "owner@example.com",
+        status: "failed",
+        error: "Resend answered HTTP 403: nope",
+        createdAt: expect.stringMatching(/-0[45]:00$/), // the shop's zone
+      });
+      expect(await store.listAlerts(shop, 50)).toEqual([...recordedAlerts].reverse());
+      expect((await store.listAlerts(shop, 2)).map((a) => a.status)).toEqual(["failed", "sent"]);
+      expect(await store.listAlerts("nope", 50)).toEqual([]);
+      // The checks refuse a value the contract doesn't allow.
+      await expect(
+        sql`insert into alerts (shop_slug, booking_id, kind, channel, status) values (${shop}, ${booking.id}::uuid, 'booking_held', 'log', 'logged')`,
+      ).rejects.toMatchObject({ code: "23514" });
+      // Deleting the booking deletes its alerts.
+      await sql`delete from bookings where id = ${booking.id}::uuid`;
+      expect(await store.listAlerts(shop, 50)).toEqual([]);
+    });
+
     it("reads the seeded shop, services, split hours and policies", async () => {
       expect(await store.getShop("harts")).toEqual({ slug: "harts", name: "Hart's Barbers", timezone: "America/New_York" });
       expect((await store.listServices("harts")).map((s) => s.id)).toEqual(["haircut", "beard-trim", "haircut-beard"]);
@@ -161,7 +212,7 @@ if (!url) {
         catalog: store,
         store,
         clock: fixedClock(saturday.minus({ days: 1 }).toJSDate()),
-        notifier: { alertOwner: async () => {} },
+        notifier: recordingNotifier(),
       });
       const results = await Promise.allSettled([
         book(deps, "harts", { service_id: "haircut", start, customer_name: "Agent A's customer" }, "vitest A"),
@@ -520,9 +571,16 @@ if (!url) {
         depositRule: "",
         lateCancelRule: "",
         noShowRule: "",
+        ownerEmail: null,
       };
       expect(await store.savePolicies(shop, first)).toEqual(first);
-      const second: Policies = { ...first, paused: true, phone: "+1 555-0100", noShowRule: "We keep the deposit." };
+      const second: Policies = {
+        ...first,
+        paused: true,
+        phone: "+1 555-0100",
+        noShowRule: "We keep the deposit.",
+        ownerEmail: "dana@example.com",
+      };
       expect(await store.savePolicies(shop, second)).toEqual(second);
       expect(await store.getPolicies(shop)).toEqual(second);
     });
@@ -546,6 +604,10 @@ if (!url) {
       });
       expect(await store.savePolicies(shop, { phone: null })).toEqual({ ...before, noShowRule: "n", phone: null });
       expect(await store.getPolicies(shop)).toEqual({ ...before, noShowRule: "n", phone: null });
+      // ownerEmail likewise: kept when absent, cleared by null.
+      expect((await store.savePolicies(shop, { ownerEmail: "owner@example.com" })).ownerEmail).toBe("owner@example.com");
+      expect((await store.savePolicies(shop, { paused: true })).ownerEmail).toBe("owner@example.com");
+      expect((await store.savePolicies(shop, { ownerEmail: null })).ownerEmail).toBeNull();
     });
 
     it("savePolicies: concurrent patches of different fields both take effect (the row is locked from read to write)", async () => {

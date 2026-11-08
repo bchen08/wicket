@@ -133,7 +133,11 @@ describe("approve", () => {
     expect(approved.customer).not.toHaveProperty("phone");
     expect(approved).not.toHaveProperty("approval");
     expect(notifier.alerts).toHaveLength(1);
-    expect(notifier.alerts[0]).toMatchObject({ id: booking.id, status: "confirmed", customer: { approved: true } });
+    expect(notifier.alerts[0]).toMatchObject({
+      kind: "booking_confirmed",
+      cancelledBy: null,
+      booking: { id: booking.id, status: "confirmed", customer: { approved: true } },
+    });
 
     // get_booking and the view agree; the history shows who did what.
     expect((await getBooking(deps, "harts", { booking_id: booking.id })).booking).toEqual(approved);
@@ -221,14 +225,16 @@ describe("approve", () => {
 });
 
 describe("decline", () => {
-  it("→ cancelled by the customer, the slot is freed, no owner alert, and the link is closed", async () => {
+  it("→ cancelled by the customer, the slot is freed, the owner is alerted once, and the link is closed", async () => {
     const booking = await hold();
     expect(await offeredStarts()).not.toContain(SAT_1400);
     const { booking: declined } = await declineBooking(deps, approvalToken(booking));
     expect(declined).toMatchObject({ status: "cancelled", customer: { approved: false } });
     expect(store.lifecycleStamps(booking.id)?.cancelledBy).toBe("customer");
     expect(await offeredStarts()).toContain(SAT_1400);
-    expect(notifier.alerts).toHaveLength(0);
+    expect(notifier.alerts.map((a) => [a.kind, a.booking.id, a.booking.status, a.cancelledBy])).toEqual([
+      ["booking_cancelled", booking.id, "cancelled", "customer"],
+    ]);
     expect(await eventsOf(booking.id)).toEqual([
       ["booked", "agent"],
       ["declined", "customer"],

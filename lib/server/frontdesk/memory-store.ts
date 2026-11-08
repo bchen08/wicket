@@ -6,12 +6,14 @@ import {
   expiredEventData,
   normalizeUuid,
   SlotTakenError,
+  toAlert,
   toBooking,
   toBookingEvent,
   type BookingRecord,
   type BookingStore,
   type DepositFailure,
   type DepositPatch,
+  type NewAlert,
   type NewBooking,
   type NewBookingEvent,
 } from "./booking-store";
@@ -81,6 +83,8 @@ export const SEED: {
       lateCancelRule:
         "Cancel at least 24 hours before your appointment and the deposit is released. Cancel within 24 hours and we keep the deposit as a late-cancellation fee.",
       noShowRule: "If you don't show up, we keep the deposit. Otherwise it is released after your appointment.",
+      // Not seeded: the owner sets it (PUT /api/shops/harts/policies). Until then alerts are logged.
+      ownerEmail: null,
     },
   },
 };
@@ -169,6 +173,8 @@ type StoredEvent = NewBookingEvent & { seq: number; bookingId: string; at: Date 
 
 type StoredBlock = NewBlock & { id: string };
 
+type StoredAlert = NewAlert & { seq: number; createdAt: Date };
+
 /** Longest blocked_times.reason (the column's check constraint). */
 const MAX_BLOCK_REASON = 200;
 
@@ -224,6 +230,7 @@ function pickPolicies(p: Policies): Policies {
     depositRule: p.depositRule,
     lateCancelRule: p.lateCancelRule,
     noShowRule: p.noShowRule,
+    ownerEmail: p.ownerEmail,
   };
 }
 
@@ -260,7 +267,9 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   const bookings: StoredBooking[] = [];
   const events: StoredEvent[] = [];
   const blocks: StoredBlock[] = [];
+  const alerts: StoredAlert[] = [];
   let eventSeq = 0;
+  let alertSeq = 0;
   // Ring 1b approval requests, keyed by booking id.
   const approvals = new Map<string, StoredApproval>();
 
@@ -674,6 +683,29 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       if (outcome.failure !== undefined) b.depositFailure = outcome.failure && copyFailure(outcome.failure);
       if (event) addEvent(b.id, event, now());
       return toBooking(record(b));
+    },
+
+    // ---- Owner alerts ----
+
+    async recordAlert(alert) {
+      // The alerts table's foreign keys and checks.
+      const shop = shopOf(alert.shopSlug);
+      if (!shop) throw new Error(`Unknown shop: ${alert.shopSlug}`);
+      if (!findBooking(alert.bookingId)) throw new Error(`Unknown booking: ${alert.bookingId}`);
+      if (alert.recipient !== null && alert.recipient.length > 254) throw new Error("recipient is too long.");
+      const stored: StoredAlert = { ...alert, bookingId: alert.bookingId.toLowerCase(), seq: ++alertSeq, createdAt: now() };
+      alerts.push(stored);
+      return toAlert({ ...stored, id: String(stored.seq), createdAt: copyDate(stored.createdAt), timezone: shop.timezone });
+    },
+
+    async listAlerts(shopSlug, limit) {
+      const shop = shopOf(shopSlug);
+      if (!shop) return [];
+      return alerts
+        .filter((a) => a.shopSlug === shopSlug)
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.seq - a.seq)
+        .slice(0, limit)
+        .map((a) => toAlert({ ...a, id: String(a.seq), createdAt: copyDate(a.createdAt), timezone: shop.timezone }));
     },
   };
 

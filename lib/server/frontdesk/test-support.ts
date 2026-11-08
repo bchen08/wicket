@@ -4,7 +4,7 @@ import { fixedClock, type Clock } from "../clock";
 import { approveBooking } from "../consent/approvals";
 import { newApprovalToken } from "../consent/crypto";
 import type { DepositPayments } from "../deposits/payments";
-import type { Notifier } from "../notify/notifier";
+import type { Notifier, OwnerAlert } from "../notify/notifier";
 import type { NewBooking } from "./booking-store";
 import type { NewBlock, ShopCatalog } from "./catalog";
 import { createMemoryStore, type InitialBooking } from "./memory-store";
@@ -86,15 +86,31 @@ export function customerOf(displayName: string, approved: boolean, phone?: strin
   return { displayName, approved, verified: approved, ...(phone ? { phone } : {}) };
 }
 
-/** A notifier that remembers what it was told. */
-export function recordingNotifier(): Notifier & { alerts: Booking[] } {
-  const alerts: Booking[] = [];
+/** A notifier that remembers what it was told: it routes every alert to the log channel and keeps it here. */
+export function recordingNotifier(): Notifier & { alerts: OwnerAlert[] } {
+  const alerts: OwnerAlert[] = [];
   return {
     alerts,
-    async alertOwner(booking) {
-      alerts.push(booking);
+    route: () => ({ channel: "log", recipient: null }),
+    async send(alert) {
+      alerts.push(alert);
     },
   };
+}
+
+/** A notifier whose every send fails with `message`, routed like an email to `recipient`. */
+export function failingNotifier(message: string, recipient = "dana@example.com"): Notifier {
+  return {
+    route: () => ({ channel: "email", recipient }),
+    async send() {
+      throw new Error(message);
+    },
+  };
+}
+
+/** What a recording notifier was told, as [kind, booking id, booking status] for each alert. */
+export function alertSummary(notifier: Notifier): [string, string, string][] {
+  return (notifier as ReturnType<typeof recordingNotifier>).alerts.map((a) => [a.kind, a.booking.id, a.booking.status]);
 }
 
 /**

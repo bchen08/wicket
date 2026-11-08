@@ -175,9 +175,11 @@ export function parseApproveBody(body: unknown): string | null {
  * - A booking that needs a deposit (needsDeposit), on a deployment that collects them: first a Stripe
  *   Checkout page is opened for the hold (if Stripe fails, nothing is stored and approve fails as internal,
  *   so the person can try again); then the booking becomes awaiting_deposit with the page's URL
- *   (booking.deposit.payUrl) and pay_by = now + 30 minutes. The owner is alerted once it's paid.
- * - Otherwise it becomes confirmed, and the owner is alerted (once). A service with a deposit that isn't
- *   collected (deposits off, or the start is beyond the deposit horizon) shows it as not_collected.
+ *   (booking.deposit.payUrl) and pay_by = now + 30 minutes. The owner is alerted (booking_confirmed) once
+ *   it's paid (lib/server/deposits/deposits.ts).
+ * - Otherwise it becomes confirmed, and the owner is alerted once (booking_confirmed), after the commit. A
+ *   service with a deposit that isn't collected (deposits off, or the start is beyond the deposit horizon)
+ *   shows it as not_collected.
  * In one transaction, only if the hold is still on: the new status with an "approved" event (actor
  * customer), the phone and the deposit columns stored.
  */
@@ -222,16 +224,18 @@ export async function approveBooking(deps: FrontDeskDeps, token: string, body?: 
     if (checkout) await closeCheckout(deps, ctx.booking, checkout.id);
     throw await whyNotPending(deps, token, "approve");
   }
-  // The owner hears about a booking only once it's confirmed: never about a hold, nor one awaiting its deposit.
-  if (answered.booking.status === "confirmed") await alertOwner(deps.notifier, answered.booking);
+  // Committed: the owner hears about it once it's confirmed, never about a hold alone nor one awaiting its
+  // deposit. A failed alert is recorded, not thrown.
+  if (answered.booking.status === "confirmed") await alertOwner(deps, "booking_confirmed", answered.booking);
   return { booking: withApprovalOrigin(deps, answered.booking) };
 }
 
 // ---- POST /api/approvals/[token]/decline ----
 
 /**
- * Decline (→ DeclineResponse): the booking becomes cancelled (cancelled_by customer), freeing the slot.
- * Only while pending (approval_closed, approval_expired).
+ * Decline (→ DeclineResponse): the booking becomes cancelled (cancelled_by customer), freeing the slot, and
+ * the owner is alerted (booking_cancelled), after the commit. Only while pending (approval_closed,
+ * approval_expired).
  */
 export async function declineBooking(deps: FrontDeskDeps, token: string): Promise<DeclineResponse> {
   const ctx = await openApproval(deps, token);
@@ -249,5 +253,6 @@ export async function declineBooking(deps: FrontDeskDeps, token: string): Promis
     },
   });
   if (!answered.ok) throw await whyNotPending(deps, token, "decline");
+  await alertOwner(deps, "booking_cancelled", answered.booking, "customer");
   return { booking: answered.booking };
 }

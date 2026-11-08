@@ -5,6 +5,8 @@
 import type { BookingDeposit, DepositsMode } from "./deposits";
 
 export type { BookingDeposit, DepositsMode, DepositState } from "./deposits";
+// The web booking API's shapes (plain HTTP booking for agents without MCP, and the booking page).
+export type * from "./web-booking";
 
 /** A business that takes bookings. */
 export type Shop = {
@@ -93,7 +95,10 @@ export type ApiError = {
 
 // ---- Shop rules ----
 
-/** How a shop takes bookings. Set by the owner; read by agents through get_policies. */
+/**
+ * How a shop takes bookings, and where the owner's alerts go. Set by the owner through the owner routes.
+ * Agents read everything but ownerEmail through get_policies (AgentPolicies).
+ */
 export type Policies = {
   /** Minimum minutes between now and an appointment's start. Default 120. */
   leadTimeMin: number;
@@ -116,7 +121,16 @@ export type Policies = {
   lateCancelRule: string;
   /** Plain-language no-show rule. "" if not set. */
   noShowRule: string;
+  /**
+   * The owner's email address for booking alerts (Alert), e.g. "dana@example.com". null: alerts are
+   * written to the log instead. Emails go out only where RESEND_API_KEY is set (production). Only the
+   * owner routes show it; get_policies leaves it out.
+   */
+  ownerEmail: string | null;
 };
+
+/** The shop's rules as agents read them through get_policies: Policies without the owner's email. */
+export type AgentPolicies = Omit<Policies, "ownerEmail">;
 
 /** One opening window in a staff member's regular week, in the shop's local time. */
 export type WeeklyHours = {
@@ -164,10 +178,10 @@ export type ListServicesResult = {
 /** Input of the `get_policies` tool. Takes no arguments. */
 export type GetPoliciesInput = Record<string, never>;
 
-/** structuredContent of a successful `get_policies` call. Also GET/PUT /api/shops/[shop]/policies. */
+/** structuredContent of a successful `get_policies` call. The owner routes return PoliciesResponse instead. */
 export type GetPoliciesResult = {
   shop: Shop;
-  policies: Policies;
+  policies: AgentPolicies;
 };
 
 /** Input of the `get_availability` tool. */
@@ -433,15 +447,61 @@ export type OwnerSessionResponse = {
 
 // ---- Owner routes (Authorization: Bearer <OWNER_API_TOKEN>, or the fd_owner cookie, until owner sign-in in Ring 2) ----
 
-/** GET and PUT /api/shops/[shop]/policies. */
-export type PoliciesResponse = GetPoliciesResult;
+/** GET and PUT /api/shops/[shop]/policies: get_policies' shape, plus the owner's email. */
+export type PoliciesResponse = {
+  shop: Shop;
+  policies: Policies;
+};
 
 /**
  * PUT /api/shops/[shop]/policies body. Send the fields to change (at least one); the others keep their
  * values. Ranges: leadTimeMin 0–10080, horizonDays 1–365, depositHorizonDays 1–365,
- * cancelWindowHours 0–720, phone 1–40 characters or null, each rule at most 1000 characters.
+ * cancelWindowHours 0–720, phone 1–40 characters or null, each rule at most 1000 characters,
+ * ownerEmail an address containing "@" of at most 254 characters, or null.
  */
 export type UpdatePoliciesRequest = Partial<Policies>;
+
+// ---- Owner alerts ----
+
+/**
+ * What an alert is about. `booking_confirmed`: the person approved a booking. `booking_cancelled`: the
+ * agent cancelled a booking (awaiting approval or confirmed), or the person declined one. The owner's own
+ * actions and lapsed holds send no alert.
+ */
+export type AlertKind = "booking_confirmed" | "booking_cancelled";
+
+/**
+ * How it went out. `email`: through Resend to the shop's ownerEmail (only where RESEND_API_KEY is set and
+ * the shop has an ownerEmail). `log`: one JSON line in the function log, everywhere else.
+ */
+export type AlertChannel = "email" | "log";
+
+/** `sent`: the email was accepted by Resend. `logged`: the log line was written. `failed`: see Alert.error. */
+export type AlertStatus = "sent" | "logged" | "failed";
+
+/** One alert to the shop owner, recorded whatever happened to it. */
+export type Alert = {
+  /** Increasing id. */
+  id: string;
+  shopSlug: string;
+  /** The booking it's about (a Booking.id). */
+  bookingId: string;
+  kind: AlertKind;
+  channel: AlertChannel;
+  /** The email address it went to; null for a log line. */
+  recipient: string | null;
+  status: AlertStatus;
+  /** Why it failed, e.g. "Resend answered HTTP 403: …". null unless status is failed. */
+  error: string | null;
+  /** When it was sent, RFC 3339 with the shop's offset. */
+  createdAt: string;
+};
+
+/** GET /api/shops/[shop]/alerts: the shop's newest 50 alerts, newest first. */
+export type AlertsResponse = {
+  shop: Shop;
+  alerts: Alert[];
+};
 
 /** GET and PUT /api/shops/[shop]/hours: every staff member's regular week. */
 export type HoursResponse = {
@@ -616,6 +676,11 @@ export type StatusResponse = {
   deposits: DepositsMode;
   /** Approval links are built on the origin of the request that creates them, like this one's. */
   approvalLinks: { origin: string };
+  /**
+   * How owner alerts go out: `email` when RESEND_API_KEY is set (to shops with an ownerEmail; the others are
+   * still logged), else `log`. Neither is a problem.
+   */
+  alerts: AlertChannel;
   /** One sentence each, saying what to fix and where. Empty when ready. */
   problems: string[];
 };

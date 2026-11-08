@@ -1,7 +1,7 @@
 import { systemClock } from "../clock";
 import type { DepositPayments } from "../deposits/payments";
 import { createStripePayments } from "../deposits/stripe";
-import { createLogNotifier } from "../notify/log-notifier";
+import { createNotifier } from "../notify/notifier";
 import { createMemoryStore } from "./memory-store";
 import { createPostgresStore } from "./postgres-store";
 import type { FrontDeskDeps } from "./service";
@@ -16,6 +16,10 @@ import type { FrontDeskDeps } from "./service";
 // Approval links need no setting: each route sets deps.baseUrl to the origin of the request it serves
 // (withRequestOrigin in service.ts).
 //
+// Owner alerts: RESEND_API_KEY set (Production only) → email to the shop's ownerEmail; otherwise, or for a
+// shop without an ownerEmail, a log line. See lib/server/notify/notifier.ts.
+//
+// Deposits:
 //   STRIPE_SECRET_KEY set         → deposits through Stripe Checkout (test mode; lib/server/deposits)
 //   unset                         → deposits off: approving confirms at once, deposit "not_collected"
 
@@ -46,7 +50,7 @@ export function paymentsFrom(env: Env): DepositPayments | null {
 /** Build deps from `env`, without caching. Exported for tests; the app uses getFrontDeskDeps(). */
 export function createFrontDeskDeps(env: Env, warn: (message: string) => void = console.warn): FrontDeskDeps {
   const clock = systemClock;
-  const notifier = createLogNotifier();
+  const notifier = createNotifier({ resendApiKey: env.RESEND_API_KEY });
   const payments = paymentsFrom(env);
   const url = env.DATABASE_URL?.trim();
 

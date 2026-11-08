@@ -1,12 +1,14 @@
 # Database (Supabase Postgres)
 
-Front Desk stores shops, services, staff hours, booking rules, blocked time, bookings and their history, and people's approvals, in Postgres, hosted on Supabase.
+Front Desk stores shops, services, staff hours, booking rules, blocked time, bookings and their history, people's approvals, and the alerts sent to owners, in Postgres, hosted on Supabase.
 
 | File | What it is |
 |---|---|
 | [`supabase/migrations/0001_skeleton.sql`](../supabase/migrations/0001_skeleton.sql) | Ring 0: shops, services, staff, weekly hours, bookings, the no-double-booking constraint, row level security |
 | [`supabase/migrations/0002_rules.sql`](../supabase/migrations/0002_rules.sql) | Ring 1a: shop policies, blocked times, the full booking lifecycle (statuses, timestamps, deposit snapshot), the events log |
 | [`supabase/migrations/0003_consent.sql`](../supabase/migrations/0003_consent.sql) | Ring 1b: holds awaiting approval (`approve_by`, the mandate, the person's phone) and approval requests (one per booking, with the link's token) |
+| [`supabase/migrations/0004_alerts.sql`](../supabase/migrations/0004_alerts.sql) | Owner alerts: `policies.owner_email` and the `alerts` table (one row per alert sent, logged or failed). Drops the unused `idempotency_keys`. |
+| [`supabase/migrations/0005_deposits.sql`](../supabase/migrations/0005_deposits.sql) | Deposits through Stripe Checkout: the Checkout Session, its URL, the PaymentIntent, `pay_by`, `deposit_state` and the last refused capture or release on `bookings`. See [deposits.md](deposits.md#database-0005_depositssql). |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -23,10 +25,11 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
   - `cancelled_by` is `agent`, `owner` or `customer` (the person declined). Each transition stamps its own time column.
   - `deposit_cents` is a snapshot of the service's deposit when the booking was made, so a later price change doesn't rewrite history.
 - `approvals (booking_id pk, token unique, created_at, decided_at, decision)`: one per booking. `token` is the token in the approval link, stored as it is, so every booking response can carry the link while the hold is on (`Booking.approval`). `decision` is `approved` or `declined`, set together with `decided_at`. `Booking.customer.approved` is `decision = 'approved'`.
-- `policies (shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone, deposit_rule, late_cancel_rule, no_show_rule, updated_at)`: one row per shop. A shop without a row uses the column defaults (120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules).
+- `policies (shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone, deposit_rule, late_cancel_rule, no_show_rule, owner_email, updated_at)`: one row per shop. A shop without a row uses the column defaults (120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules, no owner email). `owner_email` (at most 254 characters, or null) is where owner alerts are emailed; agents never see it.
 - `blocked_times (id, staff_id, during tstzrange, reason, created_at)`: holidays and time off. Half-open, like bookings. The owner sees `reason`; agents never do.
 - `events (id, booking_id, at, actor, type, data jsonb)`: one row per booking state change (`booked`, `approved`, `declined`, `expired`, `cancelled`, `completed`, `no_show`), written in the same transaction as the change. `actor` is `agent`, `owner`, `customer` or `system`.
-- `idempotency_keys`: from 0002, no longer read or written. It stays until a later migration drops it, because the Ring 1a code still deployed when 0003 lands writes to it.
+- `alerts (id, shop_slug, booking_id, kind, channel, recipient, status, error, created_at)`: one row per owner alert, whatever happened to it. `kind` is `booking_confirmed` or `booking_cancelled`; `channel` is `email` (to `recipient`) or `log` (`recipient` null); `status` is `sent`, `logged` or `failed` (with `error`). `id` increases. Deleting a booking deletes its alerts. The owner reads the newest 50 with `GET /api/shops/[shop]/alerts` ([frontdesk-api.md](frontdesk-api.md#owner-alerts)).
+- `idempotency_keys`: from 0002, unused since the MVP reset, dropped by 0004.
 
 Double booking is impossible at the database level:
 
@@ -43,7 +46,7 @@ Booking state changes are conditional: `UPDATE bookings … WHERE id = … AND s
 
 ### Database time and `FRONTDESK_NOW`
 
-`created_at`, `events.at`, `cancelled_at`, `completed_at` and `no_show_at` are set by the database with `now()` (the start of the transaction). `FRONTDESK_NOW` freezes only Front Desk's own clock, which drives the booking rules (see [frontdesk-api.md](frontdesk-api.md)). So with Postgres:
+`created_at` (bookings and alerts), `events.at`, `cancelled_at`, `completed_at` and `no_show_at` are set by the database with `now()` (the start of the transaction). `FRONTDESK_NOW` freezes only Front Desk's own clock, which drives the booking rules (see [frontdesk-api.md](frontdesk-api.md)). So with Postgres:
 - `createdAt`, event times and the lifecycle timestamps show real time, even when the app clock is frozen.
 
 The in-memory store (no `DATABASE_URL`) stamps all of these with the app clock instead, so with `FRONTDESK_NOW` set they show the frozen instant.
@@ -143,6 +146,21 @@ What 0003 does to existing data:
 
 It's compatible with the Ring 1a code already deployed: new columns are nullable, the widened checks accept what Ring 1a writes, and the 0002 table Ring 1a's `book` and `cancel` write to is still there while the new code rolls out. If the new code is deployed before the integration has applied 0003, `book`, `get_booking` and the approval routes fail with `internal` until it has.
 
+### Owner alerts: applying 0004
+
+`0004_alerts.sql` is applied like any other migration (never in the SQL editor). It seeds nothing.
+
+1. **Preview database:** the Preview database workflow rebuilds it from the PR's branch, because the PR changes `supabase/`. Check `/api/status` on the preview: `"schema": "current"`.
+2. **Production:** the GitHub integration applies 0004 when the PR merges.
+3. **Check** with `select version from supabase_migrations.schema_migrations;` (lists `0004`) and `select owner_email from policies;`.
+
+What 0004 does to existing data:
+- `policies.owner_email` is null for every shop, so alerts are logged until the owner sets an address (`PUT /api/shops/harts/policies` with `{"ownerEmail": "…"}`).
+- `alerts` starts empty: bookings confirmed or cancelled before 0004 have no alerts.
+- It drops `idempotency_keys`. Nothing deployed reads or writes it since the MVP reset.
+
+The code already deployed tolerates it: it never reads `owner_email` or `alerts`. If the new code is deployed before the integration has applied 0004, reading a shop's policies fails, so most Front Desk calls fail with `internal` until it has; `/api/status` names what's missing.
+
 ### 2. Get the connection string: use the transaction pooler
 
 In the Supabase dashboard, click **Connect**, choose **Transaction pooler**, and copy the URI. It looks like:
@@ -193,12 +211,25 @@ OWNER_API_TOKEN=<64 hex characters>
 - **Never commit it.** Anyone holding it can read the bookings (with phone numbers), change the shop's rules and act on its bookings. To rotate it, change the value in Vercel and redeploy; that also ends every `fd_owner` session.
 - It's a stopgap: `TODO(ring-2)`: owner sign-in replaces the token.
 
+### 5. Set `RESEND_API_KEY` (Production only)
+
+With it, [owner alerts](frontdesk-api.md#owner-alerts) are emailed through Resend to the shop's `ownerEmail`; without it, they're written to the function log. Set it for **Production only**: previews log their alerts, so test bookings never email the real owner.
+
+1. Create a Resend account **with the email address the owner's alerts should go to**. Alerts are sent from Resend's shared `onboarding@resend.dev`, and with that sender Resend only delivers to the account's own address. `TODO(ring-3)`: send from the shop's own domain.
+2. In Resend, create an API key with **Sending access**.
+3. In Vercel, **Settings → Environment Variables**, add `RESEND_API_KEY` (type Secret) for **Production** only, then redeploy. `/api/status` on production then shows `"alerts": "email"`.
+4. Set the shop's `ownerEmail` to that same address: `PUT /api/shops/harts/policies` with `{"ownerEmail": "…"}` (see [frontdesk-api.md](frontdesk-api.md#policies)).
+
+A failed send (a wrong key, an address Resend won't deliver to) never affects the booking. It shows up in `GET /api/shops/harts/alerts` as `"status": "failed"` with Resend's message.
+
 ## Environment variables
 
 | Variable | Where | Required | What |
 |---|---|---|---|
 | `DATABASE_URL` | Vercel (per environment), local | On Vercel | The Supabase transaction pooler string (port 6543). Unset locally: in-memory data. |
 | `OWNER_API_TOKEN` | Vercel (per environment), local | For the owner routes and `/console` | The shop's access code: the owner routes' Bearer token and the `fd_owner` cookie's value. |
+| `RESEND_API_KEY` | Vercel, **Production only** | No | Email owner alerts through Resend to the shop's `ownerEmail`. Unset (previews, local): alerts are logged instead. |
+| `STRIPE_SECRET_KEY` | Vercel (Preview and Production), local | No | A Stripe **test** secret key (`sk_test_…`): deposits are held through Stripe Checkout. Unset: deposits are off and bookings confirm without one. See [deposits.md](deposits.md#setup). |
 | `FRONTDESK_NOW` | Local, demos | No | Freeze Front Desk's clock at an RFC 3339 instant. |
 | `DATABASE_URL_TEST` | Local, CI if wanted | No | A scratch Postgres for the Postgres tests. |
 | `VERCEL_ENV`, `VERCEL_GIT_COMMIT_SHA` | Set by Vercel | — | `/api/status` reports them as `environment` and `commit`. Unset locally: `development`, `null`. |
@@ -287,7 +318,7 @@ The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/dep
 
 ## Running the Postgres tests
 
-`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql`, `0002_rules.sql`, `0003_consent.sql`) and the seed applied:
+`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql` to `0005_deposits.sql`) and the seed applied:
 
 ```bash
 DATABASE_URL_TEST=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm test
@@ -298,7 +329,7 @@ Four files use it:
 | File | What it covers |
 |---|---|
 | [`lib/server/frontdesk/status-pg.test.ts`](../lib/server/frontdesk/status-pg.test.ts) | `/api/status` on a real database: every column in `REQUIRED_SCHEMA` exists once every migration has run, the shop's name, and the schema reported `current`. Read-only. |
-| [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, lazy expiry, approval answers, and the owner writes (policies, services, hours, blocks). |
+| [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, lazy expiry, approval answers, owner alerts, and the owner writes (policies with `owner_email`, services, hours, blocks). |
 | [`lib/server/frontdesk/flow-pg.test.ts`](../lib/server/frontdesk/flow-pg.test.ts) | The lifecycle flow through the service layer, the code the MCP tools and owner routes call: book (and the same slot again → slot_taken), approve, cancel (released, captured, none), cancel after the start, an owner no-show, and concurrent books and cancels. |
 | [`lib/server/consent/consent-pg.test.ts`](../lib/server/consent/consent-pg.test.ts) | The consent flow on Postgres: approve with and without a phone (the token and the phone stored as they are), decline, and lazy expiry (a stale hold never blocks a new booking; exactly one `expired` event under concurrency). |
 

@@ -11,7 +11,8 @@ import { approveBooking, declineBooking, getApprovalView } from "./approvals";
 // approve and decline take JSON (answering JSON), or a plain HTML form post from the approval page
 // (answering 303 → /approve/<token>, so the page shows the new status; a refusal adds ?error=<code>). An
 // approve that leaves the booking awaiting its deposit answers 303 → the Stripe Checkout page instead.
-// Both run with deps.baseUrl set to the request's origin, so Stripe sends the person back to the same site.
+// Both run with deps.baseUrl set to the request's origin, so Stripe sends the person back to the same site
+// and the owner alert they send links to this deployment's /console.
 
 /** The request's JSON body, or undefined when it's empty. Malformed JSON is invalid_request (field "body"). */
 async function readOptionalJson(request: Request): Promise<unknown> {
@@ -61,25 +62,25 @@ export function approvalGet(getDeps: () => FrontDeskDeps, token: string): Promis
  * → /approve/<token>.
  */
 export function approvalApprovePost(getDeps: () => FrontDeskDeps, request: Request, token: string): Promise<Response> {
+  const deps = () => withRequestOrigin(getDeps(), request);
   if (isFormPost(request)) {
     return formAnswer(request, token, async () => {
       const phone = (await request.formData()).get("phone");
-      const { booking } = await approveBooking(withRequestOrigin(getDeps(), request), token, typeof phone === "string" ? { phone } : {});
+      const { booking } = await approveBooking(deps(), token, typeof phone === "string" ? { phone } : {});
       return booking.status === "awaiting_deposit" ? (booking.deposit.payUrl ?? null) : null;
     });
   }
-  return respond<ApproveResponse>(async () =>
-    approveBooking(withRequestOrigin(getDeps(), request), token, await readOptionalJson(request)),
-  );
+  return respond<ApproveResponse>(async () => approveBooking(deps(), token, await readOptionalJson(request)));
 }
 
 /** POST /api/approvals/[token]/decline → DeclineResponse. Ignores the body. A form post answers 303 → /approve/<token>. */
 export function approvalDeclinePost(getDeps: () => FrontDeskDeps, request: Request, token: string): Promise<Response> {
+  const deps = () => withRequestOrigin(getDeps(), request);
   if (isFormPost(request)) {
     return formAnswer(request, token, async () => {
-      await declineBooking(withRequestOrigin(getDeps(), request), token);
+      await declineBooking(deps(), token);
       return null;
     });
   }
-  return respond<DeclineResponse>(() => declineBooking(withRequestOrigin(getDeps(), request), token));
+  return respond<DeclineResponse>(() => declineBooking(deps(), token));
 }
