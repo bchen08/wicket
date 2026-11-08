@@ -8,9 +8,9 @@ Front Desk lets AI agents (Claude, ChatGPT, personal agents) ask a small busines
 |---|---|
 | Endpoint | `<origin>/api/mcp`, e.g. `http://localhost:3000/api/mcp` or `https://<preview>.vercel.app/api/mcp` |
 | Transport | Streamable HTTP, stateless (`POST` only; `GET` answers 405) |
-| Auth | MCP: none yet. Approval routes: the token in the link. Owner routes: `Authorization: Bearer <OWNER_API_TOKEN>` or the `fd_owner` cookie (see [Owner routes](#owner-routes)). |
+| Auth | MCP: optional OAuth sign-in for the person ([connector-signin.md](connector-signin.md)); anonymous calls work as before. Approval routes: the token in the link. Owner routes: `Authorization: Bearer <OWNER_API_TOKEN>` or the `fd_owner` cookie (see [Owner routes](#owner-routes)). |
 | Shop | One shop for now: Hart's Barbers (`harts`), `America/New_York` |
-| Tools | `list_services`, `get_policies`, `get_availability`, `get_booking` (read-only), `book` and `cancel` |
+| Tools | `list_services`, `get_policies`, `get_availability`, `get_booking`, `list_my_bookings` (read-only; the last needs sign-in), `book` and `cancel` |
 | Public routes | `GET /api/shops/[shop]/services` |
 | Approval routes | `GET /api/approvals/[token]`, `POST /api/approvals/[token]/approve`, `/decline` (the approval page at `/approve/[token]` uses them) |
 | Owner routes | the bookings list, policies, hours, blocked time, services, booking actions, booking history and owner alerts under `/api/shops/[shop]/`; the owner session at `/api/owner/session` |
@@ -19,6 +19,7 @@ Front Desk lets AI agents (Claude, ChatGPT, personal agents) ask a small busines
 
 Request and response shapes are exported from [`lib/types/frontdesk.ts`](../lib/types/frontdesk.ts):
 - Shared: `Shop`, `Service`, `Slot`, `Policies`, `AgentPolicies`, `Booking`, `BookingStatus`, `DepositEffect`, `BookingEvent`, `BookingActor`, `BookingEventType`, `Mandate`, `ApiError`, `ApiErrorCode`.
+- Connector sign-in ([`lib/types/oauth.ts`](../lib/types/oauth.ts), [connector-signin.md](connector-signin.md)): `ListMyBookingsInput`, `ListMyBookingsResult`, `CustomerProfile`, and the OAuth shapes.
 - Tools: `ListServicesResult`, `GetPoliciesResult`, `GetAvailabilityInput`, `GetAvailabilityResult`, `BookInput`, `BookResult`, `GetBookingInput`, `GetBookingResult`, `CancelInput`, `CancelResult` (= `BookingTransitionResult`).
 - Public routes: `ServicesResponse`.
 - Approval routes: `ApprovalView`, `ApproveRequest`, `ApproveResponse`, `DeclineResponse`.
@@ -275,9 +276,9 @@ Other `invalid_request` cases:
 |---|---|---|
 | `service_id` | string | Required. An `id` from `list_services`. |
 | `start` | string | Required. A slot `start` from `get_availability`, RFC 3339 with offset. Any offset is accepted if it's the same instant. |
-| `customer_name` | string | Required. 1–80 characters after trimming, without the NUL character (U+0000). The name the booking is under. |
+| `customer_name` | string | 1–80 characters after trimming, without the NUL character (U+0000). The name the booking is under. Required unless the agent is signed in as the person, when it defaults to the name they signed in with; leaving it out without sign-in asks them to sign in (HTTP 401, see [connector-signin.md](connector-signin.md#the-gate)). |
 | `mandate` | object | Optional. `{ priceCapCents?, depositCapCents?, window?: { from, to } }`. See [Mandate](#mandate). |
-| `customer_phone` | string | Optional. The person's mobile, E.164 (spaces, dashes, dots and parentheses are ignored); anything else is `invalid_request`, `details.field: "customer_phone"`. Stored as `customer.phone`, and texted the approval link where texting is on. |
+| `customer_phone` | string | Optional; defaults to the signed-in person's number ([connector-signin.md](connector-signin.md#the-gate)). The person's mobile, E.164 (spaces, dashes, dots and parentheses are ignored); anything else is `invalid_request`, `details.field: "customer_phone"`. Stored as `customer.phone`, and texted the approval link where texting is on. |
 
 **Input**
 
@@ -555,6 +556,24 @@ A cancelled booking frees its time: `get_availability` offers it again.
     "details": { "status": "cancelled", "booking_id": "632aa35c-4e9e-4a08-8880-b5b1165939e2" }
   }
 }
+```
+
+## `list_my_bookings`
+
+The signed-in person's bookings at the shop, for "What appointments do I have?". **Needs sign-in:** called without a token, `/api/mcp` answers HTTP 401 with `WWW-Authenticate` so the client signs the person in and retries (see [connector-signin.md](connector-signin.md#the-gate)).
+
+- Takes no arguments.
+- Returns `{ customer: { name, phone }, bookings: Booking[], truncated }` (`ListMyBookingsResult` in [`lib/types/oauth.ts`](../lib/types/oauth.ts)): every status, bookings that end within the last 7 days or later, sorted by start, at most 50. Lapsed holds read as `expired`; a booking awaiting approval or its deposit carries `approval.url`.
+- The text names who is signed in and lists each booking with its id, for `get_booking` and `cancel`.
+- Annotations: read-only (it records holds that ran out, like `get_booking`).
+
+**Text content**
+
+```
+Maya Lopez (+14015550123) is signed in. Their bookings at Hart's Barbers (from the last 7 days on):
+- Haircut, Wed 11 Nov, 9:00 am EST: confirmed. Booking id: 0f0c…
+- Beard trim, Sat 7 Nov, 2:30 pm EST (past): completed. Booking id: 7a1e…
+Pass a booking id to get_booking for details or to cancel (tell the person the deposit consequence first).
 ```
 
 ## Consent flow

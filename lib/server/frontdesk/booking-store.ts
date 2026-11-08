@@ -40,7 +40,9 @@ export type NewBooking = {
   approvalToken: string;
   /** The person's limits as validated by book, or null. */
   mandate: Mandate | null;
-  /** The person's phone number (E.164) the agent gave with book (customer_phone), or null/absent. */
+  /** The signed-in customer the booking belongs to (connector sign-in), or absent/null for an anonymous agent. */
+  customerId?: string | null;
+  /** The person's phone number (E.164): customer_phone from book (filled from the signed-in customer if the agent sent none), or null/absent. */
   customerPhone?: string | null;
 };
 
@@ -169,6 +171,11 @@ export interface BookingStore {
    * `statuses` when it's given (the nightly tidy-up asks for awaiting_deposit, then confirmed).
    */
   listBookings(shopSlug: string, range: TimeRange, statuses?: readonly BookingStatus[]): Promise<Booking[]>;
+  /**
+   * One signed-in customer's bookings at the shop (bookings.customer_id), of any status, that end after
+   * `since`, sorted by start, at most `limit`. Doesn't expire anything.
+   */
+  listCustomerBookings(shopSlug: string, customerId: string, since: Date, limit: number): Promise<Booking[]>;
   /** One booking by id, or null. Any string is accepted: a malformed id is simply not found. Doesn't expire anything. */
   getBooking(id: string): Promise<Booking | null>;
   /**

@@ -40,6 +40,7 @@ import {
   type FrontDeskDeps,
   type GetBookingOutcome,
 } from "./service";
+import { bookArgsFor, customerFrom, registerCustomerTools } from "../identity/customer";
 
 // The agent door: Front Desk's MCP tools. Transport lives in app/api/mcp/route.ts.
 
@@ -64,6 +65,8 @@ export const SERVER_INSTRUCTIONS = [
   "While the hold is on, get_booking returns the same link again, so you never need to book twice to get it.",
   "cancel works on a hold too. On a confirmed booking it follows the shop's cancellation policy (the deposit is",
   "released or kept depending on how close the start is), so tell the person the consequence before cancelling.",
+  "People can sign in to Front Desk (name and mobile number) from this connector: then book uses their name and number",
+  "(leave customer_name out) and list_my_bookings lists their bookings with ids for get_booking and cancel.",
 ].join(" ");
 
 /** How every tool reports a failure. Each description adds the codes that tool can return. */
@@ -191,7 +194,8 @@ const bookInputShape = {
     maxLength: MAX_CUSTOMER_NAME,
     description:
       `The name the booking is under, as the customer wants the shop to see it, e.g. "Maya" or "Maya Lopez". ` +
-      `1–${MAX_CUSTOMER_NAME} characters. Ask the user if you don't know it.`,
+      `1–${MAX_CUSTOMER_NAME} characters. Leave it out to book as the person signed in to Front Desk (their name ` +
+      "and number); if they haven't signed in yet, they're asked to. Otherwise ask the user if you don't know it.",
   }),
   mandate: advertise({
     type: "object",
@@ -233,7 +237,7 @@ const bookInputShape = {
   }),
 } satisfies Record<keyof BookInput, z.ZodType>; // same keys as the contract, no more, no fewer
 
-const BOOK_REQUIRED = ["service_id", "start", "customer_name"] as const;
+const BOOK_REQUIRED = ["service_id", "start"] as const;
 
 const bookInputSchema = z.object(bookInputShape).meta({ required: [...BOOK_REQUIRED] });
 
@@ -720,7 +724,8 @@ export function registerFrontDeskTools(
         "get_booking to check the status. Only call book once the person has chosen a time and heard the shop's rules " +
         "(get_policies). start must be one of the starts get_availability just returned for the same service_id " +
         "(RFC 3339 with offset, e.g. 2026-11-14T14:30:00-05:00); any other time is refused. " +
-        `customer_name is the name the booking is under (1–${MAX_CUSTOMER_NAME} characters). ` +
+        `customer_name is the name the booking is under (1–${MAX_CUSTOMER_NAME} characters); leave it out to book as ` +
+        "the person signed in to Front Desk. " +
         "mandate (optional): the person's limits (priceCapCents, depositCapCents, window { from, to }); the server " +
         "refuses a booking outside them. " +
         "customer_phone (optional): the person's mobile number (E.164); where the shop can text, Front Desk texts them " +
@@ -751,8 +756,8 @@ export function registerFrontDeskTools(
     },
     async (rawArgs, ctx) => {
       try {
-        const args = parseBookArgs(rawArgs);
-        const outcome = await book(getDeps(), shopSlug, args, agentNameFrom(ctx));
+        const args = parseBookArgs(bookArgsFor(rawArgs, customerFrom(ctx)));
+        const outcome = await book(getDeps(), shopSlug, args, agentNameFrom(ctx), customerFrom(ctx));
         const result: BookResult = { booking: outcome.booking, texted: outcome.texted };
         return {
           content: [{ type: "text", text: bookText(outcome) }],
@@ -777,7 +782,7 @@ export function registerFrontDeskTools(
         "again if they still want it), awaiting_deposit (approved, but the deposit isn't paid yet: send the person the " +
         "same booking.approval.url again; its page has the Pay button). Also completed or no_show. booking.deposit.state " +
         "says where the deposit stands. " +
-        "Until agents sign in, anyone holding a booking id can read it. Read-only, apart from recording that a hold ran out. " +
+        "For a signed-in person, list_my_bookings gives their booking ids. Read-only, apart from recording that a hold ran out. " +
         `${ERROR_FORMAT} code booking_not_found: no booking with that id at this shop; check the id. ` +
         "code invalid_request: fix the arguments as next_action says.",
       inputSchema: getBookingInputSchema,
@@ -813,7 +818,7 @@ export function registerFrontDeskTools(
         "Returns the booking (status cancelled), depositEffect (none, released or captured) and depositCollected " +
         "(true when a deposit held on the card was charged or released; booking.deposit.state shows the result). " +
         "Cancelling again is not_cancellable (it's already cancelled), so a retry never cancels twice. " +
-        "Until agents sign in, anyone holding a booking id can cancel it. " +
+        "For a signed-in person, list_my_bookings gives their booking ids. " +
         `${ERROR_FORMAT} code not_cancellable: the booking is already final (details.status), its hold ran out, or it has started; ` +
         "don't retry, tell the person to call the shop. " +
         "code booking_not_found: no booking with that id at this shop; check the id. " +
@@ -846,4 +851,6 @@ export function registerFrontDeskTools(
       }
     },
   );
+
+  registerCustomerTools(server, getDeps, shopSlug, { bookingSchema, errorResult });
 }

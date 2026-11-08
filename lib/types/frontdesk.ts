@@ -372,8 +372,12 @@ export type BookInput = {
   service_id: string;
   /** A Slot.start returned by get_availability. RFC 3339 with offset. */
   start: string;
-  /** Who the booking is for, 1–80 characters after trimming. */
-  customer_name: string;
+  /**
+   * Who the booking is for, 1–80 characters after trimming. Optional when the agent is signed in as the
+   * person (connector sign-in): then it defaults to the name they signed in with. Without sign-in it is
+   * required (leaving it out asks the person to sign in; see docs/connector-signin.md).
+   */
+  customer_name?: string;
   /** The person's limits. The server refuses a booking outside them (outside_mandate). Optional for now. */
   mandate?: Mandate;
   /**

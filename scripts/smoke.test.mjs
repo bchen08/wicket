@@ -174,7 +174,9 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
         return new Response(`event: message\ndata: ${data}\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
       }
       if (msg.method === "tools/list") {
-        return reply({ tools: ["list_services", "get_policies", "get_availability", "book", "get_booking", "cancel"].map((name) => ({ name })) });
+        return reply({
+          tools: ["list_services", "get_policies", "get_availability", "book", "get_booking", "cancel", "list_my_bookings"].map((name) => ({ name })),
+        });
       }
       const { name, arguments: args, _meta } = msg.params;
       if (name === "get_availability") {

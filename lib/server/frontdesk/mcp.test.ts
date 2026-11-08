@@ -111,7 +111,7 @@ const bookArgs = (extra: Record<string, unknown> = {}) => ({
 });
 
 describe("MCP /api/mcp", () => {
-  it("lists six tools with their annotations: four read-only reads, book (not destructive) and cancel (destructive)", async () => {
+  it("lists seven tools with their annotations: five read-only reads, book (not destructive) and cancel (destructive)", async () => {
     const tools = await listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "book",
@@ -119,9 +119,10 @@ describe("MCP /api/mcp", () => {
       "get_availability",
       "get_booking",
       "get_policies",
+      "list_my_bookings",
       "list_services",
     ]);
-    for (const name of ["list_services", "get_policies", "get_availability", "get_booking"]) {
+    for (const name of ["list_services", "get_policies", "get_availability", "get_booking", "list_my_bookings"]) {
       const tool = tools.find((t) => t.name === name)!;
       expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true });
     }
@@ -154,7 +155,8 @@ describe("MCP /api/mcp", () => {
   it("advertises the required fields and booking_id in the input schemas, and nothing else", async () => {
     const tools = await listTools();
     const schema = (name: string) => tools.find((t) => t.name === name)!.inputSchema;
-    expect([...(schema("book").required ?? [])].sort()).toEqual(["customer_name", "service_id", "start"]);
+    // customer_name isn't required: a signed-in agent leaves it out (docs/connector-signin.md).
+    expect([...(schema("book").required ?? [])].sort()).toEqual(["service_id", "start"]);
     expect(schema("cancel").required).toEqual(["booking_id"]);
     expect(schema("get_booking").required).toEqual(["booking_id"]);
     // Exactly the contract's arguments: no retry key, no phone code.

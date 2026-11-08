@@ -40,7 +40,7 @@ import {
 
 // Postgres ShopCatalog + BookingStore (postgres.js), for the schema in
 // supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql, 0004_alerts.sql, 0005_deposits.sql,
-// 0006_nightly.sql and 0007_texting.sql.
+// 0006_nightly.sql and 0007_texting.sql; bookings.customer_id is from 0008_signin.sql.
 
 /** SQLSTATE exclusion_violation: the bookings.no_overlap constraint fired. */
 const EXCLUSION_VIOLATION = "23P01";
@@ -322,12 +322,13 @@ async function insertBooking(db: Db, input: NewBooking): Promise<Booking> {
     with b as (
       insert into bookings (
         shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents, approve_by, mandate,
-        customer_phone
+        customer_id, customer_phone
       )
       values (
         ${input.shopSlug}, ${input.serviceId}, ${input.staffId}, ${tstzrange(db, input)},
         'awaiting_approval', ${input.customerName}, ${input.agentName}, ${input.depositCents},
-        ${input.approveBy.toISOString()}::timestamptz, ${mandate}::jsonb, ${input.customerPhone ?? null}::text
+        ${input.approveBy.toISOString()}::timestamptz, ${mandate}::jsonb,
+        ${normalizeUuid(input.customerId ?? "")}::uuid, ${input.customerPhone ?? null}::text
       )
       returning *
     ), a as (
@@ -387,6 +388,20 @@ function bookingStoreOn(conn: Conn): BookingStore {
         where b.shop_slug = ${shopSlug} and b.during && ${tstzrange(db, range)}
           ${statuses ? db`and b.status in ${db([...statuses])}` : db``}
         order by lower(b.during), b.id
+      `;
+      return rows.map((r) => toBooking(toRecord(r)));
+    },
+
+    async listCustomerBookings(shopSlug, customerId, since, limit) {
+      const customer = normalizeUuid(customerId);
+      if (customer === null) return [];
+      const rows = await db<BookingRow[]>`
+        select ${bookingColumns(db)}
+        from bookings b ${bookingJoins(db)}
+        where b.shop_slug = ${shopSlug} and b.customer_id = ${customer}::uuid
+          and upper(b.during) > ${since.toISOString()}::timestamptz
+        order by lower(b.during), b.id
+        limit ${limit}
       `;
       return rows.map((r) => toBooking(toRecord(r)));
     },

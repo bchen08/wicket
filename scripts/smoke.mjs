@@ -43,7 +43,7 @@ export const BYPASS_HEADER = "x-vercel-protection-bypass";
 export const EXIT = { pass: 0, fail: 1, blocked: 2, usage: 64 };
 
 const SHOP_SERVICES = ["haircut", "beard-trim", "haircut-beard"];
-const MCP_TOOLS = ["book", "cancel", "get_availability", "get_booking", "get_policies", "list_services"];
+const MCP_TOOLS = ["book", "cancel", "get_availability", "get_booking", "get_policies", "list_my_bookings", "list_services"];
 /** Tool calls use the 2026-07-28 protocol, whose per-request _meta envelope carries clientInfo (the agent's name). */
 const MCP_MODERN = "2026-07-28";
 const MCP_LEGACY = "2025-06-18";
@@ -471,7 +471,7 @@ export async function runSmoke({
     return `server ${result.serverInfo.name} ${result.serverInfo.version}, protocol ${result.protocolVersion}`;
   });
 
-  await check("7", "MCP tools/list has the six tools", async () => {
+  await check("7", "MCP tools/list has the seven tools", async () => {
     const result = await client.mcp("tools/list", {});
     const names = Array.isArray(result?.tools) ? result.tools.map((t) => t.name).sort() : [];
     expect(JSON.stringify(names) === JSON.stringify(MCP_TOOLS), `tools: ${names.join(", ") || "none"}`);
@@ -550,6 +550,7 @@ export async function runSmoke({
     ["23", "GET /api/jobs/nightly → 200 with its four counts"],
     ["23", "/api/status shows that run as lastNightlyRun"],
   ];
+
   /** Bookings this run made: { id, token, done, approved } (done: declined or cancelled). */
   const made = [];
 

@@ -15,7 +15,7 @@ pnpm smoke <PREVIEW_URL> --commit <PR head sha> --bypass <secret>
 - Otherwise it prints PASS, FAIL or SKIPPED for each check, with evidence, then one verdict line. Exit code 0: everything passed (SKIPPED rows aren't failures, but they aren't passes either). 1: a check failed.
 - Previews are behind Vercel Authentication. `--bypass` (or the env var `VERCEL_AUTOMATION_BYPASS_SECRET`) is the team's Protection Bypass for Automation secret; get it from a teammate. Without it, a preview answers with Vercel's login page and the run is `BLOCKED: preview needs the Vercel bypass secret (--bypass)`.
 - The owner checks use `harts-preview` on previews. Elsewhere pass `--owner-token <OWNER_API_TOKEN>`, or the checks that need it (the owner lists, and the alerts in the booking loop) are SKIPPED.
-- The booking loop (items 11–14, 17 and 19, the web bookings W4–W5, and the nightly tidy-up, 23) runs only where `/api/status` says `database.writesAllowed: true`, and the run declines (or, once approved, cancels) every booking it made, even after a failure. Its bookings show the agent `front-desk-smoke`.
+- The booking loop (items 11–14, 17 and 19, the web bookings W4–W5, the nightly tidy-up, 23, and connector sign-in's S5–S7) runs only where `/api/status` says `database.writesAllowed: true`, and the run declines (or, once approved, cancels) every booking it made, even after a failure. Its bookings show the agent `front-desk-smoke`.
 - On production: `pnpm smoke https://<production domain> --owner-token <production token>`. The booking loop is SKIPPED there: production is never written to.
 
 Items marked **[browser]** need a browser signed in to the team's Vercel account. **[by hand]** items need a person's judgment or a wait.
@@ -36,7 +36,7 @@ Items marked **[browser]** need a browser signed in to the team's Vercel account
    This also proves the database is connected. A 500 with `code: "internal"` usually means `DATABASE_URL` is missing for that environment, or the deployment wasn't redeployed after it was set; `/api/status` says which.
 5. **[smoke]** `/api/shops/harts/bookings` without a token or cookie returns 401 with `"next_action": "Open /console/unlock and enter the shop's access code."`. With `Authorization: Bearer $OWNER_API_TOKEN` it returns 200 with a `bookings` array (it may be empty). A 401 saying "Owner access isn't set up" means `OWNER_API_TOKEN` is missing for that environment. `/api/shops/harts/alerts` answers the same way, with an `alerts` array.
 6. **[smoke]** `/api/shops/nope/services` returns 404 with `{"error":{"code":"not_found",…}}`, not a 500 or an HTML page.
-7. **[smoke]** `/api/mcp` answers a plain browser visit (`GET`) with 405. That's expected: the MCP route only takes `POST`. A 404 or 500 means the route is broken. `pnpm smoke` also checks that it answers an MCP `initialize` and lists the six tools.
+7. **[smoke]** `/api/mcp` answers a plain browser visit (`GET`) with 405. That's expected: the MCP route only takes `POST`. A 404 or 500 means the route is broken. `pnpm smoke` also checks that it answers an MCP `initialize` and lists the seven tools.
 
 ## Owner console
 
@@ -90,6 +90,20 @@ Never book on production. These checks run only where `/api/status` shows `"writ
 - **T4 [smoke]** Where writes are allowed and texting is `off`: MCP `book` with `customer_phone` → `texted: false` and `booking.customer.phone` is that number; the run then declines it. SKIPPED where texting is on.
 - **T5 [by hand]** (production, texting on, Hart's `ownerMobile` set) At `/console/unlock`, tap **Text me a code** → the owner's phone gets "<6 digits> is your Front Desk code for Hart's Barbers…" within a minute, and the page asks for it. Enter it → `/console`. Enter the same code again (in a private window) → "That code didn't work". Where texting is off, the page shows only the access-code form.
 - **T6 [by hand]** (production, texting on) The next real booking an agent makes with the person's phone: the person gets "<agent> asked Hart's Barbers to book … Approve or decline: <link>", and the agent's result said `texted: true`. Once it's approved (or cancelled), the owner's phone gets "New booking: …" (or "Cancelled: …"), and `/api/shops/harts/alerts` lists a `text` alert `sent` next to the email or log one. Never book on production to test this: wait for a real booking.
+
+## Connector sign-in (Claude and ChatGPT connectors)
+
+Front Desk is the OAuth authorization server for its own MCP endpoint, so a person connects it to Claude or ChatGPT once, signs in with their name and mobile number, and their agent books as them. See [docs/connector-signin.md](docs/connector-signin.md). S1–S4 are read-only and run everywhere; S5–S7 sign in and book, so they run only where `/api/status` shows `"writesAllowed": true` (the booking they make is cancelled). The checks live in `scripts/smoke-checks/signin.mjs`.
+
+- **S1 [smoke]** `/.well-known/oauth-protected-resource/api/mcp` returns `resource: <origin>/api/mcp` and `authorization_servers: [<origin>]`.
+- **S2 [smoke]** `/.well-known/oauth-authorization-server` returns `issuer: <origin>`, the authorize, token and registration endpoints on this origin, `code_challenge_methods_supported: ["S256"]`, `client_id_metadata_document_supported: true` and `token_endpoint_auth_methods_supported: ["none"]`.
+- **S3 [smoke]** An MCP `tools/call` of `list_my_bookings` with no token → **HTTP 401** with `WWW-Authenticate: Bearer … resource_metadata="<origin>/.well-known/oauth-protected-resource/api/mcp"`. That 401 is what makes Claude show its sign-in step. (Every other anonymous call answers exactly as before; item 7 and the booking loop check that.)
+- **S4 [smoke]** `/api/oauth/authorize` with an unknown `client_id` → 400 page, no redirect.
+- **S5 [smoke]** Sign in as a test client: register (`POST /api/oauth/register`) → `GET /api/oauth/authorize` → 302 to `/signin`, which names the client → post the form (name `Smoke Test`, a fictional 555-01xx number, Allow) → 303 to the client's redirect URI with `code`, `state` and `iss` → `POST /api/oauth/token` with the PKCE verifier → an access token (3600 s) and a refresh token.
+- **S6 [smoke]** With that token, `book` a Beard trim **without** `customer_name` → booked for `Smoke Test` with the number; `list_my_bookings` lists it; `cancel` it → `cancelled`. SKIPPED where texting is on: it would text the number.
+- **S7 [smoke]** The refresh token gets a new access token, and `list_my_bookings` works with it.
+- **S8 [browser]** In Claude (Customize → Connectors → Add custom connector, URL `<origin>/api/mcp`; a preview needs a bypass link): Claude shows a sign-in step, either when connecting or as a **Connect** card the first time it needs it. Sign in with a name and number on `/signin`. Then "book me a haircut Wednesday morning" books without asking for a name (you still approve it with the link), "What appointments do I have at Hart's?" lists it, and "cancel the Wednesday one" cancels it.
+- **S9 [browser]** An agent that never signs in can still browse and book as before (it is asked for a name, and gets the approval link).
 
 Add a line here whenever a feature ships that must never break. Keep each one a quick pass/fail check on a URL, and mark it **[smoke]** (then add it to `scripts/smoke.mjs`), **[browser]** or **[by hand]**.
 
