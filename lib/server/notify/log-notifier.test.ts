@@ -15,7 +15,7 @@ const booking: Booking = {
   display: "Sat 14 Nov, 2:30 pm EST",
   status: "confirmed",
   customer: customerOf("Maya Lopez-Hart", true, "+14015550123"),
-  agent: { name: "claude-ai" },
+  agent: { name: "claude-ai", confirmed: false },
   depositCents: 1000,
   deposit: { amountCents: 1000, state: "held" },
   createdAt: "2026-11-07T12:00:00-05:00",

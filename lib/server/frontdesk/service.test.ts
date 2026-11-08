@@ -424,7 +424,7 @@ describe("approval links: the request's origin", () => {
       display: "Sat 14 Nov, 10:00 am EST",
       status: "awaiting_approval",
       customer: customerOf("Maya", false),
-      agent: { name: "Claude" },
+      agent: { name: "Claude", confirmed: false },
       depositCents: 0,
       deposit: { amountCents: 0, state: "none" },
       createdAt: "2026-11-09T12:00:00-05:00",

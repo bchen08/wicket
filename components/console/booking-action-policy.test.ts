@@ -7,7 +7,7 @@ const start = Date.parse("2026-11-08T12:00:00Z");
 const booking: Booking = {
   id: "test", shopSlug: "harts", serviceId: "haircut", serviceName: "Haircut", staffId: "dana",
   start: new Date(start).toISOString(), end: new Date(start + 1800000).toISOString(), display: "Sun 8 Nov, 7 am EST",
-  status: "confirmed", customer: { displayName: "Test customer", approved: true }, agent: { name: "Test agent" },
+  status: "confirmed", customer: { displayName: "Test customer", approved: true }, agent: { name: "Test agent", confirmed: false },
   depositCents: 1000, deposit: { amountCents: 1000, state: "held" }, createdAt: new Date(start - 86400000).toISOString(),
 };
 

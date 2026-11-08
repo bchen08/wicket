@@ -138,7 +138,7 @@ describe("book", () => {
       display: "Sat 14 Nov, 2:30 pm EST",
       status: "awaiting_approval",
       customer: customerOf("Maya Lopez", false),
-      agent: { name: "claude-ai" },
+      agent: { name: "claude-ai", confirmed: false },
       depositCents: 1000,
       deposit: { amountCents: 1000, state: "none" },
       createdAt: "2026-11-09T12:00:00-05:00",

@@ -740,5 +740,43 @@ if (!url) {
       expect(await store.deleteBlock(shop, earlier!.id)).toEqual(earlier);
       expect(await store.listBlocks(shop, DAY)).toEqual([]);
     });
+
+    it("records PAP agents (first and last seen), stores agent_client_id on bookings, and lists agents with counts", async () => {
+      const first = `https://vitest-${run}.example/first.json`;
+      const second = `https://vitest-${run}.example/second.json`;
+      // Other tests here book at the throwaway shop too, unconfirmed.
+      const before = (await store.listAgents(shop)).unconfirmedBookings;
+      try {
+        await store.recordAgent({ clientId: first, name: "First" });
+        await store.recordAgent({ clientId: second, name: "Second" });
+        await sql`update agents set first_seen = now() - interval '1 hour', last_seen = now() - interval '1 hour' where client_id = ${first}`;
+        await store.recordAgent({ clientId: first, name: "First, renamed" });
+
+        const confirmed = await store.createBooking({ ...ours(at(9), at(9, 30)), agentName: "First, renamed", agentClientId: first });
+        expect(confirmed.agent).toEqual({ name: "First, renamed", confirmed: true, clientId: first });
+        expect((await store.listEvents(confirmed.id))[0].data).toEqual({
+          status: "awaiting_approval",
+          agentName: "First, renamed",
+          agentClientId: first,
+        });
+        const unconfirmed = await store.createBooking(ours(at(10), at(10, 30)));
+        expect(unconfirmed.agent).toEqual({ name: "vitest", confirmed: false });
+        expect((await store.getBooking(confirmed.id))?.agent.confirmed).toBe(true);
+
+        const { agents, unconfirmedBookings } = await store.listAgents(shop);
+        const mine = agents.filter((a) => a.clientId.startsWith(`https://vitest-${run}.`));
+        // first was seen again just now, so it comes before second; its first_seen stayed an hour back.
+        expect(mine.map((a) => [a.clientId, a.name, a.bookings])).toEqual([
+          [first, "First, renamed", 1],
+          [second, "Second", 0],
+        ]);
+        expect(mine[0].firstSeen.getTime()).toBeLessThan(mine[0].lastSeen.getTime() - 3_000_000);
+        expect(mine[0].lastBookedAt?.getTime()).toBe(Date.parse(confirmed.createdAt));
+        expect(mine[1].lastBookedAt).toBeNull();
+        expect(unconfirmedBookings).toBe(before + 1);
+      } finally {
+        await sql`delete from agents where client_id = any(${[first, second]}::text[])`;
+      }
+    });
   });
 }

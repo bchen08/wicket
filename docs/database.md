@@ -10,6 +10,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 | [`supabase/migrations/0004_alerts.sql`](../supabase/migrations/0004_alerts.sql) | Owner alerts: `policies.owner_email` and the `alerts` table (one row per alert sent, logged or failed). Drops the unused `idempotency_keys`. |
 | [`supabase/migrations/0005_deposits.sql`](../supabase/migrations/0005_deposits.sql) | Deposits through Stripe Checkout: the Checkout Session, its URL, the PaymentIntent, `pay_by`, `deposit_state` and the last refused capture or release on `bookings`. See [deposits.md](deposits.md#database-0005_depositssql). |
 | [`supabase/migrations/0006_nightly.sql`](../supabase/migrations/0006_nightly.sql) | The nightly tidy-up's log: the `nightly_runs` table (one row per run, with its counts), which `/api/status` shows as `lastNightlyRun`. See [nightly.md](nightly.md#database-0006_nightlysql). |
+| [`supabase/migrations/0009_agents.sql`](../supabase/migrations/0009_agents.sql) | Agent identity (PAP 0.4): the `agents` table and `bookings.agent_client_id`. See [agent-identity.md](agent-identity.md). |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -25,11 +26,13 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
   - `mandate`: the person's limits as the agent sent them (a JSON object), or null.
   - `cancelled_by` is `agent`, `owner` or `customer` (the person declined). Each transition stamps its own time column.
   - `deposit_cents` is a snapshot of the service's deposit when the booking was made, so a later price change doesn't rewrite history.
+  - `agent_client_id` (0009): the confirmed PAP agent's `client_id`, or null for an unconfirmed agent. `agent_name` is then that agent's verified name. No foreign key.
 - `approvals (booking_id pk, token unique, created_at, decided_at, decision)`: one per booking. `token` is the token in the approval link, stored as it is, so every booking response can carry the link while the hold is on (`Booking.approval`). `decision` is `approved` or `declined`, set together with `decided_at`. `Booking.customer.approved` is `decision = 'approved'`.
 - `policies (shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone, deposit_rule, late_cancel_rule, no_show_rule, owner_email, updated_at)`: one row per shop. A shop without a row uses the column defaults (120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules, no owner email). `owner_email` (at most 254 characters, or null) is where owner alerts are emailed; agents never see it.
 - `blocked_times (id, staff_id, during tstzrange, reason, created_at)`: holidays and time off. Half-open, like bookings. The owner sees `reason`; agents never do.
 - `events (id, booking_id, at, actor, type, data jsonb)`: one row per booking state change (`booked`, `approved`, `declined`, `expired`, `cancelled`, `completed`, `no_show`), written in the same transaction as the change. `actor` is `agent`, `owner`, `customer` or `system`.
 - `alerts (id, shop_slug, booking_id, kind, channel, recipient, status, error, created_at)`: one row per owner alert, whatever happened to it. `kind` is `booking_confirmed` or `booking_cancelled`; `channel` is `email` (to `recipient`) or `log` (`recipient` null); `status` is `sent`, `logged` or `failed` (with `error`). `id` increases. Deleting a booking deletes its alerts. The owner reads the newest 50 with `GET /api/shops/[shop]/alerts` ([frontdesk-api.md](frontdesk-api.md#owner-alerts)).
+- `agents (client_id pk, name, first_seen, last_seen)` (0009): one row per PAP agent whose `Poppy-Session` verified. `name` is its latest `client_name`, and `last_seen` is its latest verified request. The owner reads them with `GET /api/shops/[shop]/agents` ([agent-identity.md](agent-identity.md)).
 - `idempotency_keys`: from 0002, unused since the MVP reset, dropped by 0004.
 
 Double booking is impossible at the database level:
@@ -172,7 +175,11 @@ The code already deployed tolerates it: it never reads `owner_email` or `alerts`
 
 It changes no existing data, and the code already deployed never reads `nightly_runs`. If the new code is deployed before the integration has applied 0006, `/api/status` says `outdated` (missing `nightly_runs`) and `lastNightlyRun: null`, and `/api/jobs/nightly` does its work but answers `internal` when it can't record the run.
 
-### 2. Get the connection string: use the transaction pooler
+### Agent identity: applying 0009
+
+`0009_agents.sql` is applied like any other migration. It adds the `agents` table (RLS on, no policies) and the nullable `bookings.agent_client_id`, and seeds nothing; see [agent-identity.md](agent-identity.md). The code already deployed never reads either. The new code reads and writes `agent_client_id` on every booking, so if it's deployed before the integration has applied 0009, `/api/status` says `outdated` (missing `agents` and `bookings.agent_client_id`) and booking fails until the migration lands, as with 0005. Renumber it to the next free number before merging: Supabase refuses a migration numbered below one it has already applied.
+
+
 
 In the Supabase dashboard, click **Connect**, choose **Transaction pooler**, and copy the URI. It looks like:
 
@@ -329,7 +336,7 @@ The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/dep
 
 ## Running the Postgres tests
 
-`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql` to `0006_nightly.sql`) and the seed applied:
+`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration in `supabase/migrations/` and the seed applied:
 
 ```bash
 DATABASE_URL_TEST=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm test

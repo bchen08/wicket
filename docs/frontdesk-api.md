@@ -267,7 +267,8 @@ Other `invalid_request` cases:
 - **`mandate` is optional:** the person's limits. The server refuses a booking outside them (`outside_mandate`) and shows them on the approval page. See [Mandate](#mandate). `TODO(ring-2)`: required once agents sign in.
 - **No deposit is collected yet.** `depositCents` is the deposit the service required when it was booked; it will be collected once deposits are enabled.
 - **The owner isn't told about a hold**, only about a booking the person approved.
-- `agent.name` is a best-effort label: the MCP client's self-reported name, with control characters removed and cut to 80 characters. Clients on the 2026-07-28 protocol send it with every request. Stateless 2025-era requests don't, so those bookings show `"unknown agent"`. MCP Inspector is one of these.
+- `agent` says who booked ([agent-identity.md](agent-identity.md)). An agent that speaks PAP 0.4 sends a signed `Poppy-Session` header. When it verifies, the booking shows `agent: { name, confirmed: true, clientId }`, where `name` is the `client_name` from the agent's signed client metadata. A header that doesn't verify gets HTTP 400 `invalid_session`, and no tool runs.
+- Without the header, nothing changes: `agent: { name, confirmed: false }`, where `name` is a best-effort label, the MCP client's self-reported name with control characters removed and cut to 80 characters. Clients on the 2026-07-28 protocol send it with every request. Stateless 2025-era requests don't, so those bookings show `"unknown agent"`. MCP Inspector is one of these.
 - Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` (each call places a new hold or is refused), `openWorldHint: false`.
 
 | Field | Type | Notes |
@@ -312,7 +313,7 @@ Booking id: bd3db26a-83b1-403c-b923-357982915d3c. Don't book this time again whi
     "display": "Sat 14 Nov, 2:30 pm EST",
     "status": "awaiting_approval",
     "customer": { "displayName": "Maya", "approved": false },
-    "agent": { "name": "unknown agent" },
+    "agent": { "name": "unknown agent", "confirmed": false },
     "depositCents": 1000,
     "createdAt": "2026-11-10T11:00:00-05:00",
     "approval": {
@@ -525,7 +526,7 @@ The middle line depends on `depositEffect`:
     "display": "Sat 14 Nov, 2:30 pm EST",
     "status": "cancelled",
     "customer": { "displayName": "Maya", "approved": false },
-    "agent": { "name": "unknown agent" },
+    "agent": { "name": "unknown agent", "confirmed": false },
     "depositCents": 1000,
     "createdAt": "2026-11-10T10:00:00-05:00"
   },
@@ -654,7 +655,7 @@ Body (optional): no body, `{}`, or `{ "phone": "+14015550123" }`. The phone is E
     "display": "Sat 14 Nov, 2:30 pm EST",
     "status": "confirmed",
     "customer": { "displayName": "Maya", "approved": true, "phone": "+14015550123" },
-    "agent": { "name": "unknown agent" },
+    "agent": { "name": "unknown agent", "confirmed": false },
     "depositCents": 1000,
     "createdAt": "2026-11-10T11:00:00-05:00"
   }
@@ -896,7 +897,7 @@ curl -s http://localhost:3000/api/shops/harts/bookings -H "Authorization: Bearer
       "display": "Sat 14 Nov, 2:30 pm EST",
       "status": "confirmed",
       "customer": { "displayName": "Maya", "approved": true, "phone": "+14015550123" },
-      "agent": { "name": "unknown agent" },
+      "agent": { "name": "unknown agent", "confirmed": false },
       "depositCents": 1000,
       "createdAt": "2026-11-10T10:00:00-05:00"
     },
@@ -911,7 +912,7 @@ curl -s http://localhost:3000/api/shops/harts/bookings -H "Authorization: Bearer
       "display": "Sat 14 Nov, 4:00 pm EST",
       "status": "awaiting_approval",
       "customer": { "displayName": "Lee", "approved": false },
-      "agent": { "name": "unknown agent" },
+      "agent": { "name": "unknown agent", "confirmed": false },
       "depositCents": 0,
       "createdAt": "2026-11-10T11:00:00-05:00",
       "approval": {
@@ -1198,7 +1199,7 @@ curl -s -X POST http://localhost:3000/api/shops/harts/bookings/<booking id>/no-s
     "display": "Tue 10 Nov, 10:00 am EST",
     "status": "no_show",
     "customer": { "displayName": "Sam", "approved": true, "phone": "+14015550199" },
-    "agent": { "name": "unknown agent" },
+    "agent": { "name": "unknown agent", "confirmed": false },
     "depositCents": 1000,
     "createdAt": "2026-11-10T10:00:00-05:00"
   },
@@ -1239,7 +1240,7 @@ curl -s http://localhost:3000/api/shops/harts/bookings/<booking id> -H "Authoriz
     "display": "Tue 10 Nov, 10:00 am EST",
     "status": "no_show",
     "customer": { "displayName": "Sam", "approved": true, "phone": "+14015550199" },
-    "agent": { "name": "unknown agent" },
+    "agent": { "name": "unknown agent", "confirmed": false },
     "depositCents": 1000,
     "createdAt": "2026-11-10T10:00:00-05:00"
   },
@@ -1521,7 +1522,7 @@ These are marked `TODO(ring-N)` in the code:
 | ring-2 | Let agents pick the shop (by slug or URL) instead of hard-coding Hart's | `lib/server/frontdesk/mcp.ts` (`DEFAULT_SHOP_SLUG`) |
 | ring-2 | Owner sign-in replaces `OWNER_API_TOKEN` and the `fd_owner` cookie | `lib/server/frontdesk/owner-auth.ts`, `lib/server/frontdesk/owner-session.ts`, `app/api/owner/session/route.ts`, `lib/server/frontdesk/http.ts`, the owner route files |
 | ring-2 | MCP sign-in: authenticate callers (`book` and `cancel` are open to anyone) | `app/api/mcp/route.ts` |
-| ring-2 | A signed-in agent identity instead of the self-reported client name | `lib/server/frontdesk/mcp.ts` (`agentNameFrom`) |
+| ring-2 | Scope the agents seen to a shop (they're recorded for Front Desk as a whole) | `lib/server/identity/agent.ts` (`listShopAgents`) |
 | ring-2 | `get_booking` and `cancel` still trust anyone holding the booking id; agent identity fixes this | `lib/server/frontdesk/service.ts` (`getBooking`, `cancelBooking`), `app/api/mcp/route.ts` |
 | ring-2 | Require a mandate once agents sign in | `lib/server/engine/lifecycle.ts` (`decide`, book), `lib/server/frontdesk/service.ts` (`book`), `lib/types/frontdesk.ts` (`Mandate`) |
 | ring-2 | OAuth or connector sign-in for agents (Ring 1b deliberately needs none) | `app/api/mcp/route.ts` |

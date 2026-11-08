@@ -16,6 +16,7 @@ import type {
   ListServicesResult,
 } from "../../types/frontdesk";
 import { DateTime } from "luxon";
+import type { ConfirmedAgent } from "../identity/agent";
 import { DEFAULT_LIMIT, MAX_LIMIT, MAX_WINDOW_DAYS, formatDisplay } from "../engine/availability";
 import { APPROVAL_HOLD_MINUTES, DEPOSIT_PAY_MINUTES } from "../engine/lifecycle";
 import { toApiError } from "./errors";
@@ -267,7 +268,11 @@ const bookingSchema = z.object({
     approved: z.boolean().describe("true once the person tapped Approve on the approval link."),
     phone: z.string().optional().describe("The phone number the person gave when approving (E.164), if any."),
   }),
-  agent: z.object({ name: z.string().describe("Best-effort label for the booking agent: the client's self-reported name.") }),
+  agent: z.object({
+    name: z.string().describe("The booking agent's name: its PAP client_name when confirmed, else the client's self-reported name."),
+    confirmed: z.boolean().describe("true when the agent signed its request with a verified PAP session (Poppy-Session header)."),
+    clientId: z.string().optional().describe("The confirmed agent's PAP client_id."),
+  }),
   depositCents: z.number().int().describe("Deposit the service requires, in integer US cents. 0 = none."),
   deposit: z
     .object({
@@ -532,7 +537,7 @@ function bookingText(outcome: GetBookingOutcome): string {
  * The calling agent's name, best effort: the MCP client's self-reported name (clientInfo.name).
  * On the 2026-07-28 protocol every request carries it in its _meta envelope. Stateless 2025-era
  * requests don't (it was only sent with initialize), so those get "unknown agent".
- * TODO(ring-2): a signed-in agent identity instead of a self-reported label.
+ * Unconfirmed: agents that speak PAP are named by their verified identity instead (lib/server/identity/agent.ts).
  */
 export function agentNameFrom(ctx: { mcpReq?: { envelope?: unknown } } | undefined): string {
   const envelope = ctx?.mcpReq?.envelope as Record<string, unknown> | undefined;
@@ -573,19 +578,24 @@ const READ_ONLY = {
  */
 export function createFrontDeskMcpHandler(
   deps: FrontDeskDeps | (() => FrontDeskDeps),
+  agent: ConfirmedAgent | null = null,
 ): (request: Request) => Promise<Response> {
   const getDeps = typeof deps === "function" ? deps : () => deps;
-  return createMcpHandler((server) => registerFrontDeskTools(server, getDeps), {
+  return createMcpHandler((server) => registerFrontDeskTools(server, getDeps, DEFAULT_SHOP_SLUG, agent), {
     serverInfo: { name: "front-desk", version: "0.5.0" },
     instructions: SERVER_INSTRUCTIONS,
   });
 }
 
-/** Register Front Desk's tools on an MCP server. `getDeps` is called once per tool call. */
+/**
+ * Register Front Desk's tools on an MCP server. `getDeps` is called once per tool call. `agent`: the caller's
+ * verified PAP identity (identifyAgent), or null to label bookings with the client's self-reported name.
+ */
 export function registerFrontDeskTools(
   server: McpServer,
   getDeps: () => FrontDeskDeps,
   shopSlug: string = DEFAULT_SHOP_SLUG,
+  agent: ConfirmedAgent | null = null,
 ): void {
   server.registerTool(
     "list_services",
@@ -728,7 +738,7 @@ export function registerFrontDeskTools(
     async (rawArgs, ctx) => {
       try {
         const args = parseBookArgs(rawArgs);
-        const outcome = await book(getDeps(), shopSlug, args, agentNameFrom(ctx));
+        const outcome = await book(getDeps(), shopSlug, args, agent ?? agentNameFrom(ctx));
         const result: BookResult = { booking: outcome.booking };
         return {
           content: [{ type: "text", text: bookText(outcome) }],

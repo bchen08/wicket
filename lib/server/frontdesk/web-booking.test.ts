@@ -521,7 +521,7 @@ describe("agent guidance", () => {
     expect(((await res.json()) as ApiError).error.code).toBe("not_found");
   });
 
-  it("/.well-known/front-desk.json: the MCP endpoint, the web API base and agents.md on the request's origin", async () => {
+  it("/.well-known/front-desk.json: the MCP endpoint, the web API base, agents.md and poppy.json on the request's origin", async () => {
     const res = discoveryGet(get("/api/well-known/front-desk"));
     expect(res.status).toBe(200);
     expect((await res.json()) as FrontDeskDiscovery).toEqual({
@@ -531,6 +531,7 @@ describe("agent guidance", () => {
       mcp: `${ORIGIN}/api/mcp`,
       webApi: `${ORIGIN}/api/shops/harts`,
       agentsMd: `${ORIGIN}/api/shops/harts/agents.md`,
+      poppy: `${ORIGIN}/.well-known/poppy.json`,
       endpoints: {
         availability: `${ORIGIN}/api/shops/harts/availability`,
         book: `${ORIGIN}/api/shops/harts/book`,

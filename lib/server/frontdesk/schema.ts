@@ -34,6 +34,7 @@ export const REQUIRED_SCHEMA = {
     "pay_by",
     "deposit_state",
     "deposit_failure",
+    "agent_client_id",
   ],
   approvals: ["booking_id", "token", "decision", "decided_at"],
   events: ["id", "booking_id", "at", "actor", "type", "data"],
@@ -54,6 +55,7 @@ export const REQUIRED_SCHEMA = {
   blocked_times: ["id", "staff_id", "during", "reason"],
   alerts: ["id", "shop_slug", "booking_id", "kind", "channel", "recipient", "status", "error", "created_at"],
   nightly_runs: ["id", "ran_at", "expired", "completed", "deposits_released", "failures"],
+  agents: ["client_id", "name", "first_seen", "last_seen"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type RequiredTable = keyof typeof REQUIRED_SCHEMA;

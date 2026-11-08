@@ -2,11 +2,14 @@
 // The UI must import these types instead of describing the shape itself.
 // Money is always an integer number of cents. Instants are RFC 3339 strings with an offset.
 
+import type { BookingAgent } from "./agents";
 import type { BookingDeposit, DepositsMode } from "./deposits";
 import type { NightlyRun } from "./nightly";
 
 export type { BookingDeposit, DepositsMode, DepositState } from "./deposits";
 export type { NightlyCounts, NightlyRun, NightlyRunResponse } from "./nightly";
+// Agent identity: Booking.agent, the agents list, poppy.json (docs/agent-identity.md).
+export type * from "./agents";
 // The web booking API's shapes (plain HTTP booking for agents without MCP, and the booking page).
 export type * from "./web-booking";
 
@@ -323,10 +326,11 @@ export type Booking = {
     /** The phone number the person gave when approving, E.164, e.g. "+14015550123". Absent if they gave none. Not checked. */
     phone?: string;
   };
-  agent: {
-    /** Best-effort label for the AI agent that booked: the MCP client's self-reported name. */
-    name: string;
-  };
+  /**
+   * The AI agent that booked. confirmed: true (with clientId) when it signed its request with a verified PAP
+   * session; otherwise name is a self-reported label. See BookingAgent in lib/types/agents.ts.
+   */
+  agent: BookingAgent;
   /** Deposit the service required when this booking was made, in integer cents. 0 = none. See `deposit` for where it stands. */
   depositCents: number;
   /** The deposit: how much, and where it stands (asked for, held on the card, captured, released). See BookingDeposit. */

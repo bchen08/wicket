@@ -78,7 +78,7 @@ It takes JSON, or a plain HTML form post (`application/x-www-form-urlencoded` or
 | `service` | Required. A service id. |
 | `start` | Required. A slot `start` from the availability route for that service, copied exactly (RFC 3339 with offset). |
 | `name` | Required. The name the booking is under, 1–80 characters after trimming, no NUL character. |
-| `bookedBy` | Optional. The agent's name; the person sees it on the approval page and the shop in its console. Without it (or blank), the booking's agent is `web (<the first 60 characters of the User-Agent>)`, or `web` with no User-Agent. Control characters are removed and it's cut to 80 characters, like an MCP client's name. |
+| `bookedBy` | Optional. The agent's name; the person sees it on the approval page and the shop in its console. Without it (or blank), the booking's agent is `web (<the first 60 characters of the User-Agent>)`, or `web` with no User-Agent. Control characters are removed and it's cut to 80 characters, like an MCP client's name. It's never checked: web bookings always show `agent.confirmed: false` (only MCP requests with a verified PAP session are confirmed; see [agent-identity.md](agent-identity.md)). |
 | `mandate` | Optional, JSON only. The person's limits, as in MCP `book` ([Mandate](frontdesk-api.md#mandate)). |
 
 ### JSON → 201 `WebBookResponse`
@@ -207,6 +207,7 @@ Where agents find Front Desk. `next.config.ts` rewrites it to `/api/well-known/f
   "mcp": "http://localhost:3000/api/mcp",
   "webApi": "http://localhost:3000/api/shops/harts",
   "agentsMd": "http://localhost:3000/api/shops/harts/agents.md",
+  "poppy": "http://localhost:3000/.well-known/poppy.json",
   "endpoints": {
     "availability": "http://localhost:3000/api/shops/harts/availability",
     "book": "http://localhost:3000/api/shops/harts/book",
@@ -214,6 +215,8 @@ Where agents find Front Desk. `next.config.ts` rewrites it to `/api/well-known/f
   }
 }
 ```
+
+`poppy` is the PAP 0.4 discovery document. Agents that speak PAP use it to sign their MCP requests, so their bookings show them as confirmed ([agent-identity.md](agent-identity.md)).
 
 ## Try it
 

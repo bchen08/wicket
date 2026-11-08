@@ -21,6 +21,9 @@
 //    its four counts, and /api/status shows that run as lastNightlyRun.
 //    Its MCP requests and web bookings say they come from "front-desk-smoke", so the bookings show who
 //    made them.
+// 4. Agent identity (PAP 0.4, scripts/smoke-checks/agents.mjs): poppy.json and an invalid Poppy-Session
+//    everywhere; where writes are allowed, the demo PAP agent books a Beard trim (confirmed, with its name, in
+//    the owner's bookings and agents lists) and a plain MCP booking stays unconfirmed. Both are declined.
 //
 // --bypass <secret> (or VERCEL_AUTOMATION_BYPASS_SECRET) sends Vercel's x-vercel-protection-bypass header
 // on every request, for previews behind Vercel Authentication. --owner-token overrides the owner token,
@@ -29,6 +32,7 @@
 // Exit codes: 0 every check passed (some may be SKIPPED), 1 a check failed, 2 BLOCKED, 64 bad arguments.
 
 import { pathToFileURL } from "node:url";
+import { agentChecks } from "./smoke-checks/agents.mjs";
 
 export const SMOKE_AGENT = "front-desk-smoke";
 export const SMOKE_CUSTOMER = "Smoke Test";
@@ -860,6 +864,10 @@ export async function runSmoke({
       return describeNightly(last);
     });
   }
+
+  // ---- Agent identity (PAP 0.4) ----
+
+  await agentChecks({ check, client, baseUrl, bypass, fetch: fetchImpl, status, token, smokeAgent: SMOKE_AGENT, now, random, expect, http });
 
   // ---- Report ----
 

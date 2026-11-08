@@ -273,6 +273,8 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   const blocks: StoredBlock[] = [];
   const alerts: StoredAlert[] = [];
   const nightlyRuns: StoredNightlyRun[] = [];
+  // PAP agents (the agents table), keyed by client_id.
+  const agents = new Map<string, { name: string; firstSeen: Date; lastSeen: Date }>();
   let eventSeq = 0;
   let alertSeq = 0;
   let nightlySeq = 0;
@@ -309,6 +311,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       status: b.status,
       customerName: b.customerName,
       agentName: b.agentName,
+      agentClientId: b.agentClientId,
       createdAt: copyDate(b.createdAt),
       // Like the Postgres left join on approvals.
       customerApproved: approvals.get(b.id)?.decision === "approved",
@@ -347,6 +350,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       status,
       customerName: input.customerName,
       agentName: input.agentName,
+      agentClientId: input.agentClientId ?? null,
       depositCents: input.depositCents ?? service.depositCents,
       createdAt: input.createdAt ? copyDate(input.createdAt) : at,
       cancelledAt: null,
@@ -546,6 +550,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
           data: {
             status: "awaiting_approval",
             agentName: input.agentName,
+            ...(stored.agentClientId !== null ? { agentClientId: stored.agentClientId } : {}),
             ...(stored.mandate ? { mandate: stored.mandate } : {}),
           },
         },
@@ -736,6 +741,33 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
     async lastNightlyRun() {
       const newest = [...nightlyRuns].sort((a, b) => b.ranAt.getTime() - a.ranAt.getTime() || b.seq - a.seq)[0];
       return newest ? toNightlyRun(newest) : null;
+    },
+
+    // ---- Agent identity (PAP) ----
+
+    async recordAgent(agent) {
+      const at = now();
+      const known = agents.get(agent.clientId);
+      agents.set(agent.clientId, { name: agent.name, firstSeen: known?.firstSeen ?? at, lastSeen: at });
+    },
+
+    async listAgents(shopSlug) {
+      const atShop = bookings.filter((b) => b.shopSlug === shopSlug);
+      const list = [...agents.entries()].map(([clientId, a]) => {
+        const theirs = atShop.filter((b) => b.agentClientId === clientId);
+        const newest = Math.max(...theirs.map((b) => b.createdAt.getTime()));
+        return {
+          clientId,
+          name: a.name,
+          firstSeen: copyDate(a.firstSeen),
+          lastSeen: copyDate(a.lastSeen),
+          bookings: theirs.length,
+          lastBookedAt: theirs.length > 0 ? new Date(newest) : null,
+        };
+      });
+      // Like the Postgres order by: last_seen desc, then client_id.
+      list.sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime() || compareText(a.clientId, b.clientId));
+      return { agents: list, unconfirmedBookings: atShop.filter((b) => b.agentClientId === null).length };
     },
   };
 

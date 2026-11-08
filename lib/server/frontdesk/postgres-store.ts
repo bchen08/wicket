@@ -101,6 +101,7 @@ type BookingRow = {
   status: BookingStatus;
   customer_name: string;
   agent_name: string;
+  agent_client_id: string | null;
   created_at: Date;
   customer_approved: boolean;
   customer_phone: string | null;
@@ -127,6 +128,7 @@ function toRecord(r: BookingRow): BookingRecord {
     status: r.status,
     customerName: r.customer_name,
     agentName: r.agent_name,
+    agentClientId: r.agent_client_id,
     createdAt: r.created_at,
     customerApproved: r.customer_approved,
     customerPhone: r.customer_phone,
@@ -242,7 +244,7 @@ const tstzrange = (db: Db, range: TimeRange) =>
 const bookingColumns = (db: Db) => db`
   b.id::text as id, b.shop_slug, b.service_id, sv.name as service_name, b.deposit_cents,
   b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at, b.status,
-  b.customer_name, b.agent_name, b.created_at, coalesce(ap.decision = 'approved', false) as customer_approved,
+  b.customer_name, b.agent_name, b.agent_client_id, b.created_at, coalesce(ap.decision = 'approved', false) as customer_approved,
   b.customer_phone, ap.token as approval_token, b.approve_by,
   b.deposit_state, b.checkout_url, b.pay_by, b.deposit_failure, sh.timezone
 `;
@@ -265,6 +267,15 @@ const policyColumns = (db: Db) => db`
   lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone,
   deposit_rule, late_cancel_rule, no_show_rule, owner_email
 `;
+
+type AgentRow = {
+  client_id: string;
+  name: string;
+  first_seen: Date;
+  last_seen: Date;
+  bookings: number;
+  last_booked_at: Date | null;
+};
 
 type AlertRow = {
   id: string;
@@ -319,11 +330,12 @@ async function insertBooking(db: Db, input: NewBooking): Promise<Booking> {
   const rows = await db<BookingRow[]>`
     with b as (
       insert into bookings (
-        shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents, approve_by, mandate
+        shop_slug, service_id, staff_id, during, status, customer_name, agent_name, agent_client_id, deposit_cents,
+        approve_by, mandate
       )
       values (
         ${input.shopSlug}, ${input.serviceId}, ${input.staffId}, ${tstzrange(db, input)},
-        'awaiting_approval', ${input.customerName}, ${input.agentName}, ${input.depositCents},
+        'awaiting_approval', ${input.customerName}, ${input.agentName}, ${input.agentClientId ?? null}, ${input.depositCents},
         ${input.approveBy.toISOString()}::timestamptz, ${mandate}::jsonb
       )
       returning *
@@ -334,6 +346,8 @@ async function insertBooking(db: Db, input: NewBooking): Promise<Booking> {
       insert into events (booking_id, actor, type, data)
       select id, 'agent', 'booked',
              jsonb_build_object('status', status, 'agentName', agent_name)
+               || case when agent_client_id is null then '{}'::jsonb
+                       else jsonb_build_object('agentClientId', agent_client_id) end
                || case when mandate is null then '{}'::jsonb else jsonb_build_object('mandate', mandate) end
       from b
     )
@@ -645,6 +659,42 @@ function bookingStoreOn(conn: Conn): BookingStore {
         limit 1
       `;
       return rows[0] ? toNightlyRunFromRow(rows[0]) : null;
+    },
+
+    // ---- Agent identity (PAP) ----
+
+    async recordAgent(agent) {
+      await db`
+        insert into agents (client_id, name) values (${agent.clientId}, ${agent.name})
+        on conflict (client_id) do update set name = excluded.name, last_seen = now()
+      `;
+    },
+
+    async listAgents(shopSlug) {
+      const [agents, unconfirmed] = await Promise.all([
+        db<AgentRow[]>`
+          select a.client_id, a.name, a.first_seen, a.last_seen,
+                 count(b.id)::int as bookings, max(b.created_at) as last_booked_at
+          from agents a
+          left join bookings b on b.agent_client_id = a.client_id and b.shop_slug = ${shopSlug}
+          group by a.client_id, a.name, a.first_seen, a.last_seen
+          order by a.last_seen desc, a.client_id
+        `,
+        db<{ n: number }[]>`
+          select count(*)::int as n from bookings where shop_slug = ${shopSlug} and agent_client_id is null
+        `,
+      ]);
+      return {
+        agents: agents.map((r) => ({
+          clientId: r.client_id,
+          name: r.name,
+          firstSeen: r.first_seen,
+          lastSeen: r.last_seen,
+          bookings: r.bookings,
+          lastBookedAt: r.last_booked_at,
+        })),
+        unconfirmedBookings: unconfirmed[0]?.n ?? 0,
+      };
     },
   };
   return store;
