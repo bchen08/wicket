@@ -53,7 +53,7 @@ export function Hero() {
             id="hero-title"
             className="font-serif text-4xl leading-tight text-balance sm:text-5xl lg:text-6xl"
           >
-            {"Let customers' AI assistants book your shop."}
+            {"Let customers' AI assistants book your business."}
           </h1>
           <p className="max-w-md text-base leading-relaxed text-muted-foreground text-pretty">
             The customer approves every booking by text, and a card deposit
@@ -220,8 +220,58 @@ export function ForAgents() {
             <code>{bookCall}</code>
           </pre>
         </div>
+        <TrustModel />
       </div>
     </section>
+  );
+}
+
+const papSpecHref = "https://github.com/personal-agent-protocol/personal-agent-protocol";
+
+function TrustModel() {
+  return (
+    <div className="flex flex-col gap-8 border-t border-border pt-10">
+      <div className="flex max-w-2xl flex-col gap-3">
+        <h3 className="font-serif text-xl">How Front Desk trusts agents</h3>
+        <p className="leading-relaxed text-muted-foreground text-pretty">
+          {"Front Desk implements "}
+          <a href={papSpecHref} className="text-foreground underline underline-offset-4">
+            PAP 0.4
+          </a>
+          {
+            ", the Personal Agent Protocol. An agent that speaks it signs every MCP request, and the shop sees exactly which agent booked. Agents that don't speak it still book, labelled by the name they give."
+          }
+        </p>
+      </div>
+      <div className="grid gap-10 md:grid-cols-2 md:gap-16">
+        <div className="flex flex-col gap-4">
+          <h4 className="font-serif text-lg">Confirmed agents</h4>
+          <PlainList
+            items={[
+              "Find the shop at /.well-known/poppy.json.",
+              "Sign each request with a short-lived key, checked against the keys the agent publishes.",
+              "Sessions are bound to this host and expire in about a minute.",
+              "Show on the console under the name in their signed metadata.",
+            ]}
+          />
+        </div>
+        <div className="flex flex-col gap-4">
+          <h4 className="font-serif text-lg">Everyone else</h4>
+          <PlainList
+            items={[
+              "Claude, ChatGPT and other MCP clients book as before.",
+              "Their bookings show as unconfirmed, with a self-reported name.",
+              "A request with a bad signature is refused, not downgraded.",
+            ]}
+          />
+        </div>
+      </div>
+      <p className="max-w-2xl leading-relaxed text-pretty">
+        {
+          "Identity tells the shop who asked. It never decides anything. Every booking, confirmed or not, waits for the customer to approve it by text, and any deposit is held on their card. An agent can't book anyone without that person saying yes."
+        }
+      </p>
+    </div>
   );
 }
 
