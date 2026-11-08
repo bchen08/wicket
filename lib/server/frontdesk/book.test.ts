@@ -129,6 +129,7 @@ describe("book", () => {
       customer: customerOf("Maya Lopez", false),
       agent: { name: "claude-ai" },
       depositCents: 1000,
+      deposit: { amountCents: 1000, state: "none" },
       createdAt: "2026-11-09T12:00:00-05:00",
       approval: { url: expect.stringMatching(APPROVAL_URL), expiresAt: HOLD_EXPIRES },
     });

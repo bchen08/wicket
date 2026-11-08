@@ -65,6 +65,7 @@ describe("GET /api/status", () => {
         missing: [],
       },
       ownerAccess: "configured",
+      deposits: "off",
       approvalLinks: { origin: "http://localhost:3000" },
       problems: [],
     });
@@ -85,6 +86,7 @@ describe("GET /api/status", () => {
         missing: [],
       },
       ownerAccess: "configured",
+      deposits: "off",
       approvalLinks: { origin: ORIGIN },
       problems: [],
     });

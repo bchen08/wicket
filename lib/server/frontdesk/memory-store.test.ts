@@ -15,6 +15,8 @@ const SATURDAY = { start: at("00:00"), end: new Date("2026-11-15T00:00:00-05:00"
 
 /** NOW + 10 minutes: the hold deadline createBooking gets by default. */
 const HOLD_UNTIL = new Date(NOW.getTime() + 10 * 60_000);
+/** When an awaiting_deposit booking in these tests lapses. */
+const PAY_UNTIL = new Date(NOW.getTime() + 30 * 60_000);
 
 const newBooking = (start: Date, end: Date, extra: Partial<NewBooking> = {}): NewBooking => ({
   shopSlug: "harts",
@@ -40,6 +42,7 @@ const initial = (start: Date, end: Date, status: BookingStatus): InitialBooking 
   agentName: "vitest",
   status,
   ...(status === "awaiting_approval" ? { approveBy: HOLD_UNTIL } : {}),
+  ...(status === "awaiting_deposit" ? { payBy: PAY_UNTIL, depositState: "awaiting_payment" as const } : {}),
 });
 
 const cancelEvent = (actor: NewBookingEvent["actor"] = "agent"): NewBookingEvent => ({
@@ -122,8 +125,8 @@ describe("getBusyIntervals", () => {
     ]);
     expect(busy.every((b) => b.staffId === "dana")).toBe(true);
     expect(busy[1].reason).toMatch(/^block /);
-    // Only the hold carries a deadline.
-    expect(busy.map((b) => b.heldUntil)).toEqual([undefined, undefined, undefined, HOLD_UNTIL]);
+    // The hold and the booking awaiting its deposit carry their deadlines.
+    expect(busy.map((b) => b.heldUntil)).toEqual([PAY_UNTIL, undefined, undefined, HOLD_UNTIL]);
     expect(await store.getBusyIntervals("nope", SATURDAY)).toEqual([]);
   });
 

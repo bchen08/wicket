@@ -88,6 +88,7 @@ describe("GET view", () => {
       end: "2026-11-14T14:30:00-05:00",
       priceCents: 3500,
       depositCents: 1000,
+      deposit: { amountCents: 1000, state: "none" },
       policies: {
         cancelWindowHours: 24,
         depositRule: expect.stringContaining("deposit"),

@@ -466,20 +466,20 @@ describe("decide: a lapsed hold expires (actor system)", () => {
     expect(err.details).toEqual({ status: "awaiting_approval", action: "expire", booking_id: booking("awaiting_approval").id });
   });
 
-  it("any other status → invalid_request: only a hold expires", () => {
-    for (const status of ALL_STATUSES.filter((s) => s !== "awaiting_approval")) {
+  it("any other status → invalid_request: only a hold (or an unpaid deposit, see deposits.test.ts) expires", () => {
+    for (const status of ALL_STATUSES.filter((s) => s !== "awaiting_approval" && s !== "awaiting_deposit")) {
       expectError(decide(booking(status), { type: "expire", actor: "system" }, AFTER_START, POLICIES), "invalid_request");
     }
   });
 });
 
 describe("decide: each actor may take only its own actions", () => {
-  const EVERY_ACTION: LifecycleAction[] = ["cancel", "complete", "mark_no_show", "approve", "decline", "expire"];
+  const EVERY_ACTION: LifecycleAction[] = ["cancel", "complete", "mark_no_show", "approve", "decline", "expire", "confirm_deposit"];
   const OWN: Record<LifecycleActor, LifecycleAction[]> = {
     agent: ["cancel"],
     owner: ["cancel", "complete", "mark_no_show"],
     customer: ["approve", "decline"],
-    system: ["expire"],
+    system: ["expire", "confirm_deposit"],
   };
 
   it("anything else is invalid_request, whatever the status and time, with plain words and a next_action", () => {

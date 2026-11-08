@@ -9,9 +9,12 @@
 //    not that the code is wrong.
 // 2. Read-only checks: health, services, owner access, errors, the MCP route.
 // 3. The booking loop, only where /api/status says writesAllowed (the Preview database, or in-memory
-//    data): book → slot_taken → get_booking → decline → the slot is free again. Every booking it makes
-//    is declined at the end, even after a failure. Its MCP requests say they come from
-//    "front-desk-smoke", so the bookings show who made them.
+//    data): book → slot_taken → get_booking → decline → the slot is free again. Then deposits: book
+//    another Haircut and approve it → awaiting_deposit with a Stripe Checkout URL where /api/status says
+//    deposits "stripe_test" (it never pays), or confirmed with the deposit not_collected where it says
+//    "off"; cancel it → the slot is free again. Every booking it makes is declined or cancelled at the end,
+//    even after a failure. Its MCP requests say they come from "front-desk-smoke", so the bookings show who
+//    made them.
 //
 // --bypass <secret> (or VERCEL_AUTOMATION_BYPASS_SECRET) sends Vercel's x-vercel-protection-bypass header
 // on every request, for previews behind Vercel Authentication. --owner-token overrides the owner token,
@@ -37,6 +40,8 @@ const MCP_LEGACY = "2025-06-18";
 const REQUEST_TIMEOUT_MS = 15_000;
 /** Haircut takes a deposit, and Hart's books those up to 6 days ahead. */
 const BOOKING_WINDOW_DAYS = 6;
+/** Where Stripe Checkout pages live (booking.deposit.payUrl). */
+const STRIPE_CHECKOUT = "https://checkout.stripe.com/";
 
 const USAGE = "Usage: pnpm smoke <base-url> [--commit <sha>] [--bypass <secret>] [--owner-token <token>]";
 
@@ -403,12 +408,23 @@ export async function runSmoke({
 
   // ---- Booking loop (writes) ----
 
+  const depositsOn = status.deposits === "stripe_test";
+  const depositsLabel = `deposits ${status.deposits ?? "unknown"}`;
   const loop = [
     ["11", "book a Haircut → awaiting_approval, link on this origin"],
     ["11", "book the same start again → slot_taken"],
     ["12", "get_booking returns the same approval link"],
     ["14", "Decline through /api/approvals/<token>/decline → cancelled"],
     ["14", "The declined start is free again"],
+    [
+      "19",
+      depositsOn
+        ? `Approve a Haircut (${depositsLabel}) → awaiting_deposit, Stripe Checkout URL`
+        : `Approve a Haircut (${depositsLabel}) → confirmed, deposit not_collected`,
+    ],
+    ["19", depositsOn ? "get_booking: awaiting_deposit, the same approval link" : "get_booking: confirmed, deposit not_collected"],
+    ["19", depositsOn ? "cancel it → cancelled, deposit released" : "cancel it → cancelled"],
+    ["19", "The cancelled start is free again"],
   ];
   /** Bookings this run made: { id, token, done } (done: declined or cancelled). */
   const made = [];
@@ -452,7 +468,7 @@ export async function runSmoke({
         expect(booking?.status === "awaiting_approval", evidence);
         expect(link.startsWith(`${baseUrl}/approve/`), `${evidence} (expected a link on ${baseUrl})`);
         expect(booking?.agent?.name === SMOKE_AGENT, `${evidence} (expected agent "${SMOKE_AGENT}")`);
-        Object.assign(ctx, { slot, booking, link });
+        Object.assign(ctx, { slots, slot, booking, link });
         return evidence;
       });
 
@@ -498,6 +514,86 @@ export async function runSmoke({
         const free = (avail.value?.slots ?? []).some((s) => Date.parse(s.start) === start);
         expect(free, `${ctx.slot.start} isn't in get_availability`);
         return `${ctx.booking.display ?? ctx.slot.start} is back in get_availability`;
+      });
+
+      // ---- Deposits: approve a Haircut. With Stripe it waits for its deposit (never paid here). ----
+
+      await check(...loop[5], async () => {
+        needs("slots");
+        // Another start than the first booking's, when there is one.
+        const others = ctx.slots.filter((s) => s.start !== ctx.slot.start);
+        const pool = others.length > 0 ? others : ctx.slots;
+        const slot = pool[Math.floor(random() * pool.length)];
+        const booked = await client.callTool("book", { service_id: "haircut", start: slot.start, customer_name: SMOKE_CUSTOMER });
+        expect(!booked.error, `book ${slot.start}: ${snippet(JSON.stringify(booked.error))}`);
+        const held = booked.value?.booking;
+        if (held?.id) remember(held);
+        const mine = made.find((b) => b.id === held?.id);
+        expect(mine?.token, "the booking has no approval token");
+        const res = await client.request(`/api/approvals/${encodeURIComponent(mine.token)}/approve`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        expect(res.status === 200, http(res));
+        const approved = res.json?.booking;
+        const deposit = approved?.deposit;
+        const payUrl = typeof deposit?.payUrl === "string" ? deposit.payUrl : "";
+        const evidence =
+          `${approved?.display ?? slot.start}: ${approved?.status}, deposit ${deposit?.state}` +
+          (payUrl ? `, pay at ${payUrl.slice(0, STRIPE_CHECKOUT.length + 14)}…` : "");
+        if (depositsOn) {
+          expect(approved?.status === "awaiting_deposit" && deposit?.state === "awaiting_payment", evidence);
+          expect(payUrl.startsWith(STRIPE_CHECKOUT), `${evidence} (expected deposit.payUrl on ${STRIPE_CHECKOUT})`);
+        } else {
+          expect(approved?.status === "confirmed" && deposit?.state === "not_collected", evidence);
+        }
+        Object.assign(ctx, { depositSlot: slot, depositBooking: approved, depositLink: held.approval?.url });
+        return evidence;
+      });
+
+      await check(...loop[6], async () => {
+        needs("depositBooking");
+        const got = await client.callTool("get_booking", { booking_id: ctx.depositBooking.id });
+        expect(!got.error, `get_booking: ${snippet(JSON.stringify(got.error))}`);
+        const b = got.value?.booking;
+        const evidence = `status ${b?.status}, deposit ${b?.deposit?.state}`;
+        if (depositsOn) {
+          expect(b?.status === "awaiting_deposit" && b?.deposit?.state === "awaiting_payment", evidence);
+          expect(b?.approval?.url === ctx.depositLink, `${evidence}, approval ${snippet(JSON.stringify(b?.approval))}`);
+          return `${evidence}, the same approval link`;
+        }
+        expect(b?.status === "confirmed" && b?.deposit?.state === "not_collected", evidence);
+        return evidence;
+      });
+
+      await check(...loop[7], async () => {
+        needs("depositBooking");
+        const cancelled = await client.callTool("cancel", { booking_id: ctx.depositBooking.id });
+        expect(!cancelled.error, `cancel: ${snippet(JSON.stringify(cancelled.error))}`);
+        const b = cancelled.value?.booking;
+        const failed = b?.deposit?.actionFailed ? ` (Stripe: ${b.deposit.actionFailed.message})` : "";
+        const evidence = `status ${b?.status}, deposit ${b?.deposit?.state}${failed}`;
+        expect(b?.status === "cancelled", evidence);
+        const mine = made.find((x) => x.id === ctx.depositBooking.id);
+        if (mine) mine.done = true;
+        ctx.depositCancelled = true;
+        if (depositsOn) expect(b?.deposit?.state === "released", evidence);
+        return evidence;
+      });
+
+      await check(...loop[8], async () => {
+        needs("depositCancelled");
+        const start = Date.parse(ctx.depositSlot.start);
+        const avail = await client.callTool("get_availability", {
+          service_id: "haircut",
+          from: ctx.depositSlot.start,
+          to: rfc3339(start + 3600_000),
+        });
+        expect(!avail.error, `get_availability: ${snippet(JSON.stringify(avail.error))}`);
+        const free = (avail.value?.slots ?? []).some((s) => Date.parse(s.start) === start);
+        expect(free, `${ctx.depositSlot.start} isn't in get_availability`);
+        return `${ctx.depositBooking.display ?? ctx.depositSlot.start} is back in get_availability`;
       });
     } finally {
       // Decline every booking this run made, even after a failure.

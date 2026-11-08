@@ -1,8 +1,9 @@
 import type { ApprovalView, ApproveResponse, Booking, DeclineResponse, Policies, Shop } from "../../types/frontdesk";
-import { decide, type Decision } from "../engine/lifecycle";
-import type { ApprovalRecord } from "../frontdesk/booking-store";
+import { closeCheckout, openCheckout, syncDeposit, type OpenCheckout } from "../deposits/deposits";
+import { decide, needsDeposit, type Decision } from "../engine/lifecycle";
+import type { ApprovalRecord, DepositPatch } from "../frontdesk/booking-store";
 import { FrontDeskError } from "../frontdesk/errors";
-import { alertOwner, EVENT_FOR, policiesFor, type FrontDeskDeps } from "../frontdesk/service";
+import { alertOwner, EVENT_FOR, policiesFor, withApprovalOrigin, type FrontDeskDeps } from "../frontdesk/service";
 import { toRfc3339 } from "../frontdesk/time";
 import { isWellFormedToken, normalizePhone } from "./crypto";
 
@@ -27,15 +28,17 @@ function unknownLink(): FrontDeskError {
 
 /**
  * The approval request for `token`, with its booking read after lazy expiry (a lapsed hold becomes
- * expired, with its event). A malformed or unknown token is booking_not_found; a malformed one isn't
- * even looked up.
+ * expired, with its event) and, while it's awaiting its deposit, after asking Stripe (syncDeposit: paid →
+ * confirmed; unpaid past pay_by → expired). A malformed or unknown token is booking_not_found; a malformed
+ * one isn't even looked up.
  */
 async function openApproval(deps: FrontDeskDeps, token: string): Promise<OpenApproval> {
   if (!isWellFormedToken(token)) throw unknownLink();
   const approval = await deps.store.findApproval(token);
   if (!approval) throw unknownLink();
-  const booking = await deps.store.refreshBooking(approval.bookingId, deps.clock.now());
-  if (!booking) throw unknownLink();
+  const refreshed = await deps.store.refreshBooking(approval.bookingId, deps.clock.now());
+  if (!refreshed) throw unknownLink();
+  const booking = await syncDeposit(deps, refreshed);
   const shop = await deps.catalog.getShop(booking.shopSlug);
   if (!shop) throw new Error(`Booking ${booking.id} belongs to a shop that doesn't exist: ${booking.shopSlug}.`);
   return { approval, booking, shop };
@@ -43,9 +46,16 @@ async function openApproval(deps: FrontDeskDeps, token: string): Promise<OpenApp
 
 /**
  * decide() the person's answer, or throw why they can't give it: approval_closed (already answered,
- * or the booking was cancelled), approval_expired (the hold lapsed).
+ * or the booking was cancelled), approval_expired (the hold lapsed). `depositRequired` (approve only):
+ * the booking waits for its deposit instead of being confirmed.
  */
-function decideAnswer(ctx: OpenApproval, type: "approve" | "decline", now: Date, policies: Policies): Decision {
+function decideAnswer(
+  ctx: OpenApproval,
+  type: "approve" | "decline",
+  now: Date,
+  policies: Policies,
+  depositRequired = false,
+): Decision {
   const { approval, booking } = ctx;
   if (approval.decision !== null) {
     throw new FrontDeskError(
@@ -55,9 +65,26 @@ function decideAnswer(ctx: OpenApproval, type: "approve" | "decline", now: Date,
       { status: booking.status, decision: approval.decision },
     );
   }
-  const decision = decide({ ...booking, approveBy: approval.approveBy }, { type, actor: "customer" }, now, policies);
+  const decision = decide(
+    { ...booking, approveBy: approval.approveBy, depositRequired },
+    { type, actor: "customer" },
+    now,
+    policies,
+  );
   if (decision instanceof FrontDeskError) throw decision;
   return decision;
+}
+
+/**
+ * ApprovalView.status: pending until the person answers (expired if the hold lapsed or the booking was
+ * cancelled first); after approving, awaiting_deposit while the deposit is due, expired if it wasn't paid
+ * in time or the booking was cancelled, otherwise approved.
+ */
+function viewStatus(approval: ApprovalRecord, booking: Booking): ApprovalView["status"] {
+  if (approval.decision === "declined") return "declined";
+  if (approval.decision === null) return booking.status === "awaiting_approval" ? "pending" : "expired";
+  if (booking.status === "awaiting_deposit") return "awaiting_deposit";
+  return booking.status === "expired" || booking.status === "cancelled" ? "expired" : "approved";
 }
 
 /** After answerApproval found the booking no longer pending: why, from a fresh read. */
@@ -86,10 +113,11 @@ export async function getApprovalView(deps: FrontDeskDeps, token: string): Promi
   const service = services.find((s) => s.id === booking.serviceId);
   if (!service) throw new Error(`Booking ${booking.id} has a service that doesn't exist: ${booking.serviceId}.`);
 
-  const status: ApprovalView["status"] =
-    approval.decision ?? (booking.status === "awaiting_approval" ? "pending" : "expired");
+  // Everything but actionFailed: a capture or release Stripe refused is for the owner's list, not this page.
+  const { amountCents, state, payUrl, payBy } = booking.deposit;
+  const deposit: ApprovalView["deposit"] = { amountCents, state, ...(payUrl ? { payUrl } : {}), ...(payBy ? { payBy } : {}) };
   return {
-    status,
+    status: viewStatus(approval, booking),
     shop,
     serviceName: booking.serviceName,
     display: booking.display,
@@ -97,6 +125,7 @@ export async function getApprovalView(deps: FrontDeskDeps, token: string): Promi
     end: booking.end,
     priceCents: service.priceCents,
     depositCents: booking.depositCents,
+    deposit,
     policies: {
       cancelWindowHours: policies.cancelWindowHours,
       depositRule: policies.depositRule,
@@ -140,24 +169,44 @@ export function parseApproveBody(body: unknown): string | null {
 }
 
 /**
- * Approve (ApproveRequest → ApproveResponse): opening the link and approving is the consent. The
- * booking becomes confirmed (customer.approved true; customer.phone when a phone was given), and the owner
- * is alerted (once). Only while pending: already answered or cancelled → approval_closed; the hold
- * lapsed → approval_expired ("Ask your agent to book again."). In one transaction, only if the hold is
- * still on: the booking is confirmed with an "approved" event (actor customer) and the phone stored.
- * TODO(ring-1c): a service with a deposit goes to awaiting_deposit instead (see decide()).
+ * Approve (ApproveRequest → ApproveResponse): opening the link and approving is the consent
+ * (customer.approved true; customer.phone when a phone was given). Only while pending: already answered
+ * or cancelled → approval_closed; the hold lapsed → approval_expired ("Ask your agent to book again.").
+ * - A booking that needs a deposit (needsDeposit), on a deployment that collects them: first a Stripe
+ *   Checkout page is opened for the hold (if Stripe fails, nothing is stored and approve fails as internal,
+ *   so the person can try again); then the booking becomes awaiting_deposit with the page's URL
+ *   (booking.deposit.payUrl) and pay_by = now + 30 minutes. The owner is alerted once it's paid.
+ * - Otherwise it becomes confirmed, and the owner is alerted (once). A service with a deposit that isn't
+ *   collected (deposits off, or the start is beyond the deposit horizon) shows it as not_collected.
+ * In one transaction, only if the hold is still on: the new status with an "approved" event (actor
+ * customer), the phone and the deposit columns stored.
  */
 export async function approveBooking(deps: FrontDeskDeps, token: string, body?: unknown): Promise<ApproveResponse> {
   const phone = parseApproveBody(body);
   const ctx = await openApproval(deps, token);
   const now = deps.clock.now();
-  const decision = decideAnswer(ctx, "approve", now, await policiesFor(deps, ctx.shop.slug));
+  const policies = await policiesFor(deps, ctx.shop.slug);
+  const required = needsDeposit(ctx.booking, now, policies, ctx.shop.timezone);
+  const payments = deps.payments;
+  const decision = decideAnswer(ctx, "approve", now, policies, required && payments !== null);
+  // Open the payment page before storing the answer, so a booking never waits for a deposit nobody can pay.
+  const checkout: OpenCheckout | null =
+    decision.nextStatus === "awaiting_deposit" && payments
+      ? await openCheckout({ ...deps, payments }, { booking: ctx.booking, shop: ctx.shop, token, now })
+      : null;
+  // A service with a deposit confirmed without collecting it (deposits off, or beyond the deposit horizon): not_collected.
+  const deposit: DepositPatch | undefined = checkout
+    ? { state: "awaiting_payment", checkoutSessionId: checkout.id, checkoutUrl: checkout.url, payBy: checkout.payBy }
+    : ctx.booking.depositCents > 0
+      ? { state: "not_collected" }
+      : undefined;
   const answered = await deps.store.answerApproval({
     bookingId: ctx.booking.id,
     decision: "approved",
     nextStatus: decision.nextStatus,
     now,
     phone,
+    deposit,
     event: {
       actor: "customer",
       type: EVENT_FOR.approve,
@@ -169,10 +218,13 @@ export async function approveBooking(deps: FrontDeskDeps, token: string, body?: 
       },
     },
   });
-  if (!answered.ok) throw await whyNotPending(deps, token, "approve");
-  // The owner hears about a booking only once the person approved it, never about a hold.
-  await alertOwner(deps.notifier, answered.booking);
-  return { booking: answered.booking };
+  if (!answered.ok) {
+    if (checkout) await closeCheckout(deps, ctx.booking, checkout.id);
+    throw await whyNotPending(deps, token, "approve");
+  }
+  // The owner hears about a booking only once it's confirmed: never about a hold, nor one awaiting its deposit.
+  if (answered.booking.status === "confirmed") await alertOwner(deps.notifier, answered.booking);
+  return { booking: withApprovalOrigin(deps, answered.booking) };
 }
 
 // ---- POST /api/approvals/[token]/decline ----

@@ -301,7 +301,7 @@ describe("MCP book tool", () => {
     expect(tool.description).toMatch(/Hold an appointment at Hart's Barbers for 10 minutes until the person approves it/);
     expect(tool.description).toMatch(/status awaiting_approval and booking\.approval\.url/);
     expect(tool.description).toMatch(/get_booking/);
-    expect(tool.description).toMatch(/No deposit is collected/);
+    expect(tool.description).toMatch(/awaiting_deposit/);
     expect(tool.description).toMatch(/They open it and approve \(→ confirmed\) or decline \(→ cancelled\)/);
     expect(tool.description).toMatch(/calling again for the same time gets slot_taken while the hold is on/);
     expect(tool.inputSchema.properties?.start).toMatchObject({ type: "string", format: "date-time" });
@@ -334,6 +334,7 @@ describe("MCP book tool", () => {
       customer: customerOf("Maya", false),
       agent: { name: "unknown agent" }, // 2025-era requests carry no clientInfo
       depositCents: 1000,
+      deposit: { amountCents: 1000, state: "none" },
       createdAt: "2026-11-09T12:00:00-05:00",
       // Held for 10 minutes from now (Mon 9 Nov, noon).
       approval: { url: expect.stringMatching(APPROVAL_URL), expiresAt: "2026-11-09T12:10:00-05:00" },
@@ -345,7 +346,8 @@ describe("MCP book tool", () => {
       `Hold placed until Mon 9 Nov, 12:10 pm EST. Send Maya this link to approve: ` +
         `${booking.approval!.url}. Then call get_booking to check the status.`,
     );
-    expect(text).toContain("A $10 deposit will be required once deposits are enabled");
+    // Deposits are off in these deps (no Stripe), so nothing will be charged.
+    expect(text).toContain("This service has a $10 deposit, but the shop isn't collecting deposits yet");
     expect(text).toContain(booking.id);
     expect(text).not.toContain("replayed");
     // The owner hears nothing about a hold.
@@ -453,6 +455,8 @@ describe("MCP get_booking and cancel", () => {
       ...withoutLink(booking),
       status: "confirmed",
       customer: customerOf("Maya", true, PHONE_E164),
+      // Deposits are off in these deps: confirmed without collecting the deposit.
+      deposit: { amountCents: 1000, state: "not_collected" },
     });
     expect(fetched.content[0].text).toContain("Status: confirmed.");
     expect(fetched.content[0].text).toContain("Maya approved it. It is confirmed.");
@@ -467,7 +471,7 @@ describe("MCP get_booking and cancel", () => {
     const text = cancelled.content[0].text;
     expect(text).toContain("Status: cancelled.");
     expect(text).toContain("the $10 deposit is released");
-    expect(text).toContain("nothing was charged or refunded");
+    expect(text).toContain("No deposit was held on the card, so nothing was charged or refunded.");
 
     // Cancelling again (e.g. a retry) can't cancel twice.
     const recancelled = envelopeOf(await callTool("cancel", { booking_id: booking.id }));

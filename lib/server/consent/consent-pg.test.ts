@@ -120,6 +120,8 @@ if (!url) {
         approval: undefined,
         status: "confirmed",
         customer: customerOf("Maya Lopez", true, phone(123)),
+        // No Stripe in these deps: confirmed without collecting the deposit.
+        deposit: { amountCents: 500, state: "not_collected" },
       });
       expect(approved).not.toHaveProperty("approval");
       expect((await getBooking(deps, shop, { booking_id: booking.id })).booking).toEqual(approved);

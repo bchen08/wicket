@@ -5,6 +5,7 @@ import type {
   BookingEvent,
   BookingEventType,
   BookingStatus,
+  DepositState,
   Mandate,
 } from "../../types/frontdesk";
 import { approvalPath } from "../consent/crypto";
@@ -60,6 +61,48 @@ export type ApprovalAnswer = {
   event: NewBookingEvent;
   /** approved only: the phone number the person gave (E.164), stored on the booking. null: none given. */
   phone?: string | null;
+  /**
+   * approved only: the deposit columns to set with it: awaiting_payment with the Checkout Session, its URL
+   * and pay_by (the booking goes to awaiting_deposit), or not_collected (confirmed without collecting).
+   */
+  deposit?: DepositPatch;
+};
+
+// ---- Ring 1c: deposits ----
+
+/** The Stripe side of a booking's deposit, for lib/server/deposits. Booking doesn't show the ids. */
+export type DepositRecord = {
+  state: DepositState;
+  /** The Checkout Session opened on approve, or null. */
+  checkoutSessionId: string | null;
+  /** The PaymentIntent holding the deposit once it's paid, or null. */
+  paymentIntentId: string | null;
+  /** When an awaiting_deposit booking lapses, or null. */
+  payBy: Date | null;
+};
+
+/** What a transition or an approval writes to a booking's deposit columns, with its status. Absent fields keep their values. */
+export type DepositPatch = {
+  state?: DepositState;
+  checkoutSessionId?: string;
+  checkoutUrl?: string;
+  paymentIntentId?: string;
+  payBy?: Date;
+};
+
+/** A capture or release Stripe refused (bookings.deposit_failure). */
+export type DepositFailure = {
+  action: "capture" | "release";
+  message: string;
+  at: Date;
+};
+
+/** What updateDeposit writes after money moved, or failed to. */
+export type DepositOutcome = {
+  /** The new state (captured, released). Absent: unchanged. */
+  state?: DepositState;
+  /** The failure to show, or null to clear it. Absent: unchanged. */
+  failure?: DepositFailure | null;
 };
 
 export type AnswerApprovalResult =
@@ -120,6 +163,8 @@ export interface BookingStore {
     expectedStatus: BookingStatus,
     nextStatus: BookingStatus,
     event: NewBookingEvent,
+    /** Deposit columns to set in the same statement (e.g. confirm_deposit: held and the PaymentIntent). */
+    deposit?: DepositPatch,
   ): Promise<Booking | null>;
   /** A booking's events, oldest first (by at, then id). Empty if there are none. */
   listEvents(bookingId: string): Promise<BookingEvent[]>;
@@ -131,9 +176,21 @@ export interface BookingStore {
    * The person's answer, in one transaction: move the booking from awaiting_approval to nextStatus only
    * if approve_by > now (approved stores `phone` as customer_phone; cancelled stamps cancelled_at and
    * cancelled_by "customer"); write `event`; and mark the approval decided (decision, decided_at = now)
-   * only if it wasn't. Anything that doesn't match rolls everything back.
+   * only if it wasn't. Anything that doesn't match rolls everything back. approved also writes
+   * `input.deposit` (awaiting_deposit: the Checkout Session, its URL, pay_by).
    */
   answerApproval(input: ApprovalAnswer): Promise<AnswerApprovalResult>;
+
+  // ---- Ring 1c: deposits ----
+
+  /** The Stripe side of a booking's deposit, or null (no such booking; any string is accepted). */
+  getDeposit(id: string): Promise<DepositRecord | null>;
+  /**
+   * After a capture or release, or a failed one: set the deposit's state and failure, and write `event`
+   * (deposit.action_failed) if given, in one statement. Doesn't touch the status. Returns the booking, or
+   * null if there's no such booking.
+   */
+  updateDeposit(id: string, outcome: DepositOutcome, event?: NewBookingEvent): Promise<Booking | null>;
 }
 
 /** The staff member is already booked for part of that time. Another agent got there first. */
@@ -182,19 +239,52 @@ export type BookingRecord = {
   approvalToken: string | null;
   /** When the hold lapses (bookings.approve_by), or null. */
   approveBy: Date | null;
+  /** bookings.deposit_state. */
+  depositState: DepositState;
+  /** The Checkout Session's URL (bookings.checkout_url), or null. */
+  checkoutUrl: string | null;
+  /** When an unpaid deposit lapses (bookings.pay_by), or null. */
+  payBy: Date | null;
+  /** The last capture or release Stripe refused (bookings.deposit_failure), or null. */
+  depositFailure: DepositFailure | null;
   /** The shop's IANA zone; times are shown in it. */
   timezone: string;
 };
 
 /**
- * The Booking for a stored record. While it is awaiting_approval it carries `approval`, whose url is only
- * the path ("/approve/<token>"): the store doesn't know the request's origin. The service layer puts it
- * in front (withApprovalOrigin in service.ts) before a booking leaves the server.
+ * Booking.deposit for a stored record. payUrl and payBy only while the booking is awaiting its deposit;
+ * actionFailed while the last capture or release failed.
+ */
+export function toBookingDeposit(r: BookingRecord): Booking["deposit"] {
+  const awaiting = r.status === "awaiting_deposit" && r.depositState === "awaiting_payment";
+  return {
+    amountCents: r.depositCents,
+    state: r.depositState,
+    ...(awaiting && r.checkoutUrl ? { payUrl: r.checkoutUrl } : {}),
+    ...(awaiting && r.payBy ? { payBy: toRfc3339(r.payBy, r.timezone) } : {}),
+    ...(r.depositFailure
+      ? {
+          actionFailed: {
+            action: r.depositFailure.action,
+            message: r.depositFailure.message,
+            at: toRfc3339(r.depositFailure.at, r.timezone),
+          },
+        }
+      : {}),
+  };
+}
+
+/**
+ * The Booking for a stored record. While it is awaiting_approval or awaiting_deposit it carries `approval`
+ * (expiresAt: approve_by, or pay_by while the deposit is due), whose url is only the path
+ * ("/approve/<token>"): the store doesn't know the request's origin. The service layer puts it in front
+ * (withApprovalOrigin in service.ts) before a booking leaves the server.
  */
 export function toBooking(r: BookingRecord): Booking {
+  const holdEnds = r.status === "awaiting_approval" ? r.approveBy : r.status === "awaiting_deposit" ? r.payBy : null;
   const approval =
-    r.status === "awaiting_approval" && r.approvalToken && r.approveBy
-      ? { approval: { url: approvalPath(r.approvalToken), expiresAt: toRfc3339(r.approveBy, r.timezone) } }
+    holdEnds && r.approvalToken
+      ? { approval: { url: approvalPath(r.approvalToken), expiresAt: toRfc3339(holdEnds, r.timezone) } }
       : {};
   return {
     id: r.id,
@@ -214,6 +304,7 @@ export function toBooking(r: BookingRecord): Booking {
     },
     agent: { name: r.agentName },
     depositCents: r.depositCents,
+    deposit: toBookingDeposit(r),
     createdAt: toRfc3339(r.createdAt, r.timezone),
     ...approval,
   };

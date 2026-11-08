@@ -3,6 +3,7 @@ import type { Booking, Policies } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
 import { approveBooking } from "../consent/approvals";
 import { newApprovalToken } from "../consent/crypto";
+import type { DepositPayments } from "../deposits/payments";
 import type { Notifier } from "../notify/notifier";
 import type { NewBooking } from "./booking-store";
 import type { NewBlock, ShopCatalog } from "./catalog";
@@ -50,8 +51,10 @@ export const PHONE_E164 = "+14015550123";
 export const OTHER_PHONE_E164 = "+14015550199";
 
 /** `base` with deps.baseUrl = TEST_BASE_URL unless it has one. */
-export function withBaseUrl(base: Omit<FrontDeskDeps, "baseUrl"> & Partial<Pick<FrontDeskDeps, "baseUrl">>): FrontDeskDeps {
-  return { baseUrl: TEST_BASE_URL, ...base };
+export function withBaseUrl(
+  base: Omit<FrontDeskDeps, "baseUrl" | "payments"> & Partial<Pick<FrontDeskDeps, "baseUrl" | "payments">>,
+): FrontDeskDeps {
+  return { baseUrl: TEST_BASE_URL, payments: null, ...base };
 }
 
 /** The consent fields createBooking needs, for tests that call the store directly. */
@@ -111,7 +114,8 @@ export function withCatalog(
 /**
  * Deps backed by a fresh in-memory store and a fixed clock. `policies` is merged over Hart's seeded
  * policies; `initialBookings` and `initialBlocks` exist before the first call. Approval links point at
- * `baseUrl` (default TEST_BASE_URL).
+ * `baseUrl` (default TEST_BASE_URL). Deposits are off unless `payments` is given (see stubPayments in
+ * lib/server/deposits/stub-payments.ts).
  */
 export function memoryDeps(
   options: {
@@ -121,6 +125,7 @@ export function memoryDeps(
     policies?: Partial<Policies>;
     initialBlocks?: NewBlock[];
     baseUrl?: string;
+    payments?: DepositPayments | null;
   } = {},
 ): FrontDeskDeps {
   const clock = options.clock ?? fixedClock(NOW);
@@ -135,6 +140,7 @@ export function memoryDeps(
     catalog: store,
     store,
     notifier: options.notifier ?? recordingNotifier(),
+    payments: options.payments ?? null,
     baseUrl: options.baseUrl ?? TEST_BASE_URL,
   };
 }
