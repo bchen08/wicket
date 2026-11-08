@@ -28,21 +28,31 @@ Photon's HTTP API is at `https://api.photon.codes` (its "Beta" API). `photon.ts`
 
 | Variable | What |
 |---|---|
-| `PHOTON_API_KEY` | A project API key, `pho_sk_…` (Photon → the project → API keys). |
+| `PHOTON_API_KEY` | A project API key, `pho_sk_…` (Photon → the project → API keys). It needs the `platforms:read` permission for the line lookup below. |
 | `PHOTON_PROJECT_ID` | `pho_prj_…`. |
-| `PHOTON_LINE` | The project's **dedicated** iMessage line, E.164 (e.g. `+12125550100`). Texts come from this number. |
+| `PHOTON_LINE` | The iMessage line to send from when Photon has **no assigned line** for the person, E.164 (e.g. `+12125550100`). On a dedicated line, this is the dedicated number. |
 
-One text takes up to four calls:
+**Each person has their own line.** Photon's shared iMessage pairs each person with their own line from the project's pool. A text from any other line doesn't reach them, so every text goes out from the line assigned to that person. `PHOTON_LINE` is used only if Photon returns no assignment for them.
 
-1. `POST /v1/projects/{project}/users` with `{ "platform": "imessage", "handle": PHOTON_LINE }` returns the line's User id. This happens once per server process, and the id is remembered after that.
-2. The same call with the person's number returns their User id.
-3. `POST /v1/projects/{project}/spaces` with `{ "platform": "imessage", "participantIds": [line, person] }` returns the chat.
-4. `POST /v1/projects/{project}/messages` with `{ "spaceId", "senderId", "content": { "type": "text", "format": "plain", "text" } }` sends the text. Photon answers 202.
+One text takes up to five calls (more if call 1's list runs over several pages):
 
-Calls 1–3 are "create or get": they return the existing User or chat if there is one. Photon requires an `Idempotency-Key` header on calls 3 and 4, so each call sends a fresh random UUID. That's Photon's requirement, not a retry scheme of ours. Errors come back as `application/problem+json`, and the alert or log shows them as `Photon answered HTTP 403: SHARED_LINE_INBOUND_REQUIRED: …`.
+1. `GET /v1/projects/{project}/platforms/imessage/assignments?pageSize=200` lists the project's active assignments as `{ "assignments": [{ "handle", "assignedPhoneNumber", … }], "nextPageToken"? }`. Photon can't filter this list by person, so `photon.ts` follows `nextPageToken` until it finds the `handle` equal to the person's number. That entry's `assignedPhoneNumber` is the line. This runs on every text, so someone added in Photon's dashboard is picked up right away.
+2. `POST /v1/projects/{project}/users` with `{ "platform": "imessage", "handle": <the line> }` returns the line's User id. This happens once per line per server process, and the id is remembered after that.
+3. The same call with the person's number returns their User id.
+4. `POST /v1/projects/{project}/spaces` with `{ "platform": "imessage", "participantIds": [line, person] }` returns the chat.
+5. `POST /v1/projects/{project}/messages` with `{ "spaceId", "senderId", "content": { "type": "text", "format": "plain", "text" } }` sends the text. Photon answers 202.
+
+Calls 2–4 are "create or get": they return the existing User or chat if there is one. Photon requires an `Idempotency-Key` header on calls 4 and 5, so each call sends a fresh random UUID. That's Photon's requirement, not a retry scheme of ours. Errors come back as `application/problem+json`, and the alert or log shows them as `Photon answered HTTP 403: SHARED_LINE_INBOUND_REQUIRED: …`.
+
+If the lookup itself fails (a refusal such as 403 `INSUFFICIENT_SCOPE`, or no answer), the text fails. It doesn't fall back to `PHOTON_LINE`, because a failed lookup doesn't mean the person has no line.
+
+**To add someone on a shared line:**
+1. Add them in Photon's dashboard with their phone number, in E.164. An iMessage email address won't match the number Front Desk texts. Photon assigns them a line from the pool.
+2. They send one iMessage to their assigned line.
+3. Texts to their number now arrive from that line.
 
 **Photon's limits** (from its docs, Nov 2026):
-- **Only a dedicated line can text someone first.** A shared line (the Free and Pro plans) sends only to people who texted it first. Otherwise Photon answers 403 `SHARED_LINE_INBOUND_REQUIRED` or `SHARED_LINE_NOT_ASSIGNED`. On a shared line, approval links to new customers fail (`texted: false`, so the agent sends the link). Owner texts work once the owner has texted the line. A dedicated line is Photon's Business plan.
+- **Only a dedicated line can text someone first.** A shared line (the Free and Pro plans) sends only in one-to-one chats, and only to a person assigned to that line who has texted it since the assignment. Otherwise Photon refuses, for example 403 `SHARED_LINE_NOT_ASSIGNED` or `SHARED_LINE_INBOUND_REQUIRED`. A number that isn't in the project, or hasn't texted its line, fails cleanly: `texted: false`, so the agent sends the link. Owner texts need the same two steps for `ownerMobile`. A dedicated line is Photon's Business plan.
 - **No SMS fallback switch.** Photon's send call has no "fall back to SMS" option, and its HTTP API has no "is this number on iMessage?" check. Whether a number without iMessage still gets the text is up to Photon and Apple, not this code. If that matters, use Twilio (SMS reaches every mobile).
 
 ### Twilio (SMS)
@@ -131,12 +141,13 @@ These are on purpose, per the MVP rule in AGENTS.md:
 ## Tests
 
 - `lib/server/notify/texting.test.ts`: which sender the environment picks, and exactly what each sender sends, using a fake fetch:
-  - Photon: its four calls, the Bearer key, the idempotency keys, and that the line's user is remembered.
+  - Photon: the lookup of the person's assigned line (across pages), the fallback to `PHOTON_LINE` only when there's no assignment, a failed lookup failing the text, the four calls after it, the Bearer key, the idempotency keys, and that each line's user is remembered.
   - Twilio: the form fields, Basic auth, and `MessagingServiceSid`.
   - How refusals surface, and what each text says.
 - `lib/server/frontdesk/texting.test.ts`: everything end to end on the in-memory store, with a stubbed sender (`recordingTexter` / `failingTexter` in `test-support.ts`):
   - The link is texted and flagged through MCP, web JSON and web form posts.
   - A failed or invalid phone doesn't hold anything wrongly.
+  - Through the real Photon sender against a fake shared pool: a person gets the link from their own assigned line, and a number that isn't in the project gets `texted: false`.
   - Owner alerts are texted and recorded, including a failed text.
   - `ownerMobile` works through the PUT and stays hidden from agents.
   - A code is sent, accepted once, accepted at 9:59, and refused at 10:00.
