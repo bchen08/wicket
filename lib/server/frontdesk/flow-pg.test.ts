@@ -14,8 +14,8 @@ import { approveAsCustomer, recordingNotifier, TEST_CONSENT, withConsent } from 
 // Tue–Sat 09:00–17:00, a 30-minute service with a deposit and a 20-minute one without, and a policies
 // row like Hart's), books only in 2099, and deletes everything it made in afterAll.
 // Ring 1b: book places a hold; a booking is confirmed when the person approves it (approveAsCustomer,
-// through the approval use cases), and the owner is alerted then. Phones are HMACed with a pepper of
-// this run's own, so its customers never collide with another run's.
+// through the approval use cases), and the owner is alerted then. Phone numbers carry a 6-digit prefix
+// of this run's own, so its customers never collide with another run's.
 const url = process.env.DATABASE_URL_TEST?.trim();
 
 if (!url) {
@@ -40,11 +40,13 @@ if (!url) {
       store,
       clock,
       notifier,
-      consent: { ...TEST_CONSENT, phonePepper: `vitest-flow-pepper-${run}-0123456789abcdef` },
+      consent: TEST_CONSENT,
     });
+    /** 6 digits of this run's own, in every phone number this file uses. */
+    const PHONE_PREFIX = String(100000 + Math.floor(Math.random() * 900000));
     /** A different phone for each approval, so no number reaches the 3-codes-an-hour limit. */
     let phones = 0;
-    const approve = (booking: Booking) => approveAsCustomer(deps, booking, `+1401555${String(1000 + phones++).slice(-4)}`);
+    const approve = (booking: Booking) => approveAsCustomer(deps, booking, `+1${PHONE_PREFIX}${String(1000 + phones++).slice(-4)}`);
 
     /** Every idempotency key this file uses, deleted in afterAll. */
     const keys: string[] = [];

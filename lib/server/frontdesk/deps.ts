@@ -1,6 +1,6 @@
 import { systemClock } from "../clock";
 import { createLogCodeSender } from "../consent/code-sender";
-import { MIN_PEPPER_LENGTH, type ConsentConfig } from "../consent/config";
+import type { ConsentConfig } from "../consent/config";
 import { createLogNotifier } from "../notify/log-notifier";
 import { createMemoryStore } from "./memory-store";
 import { createPostgresStore } from "./postgres-store";
@@ -16,8 +16,6 @@ import type { FrontDeskDeps } from "./service";
 // Consent (Ring 1b):
 //   PUBLIC_BASE_URL      the approval links' origin. Default: http://localhost:3000 locally,
 //                        https://${VERCEL_URL} on Vercel.
-//   PHONE_HMAC_PEPPER    the key phone numbers are HMACed with. Required on Vercel (configuration
-//                        error without it); locally a fixed dev pepper, with a warning.
 //   FRONTDESK_DEV_CODES  "1": the code request's response includes the code. Ignored on Vercel production.
 
 /** Front Desk is deployed without the settings it needs. Surfaces as an `internal` error; the log says why. */
@@ -29,9 +27,6 @@ export class ConfigurationError extends Error {
 }
 
 type Env = Record<string, string | undefined>;
-
-/** Used only off Vercel when PHONE_HMAC_PEPPER is unset. Phone HMACs made with it mean nothing elsewhere. */
-export const DEV_PHONE_PEPPER = "front-desk-local-dev-pepper-not-for-production";
 
 const LOCAL_BASE_URL = "http://localhost:3000";
 
@@ -63,32 +58,11 @@ function publicBaseUrl(env: Env): string {
   return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
 }
 
-/** The consent settings from `env`. Throws ConfigurationError for a missing or malformed setting. */
-export function consentConfigFromEnv(env: Env, warn: (message: string) => void = console.warn): ConsentConfig {
-  const base = publicBaseUrl(env);
-  const pepper = env.PHONE_HMAC_PEPPER?.trim();
-  let phonePepper: string;
-  if (pepper) {
-    if (pepper.length < MIN_PEPPER_LENGTH) {
-      throw new ConfigurationError(
-        `PHONE_HMAC_PEPPER is too short (at least ${MIN_PEPPER_LENGTH} characters). Generate 32 random bytes, e.g. ` +
-          "`openssl rand -base64 32`. See docs/database.md.",
-      );
-    }
-    phonePepper = pepper;
-  } else if (env.VERCEL) {
-    throw new ConfigurationError(
-      "PHONE_HMAC_PEPPER is not set. Set it in the Vercel project's environment variables (Preview and Production) to " +
-        "32 random bytes, e.g. the output of `openssl rand -base64 32`, and never change it afterwards: verified " +
-        "customers are found by it. See docs/database.md.",
-    );
-  } else {
-    warn("[frontdesk] PHONE_HMAC_PEPPER is not set: using a fixed local development pepper. Never do this on a deployment.");
-    phonePepper = DEV_PHONE_PEPPER;
-  }
+/** The consent settings from `env`. Throws ConfigurationError for a malformed setting. */
+export function consentConfigFromEnv(env: Env): ConsentConfig {
   // Never in Vercel production, whatever FRONTDESK_DEV_CODES says.
   const devCodes = env.FRONTDESK_DEV_CODES?.trim() === "1" && env.VERCEL_ENV !== "production";
-  return { publicBaseUrl: base, phonePepper, devCodes };
+  return { publicBaseUrl: publicBaseUrl(env), devCodes };
 }
 
 /** Build deps from `env`, without caching. Exported for tests; the app uses getFrontDeskDeps(). */
@@ -104,7 +78,7 @@ export function createFrontDeskDeps(env: Env, warn: (message: string) => void = 
         "to the Supabase transaction pooler connection string (port 6543). See docs/database.md.",
     );
   }
-  const consent = consentConfigFromEnv(env, warn);
+  const consent = consentConfigFromEnv(env);
   if (url) {
     const db = createPostgresStore(url);
     return { clock, notifier, codeSender, consent, catalog: db, store: db };
@@ -124,8 +98,7 @@ const cache = globalThis as typeof globalThis & { __frontDeskDeps?: FrontDeskDep
 /**
  * Front Desk's dependencies for this process, built on first use and reused after that (so the
  * in-memory store keeps its bookings between requests, and Postgres reuses its client).
- * Call it at request time, never at module load: on Vercel without DATABASE_URL or PHONE_HMAC_PEPPER
- * it throws.
+ * Call it at request time, never at module load: on Vercel without DATABASE_URL it throws.
  */
 export function getFrontDeskDeps(): FrontDeskDeps {
   cache.__frontDeskDeps ??= createFrontDeskDeps(process.env);

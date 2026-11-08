@@ -1,4 +1,3 @@
-import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   isWellFormedToken,
@@ -6,7 +5,6 @@ import {
   newApprovalToken,
   newCode,
   normalizePhone,
-  phoneHmac,
   sameDigest,
   sha256Hex,
 } from "./crypto";
@@ -51,15 +49,6 @@ describe("phone numbers", () => {
       expect(normalizePhone(input)).toBeNull();
     },
   );
-
-  it("are HMACed with the pepper: deterministic, different per pepper, never the number itself", () => {
-    const a = phoneHmac("pepper-one-0123456789abcdef0123456789", "+14015550123");
-    expect(a).toMatch(/^[0-9a-f]{64}$/);
-    expect(a).toBe(phoneHmac("pepper-one-0123456789abcdef0123456789", "+14015550123"));
-    expect(a).not.toBe(phoneHmac("pepper-two-0123456789abcdef0123456789", "+14015550123"));
-    expect(a).not.toContain("4015550123");
-    expect(a).toBe(createHmac("sha256", "pepper-one-0123456789abcdef0123456789").update("+14015550123").digest("hex"));
-  });
 
   it("last4 is the last four digits", () => {
     expect(last4("+14015550123")).toBe("0123");

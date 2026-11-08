@@ -54,7 +54,7 @@ export type FrontDeskDeps = {
   clock: Clock;
   store: BookingStore;
   notifier: Notifier;
-  /** Approval links, phone HMAC key and dev codes (Ring 1b). */
+  /** Approval links and dev codes (Ring 1b). */
   consent: ConsentConfig;
   /** Delivers one-time codes to phones (Ring 1b: a log line). */
   codeSender: CodeSender;

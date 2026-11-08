@@ -62,7 +62,7 @@ The HTTP status applies to the `/api/shops/*` and `/api/approvals/*` routes. Too
 | `code_expired` | 410 | `approve`: the code is more than 10 minutes old. | none | "Request a new code and enter that one." |
 | `too_many_attempts` | 429 | `approve`: 5 wrong codes for one code request (the 5th wrong try already answers this). | `maxAttempts` | "Request a new code and enter that one." |
 | `rate_limited` | 429 | `code`: 3 codes to this phone number, or 10 with this link, in the last hour. The response has a `Retry-After` header. | `retryAfter` (seconds), `limit` (`phone` or `link`) | "Use the last code you received, or try again in N minutes. …" |
-| `internal` | 500 (503: owner token not configured) | Our fault: the database is unreachable, `DATABASE_URL` or `PHONE_HMAC_PEPPER` is missing on Vercel, `PUBLIC_BASE_URL` or `FRONTDESK_NOW` is invalid. An owner route on a deployment without a usable `OWNER_API_TOKEN` answers 503 with this code. | none | "Retry the same call once. If it fails again, tell the user Front Desk is unavailable right now." (503: set `OWNER_API_TOKEN` and redeploy) |
+| `internal` | 500 (503: owner token not configured) | Our fault: the database is unreachable, `DATABASE_URL` is missing on Vercel, `PUBLIC_BASE_URL` or `FRONTDESK_NOW` is invalid. An owner route on a deployment without a usable `OWNER_API_TOKEN` answers 503 with this code. | none | "Retry the same call once. If it fails again, tell the user Front Desk is unavailable right now." (503: set `OWNER_API_TOKEN` and redeploy) |
 
 ## `list_services`
 
@@ -593,7 +593,7 @@ agent                         Front Desk                         person
 1. `book` returns the booking in `awaiting_approval` with `approval.url` = `${PUBLIC_BASE_URL}/approve/<token>` and `approval.expiresAt` (now + 10 minutes). The token is 32 random bytes, base64url; only its SHA-256 is stored.
 2. The agent sends the person the link. The page (built separately, in v0) reads [the approval API](#approval-api).
 3. The person enters their phone number and gets a 6-digit code (`POST …/code`). In Ring 1b no text is actually sent: the code goes through a stub sender that logs `{ "event": "otp.sent", "phoneLast4", "bookingId" }`. Locally, `FRONTDESK_DEV_CODES=1` returns it as `devCode` so you can demo without a phone. `TODO(ring-1c)`: Photon iMessage, with Resend as a fallback.
-4. **Approve** (`POST …/approve` with the code): the booking becomes `confirmed`, the customer is stored by phone (an HMAC of the number, never the number itself) and linked, `customer.verified` becomes `true` with `phoneLast4`, and the owner is alerted. That's the only owner alert: a hold alone never notifies anyone. `TODO(ring-1c)`: a service with a deposit will go to `awaiting_deposit` instead.
+4. **Approve** (`POST …/approve` with the code): the booking becomes `confirmed`, the customer is stored by phone number (plain E.164) and linked, `customer.verified` becomes `true` with `phoneLast4`, and the owner is alerted. That's the only owner alert: a hold alone never notifies anyone. `TODO(ring-1c)`: a service with a deposit will go to `awaiting_deposit` instead.
    **Decline** (`POST …/decline`): the booking becomes `cancelled` (`cancelled_by` `customer`) and the slot is free.
    **No answer:** after 10 minutes the hold expires (`expired`) and the slot is free.
 5. The agent calls `get_booking` to see which happened, and tells the person.
@@ -614,7 +614,7 @@ Public routes for the approval page. **The token in the path is the credential**
 
 - **CSRF:** every `POST` must carry `Origin` equal to `PUBLIC_BASE_URL`'s origin (the page's own origin, e.g. `http://localhost:3000`). Otherwise it's **403** `invalid_request` (`details.field: "origin"`), before anything is read or written. Browsers always send `Origin` on a cross-site `POST`, so another site can't answer for the person. With curl, pass `-H "Origin: http://localhost:3000"`.
 - An unknown or malformed token is **404** `booking_not_found` (a malformed one isn't even looked up).
-- Tokens, codes and full phone numbers are never logged, stored in the clear or echoed in an error. (The hosting platform's request log does record request paths, so the token appears there; it's single-purpose and dead after 10 minutes.)
+- Tokens, codes and full phone numbers are never logged or echoed in an error. Tokens and codes are stored only as SHA-256 hashes; phone numbers are stored as plain E.164. (The hosting platform's request log does record request paths, so the token appears there; it's single-purpose and dead after 10 minutes.)
 
 | Method and path | Request | Response | Errors |
 |---|---|---|---|
@@ -654,7 +654,7 @@ Expires the hold first if it lapsed. `status` is `pending` (the person can answe
 
 Body: `{ "phone": "+14015550123" }`, E.164 (spaces, dashes, dots and parentheses are ignored). Only while the approval is pending.
 
-- A new 6-digit code (`crypto.randomInt`), valid for 10 minutes. Only its SHA-256 is stored, with an HMAC of the phone number (`PHONE_HMAC_PEPPER`) and its last 4 digits. **A new code replaces the previous one.**
+- A new 6-digit code (`crypto.randomInt`), valid for 10 minutes. Only its SHA-256 is stored, with the phone number (E.164). **A new code replaces the previous one.**
 - Limits (sliding one-hour windows): **3 codes per phone number** across all links, and **10 per link**. Over a limit → **429** `rate_limited` with `details.retryAfter` (seconds, also in the `Retry-After` header) and `details.limit` (`phone` or `link`). Nothing is sent.
 - `devCode` is included only when `FRONTDESK_DEV_CODES=1` and the app isn't running on Vercel production (`VERCEL_ENV` isn't `production`). Never in production.
 
@@ -668,7 +668,7 @@ Body: `{ "code": "292100" }` (6 digits; spaces ignored). Checks, in order:
 1. The approval is pending: already answered or cancelled → `approval_closed`; the hold ran out → `approval_expired` ("Ask your agent to book again.").
 2. The latest code is usable: none sent yet or already used → `code_invalid`; older than 10 minutes → `code_expired`; 5 attempts used → `too_many_attempts`. (While the hold and the code both last 10 minutes from when they're made, a lapsed hold is reported first.)
 3. The attempt is counted, then the code's SHA-256 is compared with the stored one in constant time. Wrong → `code_invalid` with `details.attemptsLeft`; the 5th wrong code → `too_many_attempts`, after which a new code is needed. A malformed code (not 6 digits) is `invalid_request` and isn't counted.
-4. In one transaction: the code is consumed (it works once), the customer is upserted by phone HMAC (display name: the booking's `customer_name`) and linked, the booking becomes `confirmed` with an `approved` event (actor `customer`, `data.phoneLast4`), and the approval is marked decided, all only if the hold is still on. The owner is then alerted once.
+4. In one transaction: the code is consumed (it works once), the customer is upserted by phone number (display name: the booking's `customer_name`) and linked, the booking becomes `confirmed` with an `approved` event (actor `customer`, `data.phoneLast4`), and the approval is marked decided, all only if the hold is still on. The owner is then alerted once.
 
 ```json
 {

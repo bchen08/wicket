@@ -44,10 +44,9 @@ export const EXAMPLE_BOOKINGS: InitialBooking[] = [
   },
 ];
 
-/** The consent settings tests use: localhost links, a fixed pepper, no dev codes. */
+/** The consent settings tests use: localhost links, no dev codes. */
 export const TEST_CONSENT: ConsentConfig = Object.freeze({
   publicBaseUrl: "http://localhost:3000",
-  phonePepper: "test-pepper-0123456789abcdef0123456789abcdef",
   devCodes: false,
 });
 

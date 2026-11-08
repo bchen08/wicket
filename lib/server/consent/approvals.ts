@@ -19,7 +19,7 @@ import {
   SENDS_PER_LINK_PER_HOUR,
   SENDS_PER_PHONE_PER_HOUR,
 } from "./config";
-import { isWellFormedToken, last4, newCode, normalizePhone, phoneHmac, sameDigest, sha256Hex } from "./crypto";
+import { isWellFormedToken, last4, newCode, normalizePhone, sameDigest, sha256Hex } from "./crypto";
 
 // The approval page's use cases, behind /api/approvals/[token]/*: what the person sees, sending them a
 // code, and their answer. The token in the link is the only credential (no sign-in, no OAuth), so it
@@ -119,7 +119,7 @@ export async function getApprovalView(deps: FrontDeskDeps, token: string): Promi
 
   const status: ApprovalView["status"] =
     approval.decision ?? (booking.status === "awaiting_approval" ? "pending" : "expired");
-  const codeSentTo = status === "pending" && challenge && usable(challenge, deps.clock.now()) ? challenge.phoneLast4 : null;
+  const codeSentTo = status === "pending" && challenge && usable(challenge, deps.clock.now()) ? last4(challenge.phone) : null;
   return {
     status,
     shop,
@@ -187,7 +187,7 @@ function rateLimited(limit: "phone" | "booking", retryAfterMs: number): FrontDes
 /**
  * Send the person a 6-digit code (SendCodeRequest → SendCodeResponse), only while the approval is
  * pending. Limits: SENDS_PER_PHONE_PER_HOUR per phone number and SENDS_PER_LINK_PER_HOUR per link
- * (rate_limited). The code's SHA-256 is stored with the phone's HMAC; the code works for
+ * (rate_limited). The code's SHA-256 is stored with the phone number; the code works for
  * CODE_TTL_MINUTES and replaces any earlier one. devCode is included only when deps.consent.devCodes.
  */
 export async function sendApprovalCode(deps: FrontDeskDeps, token: string, body: unknown): Promise<SendCodeResponse> {
@@ -200,8 +200,7 @@ export async function sendApprovalCode(deps: FrontDeskDeps, token: string, body:
   const expiresAt = new Date(now.getTime() + CODE_TTL_MS);
   const created = await deps.store.createChallenge({
     bookingId: ctx.booking.id,
-    phoneHmac: phoneHmac(deps.consent.phonePepper, phone),
-    phoneLast4: last4(phone),
+    phone,
     codeHash: sha256Hex(code),
     expiresAt,
     now,
@@ -257,7 +256,7 @@ function unusable(challenge: ChallengeRecord, now: Date): FrontDeskError {
  *    code_expired; 5 attempts used → too_many_attempts.
  * 3. Count the attempt, then compare the code's SHA-256 with the stored one in constant time. Wrong:
  *    code_invalid with details.attemptsLeft, or too_many_attempts on the 5th wrong try.
- * 4. In one transaction: consume the code, upsert the customer by phone HMAC (display name from the
+ * 4. In one transaction: consume the code, upsert the customer by phone number (display name from the
  *    booking's customer name), link it, confirm the booking and write the "approved" event, only if
  *    the hold is still on. A hold that lapsed meanwhile → approval_expired.
  * TODO(ring-1c): a service with a deposit goes to awaiting_deposit instead (see decide()).
@@ -297,7 +296,7 @@ export async function approveBooking(deps: FrontDeskDeps, token: string, body: u
     nextStatus: decision.nextStatus,
     now,
     challengeId: challenge.id,
-    customer: { phoneHmac: challenge.phoneHmac, phoneLast4: challenge.phoneLast4, displayName: booking.customer.displayName },
+    customer: { phone: challenge.phone, displayName: booking.customer.displayName },
     event: {
       actor: "customer",
       type: EVENT_FOR.approve,
@@ -306,7 +305,7 @@ export async function approveBooking(deps: FrontDeskDeps, token: string, body: u
         to: decision.nextStatus,
         depositEffect: decision.depositEffect,
         depositCollected: false,
-        phoneLast4: challenge.phoneLast4,
+        phoneLast4: last4(challenge.phone),
       },
     },
   });

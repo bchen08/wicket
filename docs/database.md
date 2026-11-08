@@ -6,7 +6,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 |---|---|
 | [`supabase/migrations/0001_skeleton.sql`](../supabase/migrations/0001_skeleton.sql) | Ring 0: shops, services, staff, weekly hours, bookings, the no-double-booking constraint, row level security |
 | [`supabase/migrations/0002_rules.sql`](../supabase/migrations/0002_rules.sql) | Ring 1a: shop policies, blocked times, the full booking lifecycle (statuses, timestamps, deposit snapshot), the events log, idempotency keys |
-| [`supabase/migrations/0003_consent.sql`](../supabase/migrations/0003_consent.sql) | Ring 1b: holds awaiting approval (`approve_by`, the mandate), customers (phone kept only as an HMAC), approval requests (token kept only as a hash), one-time codes |
+| [`supabase/migrations/0003_consent.sql`](../supabase/migrations/0003_consent.sql) | Ring 1b: holds awaiting approval (`approve_by`, the mandate), customers (phone stored as plain E.164), approval requests (token kept only as a hash), one-time codes |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -22,9 +22,9 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
   - `mandate`: the person's limits as the agent sent them (a JSON object), or null.
   - `cancelled_by` is `agent`, `owner` or `customer` (the person declined). Each transition stamps its own time column.
   - `deposit_cents` is a snapshot of the service's deposit when the booking was made, so a later price change doesn't rewrite history.
-- `customers (id, phone_hmac unique, phone_last4, display_name, created_at)`: people who proved a phone number. **The raw number is never stored**: `phone_hmac` is HMAC-SHA256(`PHONE_HMAC_PEPPER`, the E.164 number), hex. A returning customer is found by it; `display_name` is the name on the last booking they approved.
+- `customers (id, phone unique, display_name, created_at)`: people who proved a phone number. `phone` is the E.164 number, stored as it is (an MVP decision: no hashing); a returning customer is found by it. `display_name` is the name on the last booking they approved. `Booking.customer.phoneLast4` is its last 4 digits.
 - `approvals (booking_id pk, token_hash unique, created_at, decided_at, decision)`: one per booking. `token_hash` is the SHA-256 of the token in the approval link; the token itself is never stored. `decision` is `approved` or `declined`, set together with `decided_at`.
-- `otp_challenges (id, booking_id, phone_hmac, phone_last4, code_hash, expires_at, attempts, consumed_at, created_at)`: the 6-digit codes sent for an approval, newest = highest `id`. `code_hash` is the code's SHA-256; `attempts` is at most 5; `consumed_at` is set when the code is used.
+- `otp_challenges (id, booking_id, phone, code_hash, expires_at, attempts, consumed_at, created_at)`: the 6-digit codes sent for an approval, newest = highest `id`. `phone` is the E.164 number the code went to; `code_hash` is the code's SHA-256; `attempts` is at most 5; `consumed_at` is set when the code is used.
 - `policies (shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone, deposit_rule, late_cancel_rule, no_show_rule, updated_at)`: one row per shop. A shop without a row uses the column defaults (120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules).
 - `blocked_times (id, staff_id, during tstzrange, reason, created_at)`: holidays and time off. Half-open, like bookings. The owner sees `reason`; agents never do.
 - `events (id, booking_id, at, actor, type, data jsonb)`: one row per booking state change (`booked`, `approved`, `declined`, `expired`, `cancelled`, `completed`, `no_show`), written in the same transaction as the change. `actor` is `agent`, `owner`, `customer` or `system`.
@@ -133,7 +133,7 @@ It's additive, so it's compatible with the Ring 0 code already deployed: new tab
 
 2. **Production:** the GitHub integration applies 0003 when the PR merges.
 3. **Check** with `select version from supabase_migrations.schema_migrations;` (lists `0003`) and `\d approvals` (or `select * from approvals limit 1;`).
-4. **Set the new environment variables** before the code is deployed: [`PHONE_HMAC_PEPPER`](#5-set-public_base_url-and-phone_hmac_pepper) is required on Vercel, or every Front Desk call fails with `internal`.
+4. **Set [`PUBLIC_BASE_URL`](#5-set-public_base_url) for Production** before the code is deployed, so approval links point at the production domain.
 
 What 0003 does to existing data:
 - Existing bookings keep their status; `approve_by`, `customer_id` and `mandate` are null. They stay unverified (`customer.verified: false`): nobody approved them.
@@ -192,31 +192,20 @@ OWNER_API_TOKEN=<64 hex characters>
 - **Never commit it.** Anyone holding it can change the shop's rules and act on its bookings. To rotate it, change the value in Vercel and redeploy.
 - It's a stopgap: `TODO(ring-2)`: owner sign-in replaces the token.
 
-### 5. Set `PUBLIC_BASE_URL` and `PHONE_HMAC_PEPPER`
+### 5. Set `PUBLIC_BASE_URL`
 
-The consent flow (Ring 1b) needs two more variables, and a third for local demos.
+The consent flow (Ring 1b) needs one more variable, and another for local demos.
 
 **`PUBLIC_BASE_URL`**: the origin people open approval links on, e.g. `https://frontdesk.example.com`. `book` builds each link as `${PUBLIC_BASE_URL}/approve/<token>`, and the approval routes accept a `POST` only from this origin (`Origin` header), as CSRF protection.
 - Locally it defaults to `http://localhost:3000`. If `pnpm dev` runs on another port, set it to match.
 - On Vercel, if it's unset, it falls back to `https://${VERCEL_URL}`, the deployment's own URL. That's fine for previews. **Set it for Production** to the production domain, or links point at a per-deployment URL.
 - It must be an absolute `http(s)` URL without a query, fragment or credentials; a trailing slash is dropped. Anything else is a configuration error.
 
-**`PHONE_HMAC_PEPPER`**: the secret phone numbers are HMACed with before they're stored, so a database dump can't be reversed into phone numbers. 32 random bytes:
-
-```bash
-openssl rand -base64 32
-```
-
-- **Required on Vercel** (Production and Preview, type Secret, ideally a different value for each). Without it every Front Desk call fails with `internal`, and the log says `PHONE_HMAC_PEPPER is not set`. It must be at least 32 characters.
-- **Never change it** once customers exist: they're found by the HMAC, so a new pepper makes every returning customer look new.
-- Locally, if it's unset, a fixed development pepper is used, with a warning.
-
 **`FRONTDESK_DEV_CODES`**: set it to `1` **locally only** to get the code back in the code request's response (`devCode`), so the flow is demoable without a phone. It's ignored on Vercel production (`VERCEL_ENV=production`) whatever its value. No real text messages are sent in Ring 1b either way (`TODO(ring-1c)`).
 
 ```bash
 # .env.local
 PUBLIC_BASE_URL=http://localhost:3000
-PHONE_HMAC_PEPPER=<the output of openssl rand -base64 32>
 FRONTDESK_DEV_CODES=1
 ```
 
@@ -227,7 +216,6 @@ FRONTDESK_DEV_CODES=1
 | `DATABASE_URL` | Vercel (per environment), local | On Vercel | The Supabase transaction pooler string (port 6543). Unset locally: in-memory data. |
 | `OWNER_API_TOKEN` | Vercel (per environment), local | For the owner routes | Bearer token for the owner routes, at least 16 characters. |
 | `PUBLIC_BASE_URL` | Vercel Production, local if not port 3000 | No (defaults below) | Origin of the approval links and of allowed approval `POST`s. Default: `http://localhost:3000` locally, `https://${VERCEL_URL}` on Vercel. |
-| `PHONE_HMAC_PEPPER` | Vercel (per environment), local optional | On Vercel | 32 random bytes; the key for phone HMACs. Never change it. |
 | `FRONTDESK_DEV_CODES` | Local only | No | `1`: return the code as `devCode`. Ignored on Vercel production. |
 | `FRONTDESK_NOW` | Local, demos | No | Freeze Front Desk's clock at an RFC 3339 instant. |
 | `DATABASE_URL_TEST` | Local, CI if wanted | No | A scratch Postgres for the Postgres tests. |
@@ -299,7 +287,7 @@ To clear only the bookings, run `delete from bookings;` in the **Preview** proje
 | Where | Behavior |
 |---|---|
 | Local (`pnpm dev`, tests) | Front Desk uses an in-memory copy of the seed data (including Hart's policies) and logs one warning. Bookings, events and owner changes are lost when the server restarts. Good for UI work without a database. |
-| Vercel (the `VERCEL` env var is set) | Every Front Desk call fails with an `internal` error, and the function log says `DATABASE_URL is not set`. A deployment never serves fake data. The same goes for a missing `PHONE_HMAC_PEPPER`. |
+| Vercel (the `VERCEL` env var is set) | Every Front Desk call fails with an `internal` error, and the function log says `DATABASE_URL is not set`. A deployment never serves fake data. |
 
 The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/deps.ts).
 
@@ -317,7 +305,7 @@ Three files use it:
 |---|---|
 | [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, idempotency keys (replay, conflict, rollback, concurrency, reuse after 24 hours), and the owner writes (policies, services, hours, blocks). |
 | [`lib/server/frontdesk/flow-pg.test.ts`](../lib/server/frontdesk/flow-pg.test.ts) | The lifecycle and idempotency flow through the service layer, the code the MCP tools and owner routes call: book and replay, conflicts, cancel (released, captured, none), cancel after the start, an owner no-show, and concurrent books and cancels. |
-| [`lib/server/consent/consent-pg.test.ts`](../lib/server/consent/consent-pg.test.ts) | The consent flow on Postgres: send a code and approve (only hashes and the phone HMAC are stored), decline, lazy expiry (a stale hold never blocks a new booking; exactly one `expired` event under concurrency), wrong codes, code expiry and reuse, and the send limits under concurrent sends. |
+| [`lib/server/consent/consent-pg.test.ts`](../lib/server/consent/consent-pg.test.ts) | The consent flow on Postgres: send a code and approve (the token and code stored only as hashes, the phone as plain E.164), decline, lazy expiry (a stale hold never blocks a new booking; exactly one `expired` event under concurrency), wrong codes, code expiry and reuse, and the send limits under concurrent sends. |
 
 They only touch rows of their own and delete them afterwards: bookings in 2099, idempotency keys they made, the customers their approvals created, and a throwaway shop for the lifecycle, idempotency, consent and owner-write tests. Hart's seeded rows are read, never changed. Without `DATABASE_URL_TEST` they're skipped, and the test output says so.
 

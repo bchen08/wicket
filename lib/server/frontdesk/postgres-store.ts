@@ -123,8 +123,7 @@ function toRecord(r: BookingRow): BookingRecord {
 type ChallengeRow = {
   id: string;
   booking_id: string;
-  phone_hmac: string;
-  phone_last4: string;
+  phone: string;
   code_hash: string;
   expires_at: Date;
   attempts: number;
@@ -136,8 +135,7 @@ function toChallenge(r: ChallengeRow): ChallengeRecord {
   return {
     id: r.id,
     bookingId: r.booking_id,
-    phoneHmac: r.phone_hmac,
-    phoneLast4: r.phone_last4,
+    phone: r.phone,
     codeHash: r.code_hash,
     expiresAt: r.expires_at,
     attempts: r.attempts,
@@ -147,7 +145,7 @@ function toChallenge(r: ChallengeRow): ChallengeRecord {
 }
 
 const challengeColumns = (db: Db) => db`
-  id::text as id, booking_id::text as booking_id, phone_hmac, phone_last4, code_hash, expires_at, attempts,
+  id::text as id, booking_id::text as booking_id, phone, code_hash, expires_at, attempts,
   consumed_at, created_at
 `;
 
@@ -244,7 +242,7 @@ const tstzrange = (db: Db, range: TimeRange) =>
 const bookingColumns = (db: Db) => db`
   b.id::text as id, b.shop_slug, b.service_id, sv.name as service_name, b.deposit_cents,
   b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at, b.status,
-  b.customer_name, b.agent_name, b.created_at, c.phone_last4 as customer_phone_last4, sh.timezone
+  b.customer_name, b.agent_name, b.created_at, right(c.phone, 4) as customer_phone_last4, sh.timezone
 `;
 const bookingJoins = (db: Db) => db`
   join services sv on sv.shop_slug = b.shop_slug and sv.id = b.service_id
@@ -509,15 +507,15 @@ function bookingStoreOn(conn: Conn): BookingStore {
         // inserting can't interleave with another send. Always in this order, so they can't deadlock.
         const locked = await tx`select booking_id from approvals where booking_id = ${key}::uuid for update`;
         if (locked.length === 0) throw new Error(`No approval for booking ${key}.`);
-        await tx`select pg_advisory_xact_lock(hashtextextended(${`otp:${input.phoneHmac}`}, 0))`;
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`otp:${input.phone}`}, 0))`;
         const [counts] = await tx<{ booking_count: number; booking_oldest: Date | null; phone_count: number; phone_oldest: Date | null }[]>`
           select
             count(*) filter (where booking_id = ${key}::uuid)::int as booking_count,
             min(created_at) filter (where booking_id = ${key}::uuid) as booking_oldest,
-            count(*) filter (where phone_hmac = ${input.phoneHmac})::int as phone_count,
-            min(created_at) filter (where phone_hmac = ${input.phoneHmac}) as phone_oldest
+            count(*) filter (where phone = ${input.phone})::int as phone_count,
+            min(created_at) filter (where phone = ${input.phone}) as phone_oldest
           from otp_challenges
-          where (booking_id = ${key}::uuid or phone_hmac = ${input.phoneHmac})
+          where (booking_id = ${key}::uuid or phone = ${input.phone})
             and created_at > ${windowStart}::timestamptz and created_at <= ${now}::timestamptz
         `;
         const retryAfter = (oldest: Date | null) =>
@@ -529,9 +527,9 @@ function bookingStoreOn(conn: Conn): BookingStore {
           return { ok: false as const, limit: "phone" as const, retryAfterMs: retryAfter(counts.phone_oldest) };
         }
         const [row] = await tx<ChallengeRow[]>`
-          insert into otp_challenges (booking_id, phone_hmac, phone_last4, code_hash, expires_at, created_at)
+          insert into otp_challenges (booking_id, phone, code_hash, expires_at, created_at)
           values (
-            ${key}::uuid, ${input.phoneHmac}, ${input.phoneLast4}, ${input.codeHash},
+            ${key}::uuid, ${input.phone}, ${input.codeHash},
             ${input.expiresAt.toISOString()}::timestamptz, ${now}::timestamptz
           )
           returning ${challengeColumns(tx)}
@@ -580,10 +578,9 @@ function bookingStoreOn(conn: Conn): BookingStore {
           if (consumed.length === 0) throw new AnswerRollback("code_used");
           if (!input.customer) throw new Error("answerApproval: an approval needs the customer.");
           const [customer] = await tx<{ id: string }[]>`
-            insert into customers (phone_hmac, phone_last4, display_name)
-            values (${input.customer.phoneHmac}, ${input.customer.phoneLast4}, ${input.customer.displayName})
-            on conflict (phone_hmac) do update
-              set phone_last4 = excluded.phone_last4, display_name = excluded.display_name
+            insert into customers (phone, display_name)
+            values (${input.customer.phone}, ${input.customer.displayName})
+            on conflict (phone) do update set display_name = excluded.display_name
             returning id::text as id
           `;
           customerId = customer?.id ?? null;

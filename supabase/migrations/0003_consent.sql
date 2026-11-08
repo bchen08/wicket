@@ -6,15 +6,14 @@
 -- with a verified customer) or declines (→ cancelled). A hold nobody answers is expired lazily.
 -- Same access model as 0001: RLS on, no policies.
 --
--- Nothing secret is stored in the clear: the approval token, the phone number and the code are kept
--- only as hashes (the phone as an HMAC with PHONE_HMAC_PEPPER, so it can't be brute-forced from a dump).
+-- The approval token and the code are kept only as SHA-256 hashes. Phone numbers are stored as plain
+-- E.164 strings (an MVP decision: no hashing of phone numbers).
 
 -- ---- Customers: people who proved a phone number ----
 create table customers (
   id           uuid        primary key default gen_random_uuid(),
-  -- HMAC-SHA256(PHONE_HMAC_PEPPER, E.164 number), hex. The raw number is never stored.
-  phone_hmac   text        not null unique check (phone_hmac ~ '^[0-9a-f]{64}$'),
-  phone_last4  text        not null check (phone_last4 ~ '^[0-9]{4}$'),
+  -- E.164, e.g. '+14015550123'. A returning customer is found by it.
+  phone        text        not null unique check (phone ~ '^\+[1-9][0-9]{7,14}$'),
   -- The name of the booking they last approved.
   display_name text        not null check (char_length(display_name) between 1 and 80),
   created_at   timestamptz not null default now()
@@ -70,8 +69,8 @@ create table otp_challenges (
   -- Increasing: the latest code for a booking is the one with the highest id.
   id          bigint      generated always as identity primary key,
   booking_id  uuid        not null references bookings (id) on delete cascade,
-  phone_hmac  text        not null check (phone_hmac ~ '^[0-9a-f]{64}$'),
-  phone_last4 text        not null check (phone_last4 ~ '^[0-9]{4}$'),
+  -- E.164, the number the code was sent to.
+  phone       text        not null check (phone ~ '^\+[1-9][0-9]{7,14}$'),
   -- SHA-256 of the 6-digit code, hex.
   code_hash   text        not null check (code_hash ~ '^[0-9a-f]{64}$'),
   expires_at  timestamptz not null,
@@ -85,7 +84,7 @@ create table otp_challenges (
 -- The latest code for a booking, and the per-link send limit.
 create index otp_challenges_booking on otp_challenges (booking_id, id);
 -- The per-phone send limit (sends in the last hour).
-create index otp_challenges_phone on otp_challenges (phone_hmac, created_at);
+create index otp_challenges_phone on otp_challenges (phone, created_at);
 
 alter table customers      enable row level security;
 alter table approvals      enable row level security;

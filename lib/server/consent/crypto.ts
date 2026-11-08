@@ -1,9 +1,9 @@
-import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 
-// The secrets of the consent flow and how they're stored: only ever as hashes.
+// The secrets of the consent flow and how they're stored.
 //   approval token: 32 random bytes, base64url, in the link; stored as SHA-256 hex.
-//   phone number:   E.164; stored as HMAC-SHA256(PHONE_HMAC_PEPPER, number) hex, plus its last 4 digits.
 //   code:           6 random digits, texted to the phone; stored as SHA-256 hex.
+//   phone number:   E.164, stored as it is (an MVP decision; no hashing).
 // None of them is ever logged.
 
 /** SHA-256 of `value` (UTF-8), hex. */
@@ -21,11 +21,6 @@ const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 
 export function isWellFormedToken(token: string): boolean {
   return TOKEN.test(token);
-}
-
-/** HMAC-SHA256(pepper, phoneE164), hex: how a phone number is stored and compared. */
-export function phoneHmac(pepper: string, phoneE164: string): string {
-  return createHmac("sha256", pepper).update(phoneE164, "utf8").digest("hex");
 }
 
 /** A new 6-digit code, uniformly random (leading zeros kept), from crypto.randomInt. */

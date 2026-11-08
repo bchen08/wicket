@@ -125,7 +125,7 @@ export type LifecycleStamps = {
 };
 
 /** A stored customer (the customers table). */
-export type StoredCustomer = { id: string; phoneHmac: string; phoneLast4: string; displayName: string; createdAt: Date };
+export type StoredCustomer = { id: string; /** E.164. */ phone: string; displayName: string; createdAt: Date };
 
 /** A stored approval request (the approvals table). */
 export type StoredApproval = {
@@ -277,7 +277,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       agentName: b.agentName,
       createdAt: copyDate(b.createdAt),
       // Like the Postgres left join on customers.
-      customerPhoneLast4: customers.find((c) => c.id === b.customerId)?.phoneLast4 ?? null,
+      customerPhoneLast4: customers.find((c) => c.id === b.customerId)?.phone.slice(-4) ?? null,
       timezone: shop.timezone,
     };
   }
@@ -650,13 +650,12 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       };
       const byBooking = limited(challenges.filter((c) => c.bookingId === b.id && inWindow(c)), input.limits.perBooking);
       if (byBooking !== null) return { ok: false, limit: "booking", retryAfterMs: byBooking };
-      const byPhone = limited(challenges.filter((c) => c.phoneHmac === input.phoneHmac && inWindow(c)), input.limits.perPhone);
+      const byPhone = limited(challenges.filter((c) => c.phone === input.phone && inWindow(c)), input.limits.perPhone);
       if (byPhone !== null) return { ok: false, limit: "phone", retryAfterMs: byPhone };
       const challenge: ChallengeRecord = {
         id: String(++challengeSeq),
         bookingId: b.id,
-        phoneHmac: input.phoneHmac,
-        phoneLast4: input.phoneLast4,
+        phone: input.phone,
         codeHash: input.codeHash,
         expiresAt: copyDate(input.expiresAt),
         attempts: 0,
@@ -693,12 +692,12 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       const at = now();
       if (input.decision === "approved" && challenge && input.customer) {
         challenge.consumedAt = copyDate(input.now);
-        const { phoneHmac, phoneLast4, displayName } = input.customer;
-        let customer = customers.find((c) => c.phoneHmac === phoneHmac);
+        const { phone, displayName } = input.customer;
+        let customer = customers.find((c) => c.phone === phone);
         if (customer) {
-          Object.assign(customer, { phoneLast4, displayName });
+          customer.displayName = displayName;
         } else {
-          customer = { id: crypto.randomUUID(), phoneHmac, phoneLast4, displayName, createdAt: at };
+          customer = { id: crypto.randomUUID(), phone, displayName, createdAt: at };
           customers.push(customer);
         }
         b.customerId = customer.id;

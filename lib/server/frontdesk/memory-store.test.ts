@@ -736,8 +736,8 @@ describe("transition: actors", () => {
 });
 
 describe("consent: codes", () => {
-  const HMAC_A = "a".repeat(64);
-  const HMAC_B = "b".repeat(64);
+  const PHONE_A = "+14015550123";
+  const PHONE_B = "+14015550199";
   const LIMITS = { perPhone: 3, perBooking: 10, windowMs: 60 * 60_000 };
 
   async function held(store: ReturnType<typeof createMemoryStore>, hhmm = "10:00") {
@@ -746,10 +746,9 @@ describe("consent: codes", () => {
     return store.createBooking(newBooking(at(hhmm), at(end)));
   }
 
-  const challenge = (bookingId: string, now: Date, phoneHmac = HMAC_A, limits = LIMITS): NewChallenge => ({
+  const challenge = (bookingId: string, now: Date, phone = PHONE_A, limits = LIMITS): NewChallenge => ({
     bookingId,
-    phoneHmac,
-    phoneLast4: "0123",
+    phone,
     codeHash: sha256Hex("123456"),
     expiresAt: new Date(now.getTime() + 10 * 60_000),
     now,
@@ -761,7 +760,7 @@ describe("consent: codes", () => {
     const booking = await held(store);
     expect(await store.latestChallenge(booking.id)).toBeNull();
     const first = await store.createChallenge(challenge(booking.id, NOW));
-    const second = await store.createChallenge(challenge(booking.id, NOW, HMAC_B));
+    const second = await store.createChallenge(challenge(booking.id, NOW, PHONE_B));
     expect(first).toMatchObject({ ok: true, challenge: { bookingId: booking.id, attempts: 0, consumedAt: null, createdAt: NOW } });
     if (!first.ok || !second.ok) throw new Error("expected both sends to succeed");
     expect(Number(second.challenge.id)).toBeGreaterThan(Number(first.challenge.id));
@@ -780,7 +779,7 @@ describe("consent: codes", () => {
     const now = new Date(NOW.getTime() + 5 * 60_000);
     expect(await store.createChallenge(challenge(b.id, now))).toEqual({ ok: false, limit: "phone", retryAfterMs: 55 * 60_000 });
     // Another phone is fine.
-    expect((await store.createChallenge(challenge(b.id, now, HMAC_B))).ok).toBe(true);
+    expect((await store.createChallenge(challenge(b.id, now, PHONE_B))).ok).toBe(true);
     // Once the oldest send is an hour old, the phone may get another code (the window is (now − 1 h, now]).
     expect((await store.createChallenge(challenge(b.id, new Date(NOW.getTime() + 60 * 60_000)))).ok).toBe(true);
   });
@@ -789,8 +788,8 @@ describe("consent: codes", () => {
     const store = createMemoryStore();
     const booking = await held(store);
     const limits = { ...LIMITS, perPhone: 100, perBooking: 2 };
-    expect((await store.createChallenge(challenge(booking.id, NOW, HMAC_A, limits))).ok).toBe(true);
-    expect((await store.createChallenge(challenge(booking.id, NOW, HMAC_B, limits))).ok).toBe(true);
+    expect((await store.createChallenge(challenge(booking.id, NOW, PHONE_A, limits))).ok).toBe(true);
+    expect((await store.createChallenge(challenge(booking.id, NOW, PHONE_B, limits))).ok).toBe(true);
     expect(await store.createChallenge(challenge(booking.id, NOW, "c".repeat(64), limits))).toEqual({
       ok: false,
       limit: "booking",
@@ -814,7 +813,7 @@ describe("consent: codes", () => {
     expect(await store.recordCodeAttempt(id, NOW, 5)).toBeNull(); // out of attempts
     expect((await store.latestChallenge(booking.id))?.attempts).toBe(5);
 
-    const fresh = await store.createChallenge(challenge(booking.id, NOW, HMAC_B));
+    const fresh = await store.createChallenge(challenge(booking.id, NOW, PHONE_B));
     if (!fresh.ok) throw new Error("expected the send to succeed");
     expect(await store.recordCodeAttempt(fresh.challenge.id, fresh.challenge.expiresAt, 5)).toBeNull(); // expired
     expect(await store.recordCodeAttempt("999", NOW, 5)).toBeNull();
@@ -822,15 +821,14 @@ describe("consent: codes", () => {
 });
 
 describe("consent: answerApproval", () => {
-  const PHONE_HMAC = "d".repeat(64);
+  const PHONE = "+14015550123";
   const LIMITS = { perPhone: 3, perBooking: 10, windowMs: 60 * 60_000 };
 
   async function heldWithCode(store: ReturnType<typeof createMemoryStore>) {
     const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
     const created = await store.createChallenge({
       bookingId: booking.id,
-      phoneHmac: PHONE_HMAC,
-      phoneLast4: "0123",
+      phone: PHONE,
       codeHash: sha256Hex("123456"),
       expiresAt: new Date(NOW.getTime() + 10 * 60_000),
       now: NOW,
@@ -846,7 +844,7 @@ describe("consent: answerApproval", () => {
     nextStatus: "confirmed" as const,
     now,
     challengeId,
-    customer: { phoneHmac: PHONE_HMAC, phoneLast4: "0123", displayName },
+    customer: { phone: PHONE, displayName },
     event: {
       actor: "customer" as const,
       type: "approved" as const,
@@ -864,7 +862,7 @@ describe("consent: answerApproval", () => {
     });
     const rows = store.consentRows();
     expect(rows.customers).toEqual([
-      { id: expect.any(String), phoneHmac: PHONE_HMAC, phoneLast4: "0123", displayName: "Memory Test", createdAt: NOW },
+      { id: expect.any(String), phone: PHONE, displayName: "Memory Test", createdAt: NOW },
     ]);
     expect(rows.bookings[0].customerId).toBe(rows.customers[0].id);
     expect(rows.challenges[0].consumedAt).toEqual(NOW);
@@ -934,8 +932,7 @@ describe("consent: answerApproval", () => {
     const second = await store.createBooking(newBooking(at("11:00"), at("11:30"), { approvalTokenHash: sha256Hex(newApprovalToken()) }));
     const created = await store.createChallenge({
       bookingId: second.id,
-      phoneHmac: PHONE_HMAC,
-      phoneLast4: "0123",
+      phone: PHONE,
       codeHash: sha256Hex("654321"),
       expiresAt: new Date(NOW.getTime() + 10 * 60_000),
       now: NOW,

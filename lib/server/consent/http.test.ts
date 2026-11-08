@@ -153,7 +153,7 @@ describe("approval routes: errors and status codes", () => {
   it("a configuration error → 500 internal, before the Origin is checked", async () => {
     const res = await approvalCodePost(
       () => {
-        throw new Error("PHONE_HMAC_PEPPER is not set");
+        throw new Error("DATABASE_URL is not set");
       },
       post("x".repeat(43), "code", { phone: PHONE_E164 }, null),
       "x".repeat(43),
@@ -161,6 +161,6 @@ describe("approval routes: errors and status codes", () => {
     expect(res.status).toBe(500);
     const body = (await res.json()) as ApiError;
     expect(body.error.code).toBe("internal");
-    expect(JSON.stringify(body)).not.toContain("PEPPER");
+    expect(JSON.stringify(body)).not.toContain("DATABASE_URL");
   });
 });

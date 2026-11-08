@@ -438,15 +438,16 @@ if (!url) {
       store.createBooking({ ...ours(at(24 + h), at(24 + h, 30)), approveBy, ...extra });
     const statusOf = async (id: string) => (await store.getBooking(id))?.status;
     const eventsOf = async (id: string) => (await store.listEvents(id)).map((e) => [e.type, e.actor]);
-    /** A distinct 64-hex phone HMAC for this run. */
-    const hmac = (name: string) => sha256Hex(`${run}:${name}`);
+    /** 6 digits of this run's own, so its phone numbers (and customers, and send limits) never meet another run's. */
+    const PHONE_PREFIX = String(100000 + Math.floor(Math.random() * 900000));
+    /** A distinct E.164 number for this run, ending in 4321, e.g. phoneOf(5) = "+1<prefix>054321". */
+    const phoneOf = (n: number) => `+1${PHONE_PREFIX}${String(n).padStart(2, "0")}4321`;
     const DEADLINE = at(30);
     const LIMITS = { perPhone: 3, perBooking: 10, windowMs: 60 * 60 * 1000 };
-    const challenge = (bookingId: string, phoneHmac: string, now: Date, limits = LIMITS) =>
+    const challenge = (bookingId: string, phone: string, now: Date, limits = LIMITS) =>
       store.createChallenge({
         bookingId,
-        phoneHmac,
-        phoneLast4: "4321",
+        phone,
         codeHash: sha256Hex(`code-${Math.random()}`),
         expiresAt: new Date(now.getTime() + 10 * 60_000),
         now,
@@ -525,7 +526,7 @@ if (!url) {
     it("createChallenge() enforces the per-booking and per-phone limits over a sliding window, with retryAfterMs", async () => {
       const a = await holdAt(6, DEADLINE);
       const b = await holdAt(7, DEADLINE);
-      const phone = hmac("limits");
+      const phone = phoneOf(1);
       const t0 = at(28);
       const minute = 60_000;
       for (let i = 0; i < 3; i++) {
@@ -540,10 +541,10 @@ if (!url) {
 
       // Per booking: at most 2 here, whatever the phone.
       const tight = { ...LIMITS, perBooking: 2 };
-      expect(await challenge(a.id, hmac("other"), now, tight)).toEqual({ ok: false, limit: "booking", retryAfterMs: 50 * minute });
+      expect(await challenge(a.id, phoneOf(2), now, tight)).toEqual({ ok: false, limit: "booking", retryAfterMs: 50 * minute });
 
       const latest = await store.latestChallenge(b.id);
-      expect(latest).toMatchObject({ bookingId: b.id, phoneHmac: phone, phoneLast4: "4321", attempts: 0, consumedAt: null });
+      expect(latest).toMatchObject({ bookingId: b.id, phone, attempts: 0, consumedAt: null });
       expect(latest!.createdAt).toEqual(new Date(t0.getTime() + 60 * minute));
       expect(await store.latestChallenge(crypto.randomUUID())).toBeNull();
       expect(await store.latestChallenge("not-a-uuid")).toBeNull();
@@ -552,7 +553,7 @@ if (!url) {
     it("recordCodeAttempt() counts attempts only while the code is usable", async () => {
       const hold = await holdAt(9, DEADLINE);
       const now = at(28);
-      const sent = await challenge(hold.id, hmac("attempts"), now);
+      const sent = await challenge(hold.id, phoneOf(3), now);
       if (!sent.ok) throw new Error("expected a challenge");
       const id = sent.challenge.id;
       for (let n = 1; n <= 5; n++) expect(await store.recordCodeAttempt(id, now, 5)).toBe(n);
@@ -560,7 +561,7 @@ if (!url) {
       const [row] = await sql<{ attempts: number }[]>`select attempts from otp_challenges where id = ${id}::bigint`;
       expect(row.attempts).toBe(5);
 
-      const fresh = await challenge(hold.id, hmac("attempts-2"), now);
+      const fresh = await challenge(hold.id, phoneOf(4), now);
       if (!fresh.ok) throw new Error("expected a challenge");
       expect(await store.recordCodeAttempt(fresh.challenge.id, fresh.challenge.expiresAt, 5)).toBeNull(); // expired
       expect(await store.recordCodeAttempt("not-an-id", now, 5)).toBeNull();
@@ -569,7 +570,7 @@ if (!url) {
     it("answerApproval(): approve consumes the code, upserts the customer, links it and confirms, in one transaction", async () => {
       const hold = await holdAt(10, DEADLINE);
       const now = at(28);
-      const phone = hmac("approve");
+      const phone = phoneOf(5);
       const sent = (await challenge(hold.id, phone, now)) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
       const answer = (bookingId: string, c: ChallengeRecord, displayName = "Postgres Test") =>
         store.answerApproval({
@@ -578,7 +579,7 @@ if (!url) {
           nextStatus: "confirmed",
           now,
           challengeId: c.id,
-          customer: { phoneHmac: phone, phoneLast4: "4321", displayName },
+          customer: { phone, displayName },
           event: { actor: "customer", type: "approved", data: { phoneLast4: "4321" } },
         });
 
@@ -587,15 +588,15 @@ if (!url) {
         ok: true,
         booking: { ...hold, status: "confirmed", customer: { displayName: "Postgres Test", verified: true, phoneLast4: "4321" } },
       });
-      const [row] = await sql<{ customer_id: string; phone_hmac: string; phone_last4: string; display_name: string; consumed_at: Date; decision: string; decided_at: Date }[]>`
-        select c.id::text as customer_id, c.phone_hmac, c.phone_last4, c.display_name, o.consumed_at, a.decision, a.decided_at
+      const [row] = await sql<{ customer_id: string; phone: string; display_name: string; consumed_at: Date; decision: string; decided_at: Date }[]>`
+        select c.id::text as customer_id, c.phone, c.display_name, o.consumed_at, a.decision, a.decided_at
         from bookings b
         join customers c on c.id = b.customer_id
         join otp_challenges o on o.booking_id = b.id
         join approvals a on a.booking_id = b.id
         where b.id = ${hold.id}::uuid
       `;
-      expect(row).toMatchObject({ phone_hmac: phone, phone_last4: "4321", display_name: "Postgres Test", consumed_at: now, decision: "approved", decided_at: now });
+      expect(row).toMatchObject({ phone, display_name: "Postgres Test", consumed_at: now, decision: "approved", decided_at: now });
       expect(await eventsOf(hold.id)).toEqual([
         ["booked", "agent"],
         ["approved", "customer"],
@@ -620,27 +621,27 @@ if (!url) {
       const sent2 = (await challenge(second.id, phone, now)) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
       expect((await answer(second.id, sent2.challenge, "Renamed Test")).ok).toBe(true);
       const customers = await sql<{ id: string; display_name: string }[]>`
-        select id::text as id, display_name from customers where phone_hmac = ${phone}
+        select id::text as id, display_name from customers where phone = ${phone}
       `;
       expect(customers).toEqual([{ id: row.customer_id, display_name: "Renamed Test" }]);
     });
 
     it("answerApproval(): a lapsed hold or an answered approval is not_pending, and nothing is written", async () => {
       const lapsed = await holdAt(12, DEADLINE);
-      const sent = (await challenge(lapsed.id, hmac("lapsed"), at(28))) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
+      const sent = (await challenge(lapsed.id, phoneOf(6), at(28))) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
       const result = await store.answerApproval({
         bookingId: lapsed.id,
         decision: "approved",
         nextStatus: "confirmed",
         now: DEADLINE,
         challengeId: sent.challenge.id,
-        customer: { phoneHmac: hmac("lapsed"), phoneLast4: "4321", displayName: "Postgres Test" },
+        customer: { phone: phoneOf(6), displayName: "Postgres Test" },
         event: { actor: "customer", type: "approved", data: {} },
       });
       expect(result).toEqual({ ok: false, reason: "not_pending" });
       expect((await store.latestChallenge(lapsed.id))?.consumedAt).toBeNull();
       expect(await store.findApproval((await sql<{ token_hash: string }[]>`select token_hash from approvals where booking_id = ${lapsed.id}::uuid`)[0].token_hash)).toMatchObject({ decision: null });
-      expect(await sql`select 1 from customers where phone_hmac = ${hmac("lapsed")}`).toHaveLength(0);
+      expect(await sql`select 1 from customers where phone = ${phoneOf(6)}`).toHaveLength(0);
 
       // Decline: cancelled by the customer; a second answer is not_pending.
       const hold = await holdAt(13, DEADLINE);

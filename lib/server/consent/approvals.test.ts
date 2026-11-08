@@ -1,4 +1,3 @@
-import { createHmac } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Booking, Mandate } from "../../types/frontdesk";
 import type { Clock } from "../clock";
@@ -180,17 +179,16 @@ describe("the approve path", () => {
     expect(notifier.alerts).toHaveLength(1);
   });
 
-  it("stores the phone only as an HMAC with the pepper, plus its last 4 digits; the customer is reused by phone", async () => {
+  it("stores the plain E.164 number (never the token or the code); the customer is reused by phone", async () => {
     const first = await hold(SAT_1400, { name: "Maya" });
     const second = await hold(SAT_1500, { name: "Maya L." });
     const a = await approveAsPerson(first, PHONE_E164);
     const b = await approveAsPerson(second, "+1 401 555 0123");
     const rows = store.consentRows();
     expect(rows.customers).toHaveLength(1);
-    expect(rows.customers[0]).toMatchObject({ phoneLast4: "0123", displayName: "Maya L." });
-    expect(rows.customers[0].phoneHmac).toBe(sha256HmacOf(PHONE_E164));
+    expect(rows.customers[0]).toMatchObject({ phone: PHONE_E164, displayName: "Maya L." });
+    expect(rows.challenges.map((c) => c.phone)).toEqual([PHONE_E164, PHONE_E164]);
     const dump = JSON.stringify(rows);
-    expect(dump).not.toContain("4015550123");
     expect(dump).not.toContain(approvalToken(first));
     for (const message of codes.sent) expect(dump).not.toContain(`"${message.code}"`);
     expect(rows.bookings.find((r) => r.id === a.id)?.customerId).toBe(rows.customers[0].id);
@@ -238,11 +236,6 @@ async function approveAsPerson(booking: Booking, phone: string): Promise<Booking
   const token = approvalToken(booking);
   await sendApprovalCode(deps, token, { phone });
   return (await approveBooking(deps, token, { code: lastSentCode(deps) })).booking;
-}
-
-function sha256HmacOf(phone: string): string {
-  // Same as phoneHmac(TEST_CONSENT.phonePepper, phone), computed independently.
-  return createHmac("sha256", deps.consent.phonePepper).update(phone).digest("hex");
 }
 
 describe("decline", () => {

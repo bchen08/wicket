@@ -8,8 +8,6 @@ export type ConsentConfig = {
    * http://localhost:3000, on Vercel https://${VERCEL_URL} when unset.
    */
   publicBaseUrl: string;
-  /** PHONE_HMAC_PEPPER: the key phone numbers are HMACed with before they're stored. */
-  phonePepper: string;
   /**
    * true: SendCodeResponse includes the code (devCode), so the flow is demoable without a phone.
    * Only when FRONTDESK_DEV_CODES=1 and VERCEL_ENV isn't "production".
@@ -27,9 +25,6 @@ export const SENDS_PER_PHONE_PER_HOUR = 3;
 export const SENDS_PER_LINK_PER_HOUR = 10;
 /** The send limits' sliding window. */
 export const SEND_WINDOW_MS = 60 * 60 * 1000;
-
-/** Shortest PHONE_HMAC_PEPPER accepted, after trimming (32 random bytes encode to 43+ characters). */
-export const MIN_PEPPER_LENGTH = 32;
 
 /** The approval page's path, under publicBaseUrl. The page itself is built separately (v0). */
 export function approvalUrl(config: Pick<ConsentConfig, "publicBaseUrl">, token: string): string {

@@ -7,14 +7,13 @@ import { closePostgresClients, createPostgresStore, getPostgresClient } from "..
 import { book, getAvailability, getBooking } from "../frontdesk/service";
 import { approvalToken, lastSentCode, recordingNotifier, TEST_CONSENT, withConsent } from "../frontdesk/test-support";
 import { approveBooking, declineBooking, getApprovalView, sendApprovalCode } from "./approvals";
-import { phoneHmac } from "./crypto";
 
 // Ring 1b's consent flow against a real Postgres, through the approval use cases (what the
 // /api/approvals/[token]/* routes call) and book, when DATABASE_URL_TEST points at a database with
 // 0001, 0002, 0003 and the seed applied (see docs/database.md). Like flow-pg.test.ts it never touches
 // Hart's: a throwaway shop (one staff member, Tue–Sat 09:00–17:00, a 30-minute service with a deposit),
-// bookings only in 2099, each test in its own week, and everything deleted in afterAll. Phones are
-// HMACed with a pepper of this run's own, so its customers and send limits never meet another run's.
+// bookings only in 2099, each test in its own week, and everything deleted in afterAll. Phone numbers
+// carry a 6-digit prefix of this run's own, so its customers and send limits never meet another run's.
 const url = process.env.DATABASE_URL_TEST?.trim();
 
 if (!url) {
@@ -29,13 +28,14 @@ if (!url) {
     const shop = `vitest-consent-${run}`;
     const staffId = `vitest-consent-${run}-sam`;
     const zone = "America/New_York";
-    const pepper = `vitest-consent-pepper-${run}-0123456789abcdef`;
+    /** 6 digits of this run's own, in every phone number this file uses. */
+    const PHONE_PREFIX = String(100000 + Math.floor(Math.random() * 900000));
 
     /** A clock the tests move. */
     let now = new Date();
     const clock: Clock = { now: () => new Date(now.getTime()) };
     const notifier = recordingNotifier();
-    const deps = withConsent({ catalog: store, store, clock, notifier, consent: { ...TEST_CONSENT, phonePepper: pepper } });
+    const deps = withConsent({ catalog: store, store, clock, notifier, consent: TEST_CONSENT });
 
     /** Every idempotency key this file uses, deleted in afterAll. */
     const keys: string[] = [];
@@ -71,8 +71,8 @@ if (!url) {
         },
       );
     const eventsOf = async (id: string) => (await store.listEvents(id)).map((e) => [e.type, e.actor]);
-    /** A phone number of this file's own, e.g. phone(7) = "+14015550007". */
-    const phone = (n: number) => `+1401555${String(n).padStart(4, "0")}`;
+    /** A phone number of this run's own, e.g. phone(7) = "+1<prefix>0007". */
+    const phone = (n: number) => `+1${PHONE_PREFIX}${String(n).padStart(4, "0")}`;
     /** A code that isn't `code`. */
     const wrong = (code: string) => code.slice(0, 5) + String((Number(code[5]) + 1) % 10);
 
@@ -121,7 +121,8 @@ if (!url) {
         expiresAt: time(0, 0, 9, 10),
       });
 
-      const sent = await sendApprovalCode(deps, token, { phone: "+1 401-555-0123" });
+      // Typed with separators, as a person might: stored normalized.
+      const sent = await sendApprovalCode(deps, token, { phone: `+1 ${PHONE_PREFIX.slice(0, 3)}-${PHONE_PREFIX.slice(3)}-0123` });
       expect(sent).toEqual({ sentTo: "0123", expiresAt: time(0, 0, 9, 10) }); // no devCode: dev codes are off
       expect((await getApprovalView(deps, token)).codeSentTo).toBe("0123");
       const code = lastSentCode(deps);
@@ -137,21 +138,18 @@ if (!url) {
       expect((await getBooking(deps, shop, { booking_id: booking.id })).booking).toEqual(approved);
       expect((await getApprovalView(deps, token)).status).toBe("approved");
 
-      // Stored: the phone only as its HMAC (and last 4 digits), the code only as its hash.
-      const hmac = phoneHmac(pepper, "+14015550123");
-      const [customer] = await sql<{ id: string; phone_hmac: string; phone_last4: string; display_name: string; json: string }[]>`
-        select c.id::text as id, c.phone_hmac, c.phone_last4, c.display_name, row_to_json(c)::text as json
+      // Stored: the phone as plain E.164, the code only as its hash.
+      const [customer] = await sql<{ id: string; phone: string; display_name: string }[]>`
+        select c.id::text as id, c.phone, c.display_name
         from customers c join bookings b on b.customer_id = c.id where b.id = ${booking.id}::uuid
       `;
-      expect(customer).toMatchObject({ phone_hmac: hmac, phone_last4: "0123", display_name: "Maya Lopez" });
-      expect(customer.phone_hmac).toMatch(/^[0-9a-f]{64}$/);
-      expect(customer.json).not.toContain("4015550123");
+      expect(customer).toMatchObject({ phone: phone(123), display_name: "Maya Lopez" });
       const challenges = await sql<{ json: string; attempts: number; consumed_at: Date | null }[]>`
         select row_to_json(o)::text as json, attempts, consumed_at from otp_challenges o where booking_id = ${booking.id}::uuid
       `;
       expect(challenges).toHaveLength(1);
       expect(challenges[0]).toMatchObject({ attempts: 1, consumed_at: new Date(time(0, 0, 9)) });
-      expect(challenges[0].json).not.toContain("4015550123");
+      expect(challenges[0].json).toContain(phone(123));
       expect(challenges[0].json).not.toContain(`"${code}"`);
       const [approval] = await sql<{ decision: string; decided_at: Date; token_hash: string }[]>`
         select decision, decided_at, token_hash from approvals where booking_id = ${booking.id}::uuid
@@ -321,7 +319,7 @@ if (!url) {
       const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
       expect(rejected.map((r) => (r.reason as FrontDeskError).code)).toEqual(["rate_limited", "rate_limited", "rate_limited"]);
       const [{ n }] = await sql<{ n: number }[]>`
-        select count(*)::int as n from otp_challenges where phone_hmac = ${phoneHmac(pepper, phone(80))}
+        select count(*)::int as n from otp_challenges where phone = ${phone(80)}
       `;
       expect(n).toBe(3);
     });

@@ -52,9 +52,8 @@ export type ChallengeRecord = {
   /** Increasing: the latest code for a booking has the highest id. */
   id: string;
   bookingId: string;
-  /** HMAC-SHA256(PHONE_HMAC_PEPPER, E.164 number), hex. */
-  phoneHmac: string;
-  phoneLast4: string;
+  /** The number the code was sent to, E.164. */
+  phone: string;
   /** SHA-256 of the code, hex. */
   codeHash: string;
   expiresAt: Date;
@@ -67,14 +66,14 @@ export type ChallengeRecord = {
 /** What createChallenge stores, and the send limits it enforces. */
 export type NewChallenge = {
   bookingId: string;
-  phoneHmac: string;
-  phoneLast4: string;
+  /** E.164. */
+  phone: string;
   codeHash: string;
   expiresAt: Date;
   /** Front Desk's clock: the new row's created_at, and the end of the limit window. */
   now: Date;
   limits: {
-    /** Most codes per phone (phone_hmac) in the window, across all bookings. */
+    /** Most codes per phone number in the window, across all bookings. */
     perPhone: number;
     /** Most codes per booking (i.e. per approval link) in the window. */
     perBooking: number;
@@ -100,8 +99,8 @@ export type ApprovalAnswer = {
   event: NewBookingEvent;
   /** approved only: the code that proved the phone. It's consumed in the same transaction. */
   challengeId?: string;
-  /** approved only: who the person is, upserted by phoneHmac and linked to the booking. */
-  customer?: { phoneHmac: string; phoneLast4: string; displayName: string };
+  /** approved only: who the person is, upserted by phone (E.164) and linked to the booking. */
+  customer?: { phone: string; displayName: string };
 };
 
 export type AnswerApprovalResult =
@@ -217,7 +216,7 @@ export interface BookingStore {
   latestChallenge(bookingId: string): Promise<ChallengeRecord | null>;
   /**
    * Store a new code, unless a send limit is reached: at most limits.perPhone codes for this
-   * phoneHmac and limits.perBooking for this booking with created_at in (now − windowMs, now]. The
+   * phone and limits.perBooking for this booking with created_at in (now − windowMs, now]. The
    * count and the insert are atomic per booking and per phone (Postgres: the approval row is locked,
    * plus an advisory lock on the phone), so concurrent sends can't exceed a limit.
    */
@@ -230,7 +229,7 @@ export interface BookingStore {
   recordCodeAttempt(challengeId: string, now: Date, maxAttempts: number): Promise<number | null>;
   /**
    * The person's answer, in one transaction: (approved) consume the challenge if it's still unconsumed,
-   * upsert the customer by phoneHmac (display_name and phone_last4 updated) and link it to the booking;
+   * upsert the customer by phone (display_name updated) and link it to the booking;
    * move the booking from awaiting_approval to nextStatus only if approve_by > now (cancelled stamps
    * cancelled_at and cancelled_by "customer"); write `event`; and mark the approval decided (decision,
    * decided_at = now) only if it wasn't. Anything that doesn't match rolls everything back.
@@ -276,7 +275,7 @@ export type BookingRecord = {
   customerName: string;
   agentName: string;
   createdAt: Date;
-  /** The verified customer's phone_last4, or null if nobody has approved the booking. */
+  /** The last 4 digits of the verified customer's phone, or null if nobody has approved the booking. */
   customerPhoneLast4: string | null;
   /** The shop's IANA zone; times are shown in it. */
   timezone: string;
