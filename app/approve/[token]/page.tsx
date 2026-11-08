@@ -184,8 +184,10 @@ function PayDeposit({ view }: { view: ApprovalView }) {
   const cents = view.deposit.amountCents;
   const amount = cents % 100 === 0 ? `$${cents / 100}` : usd(cents);
   return (
-    <div className="flex flex-col gap-4">
-      <p className="font-medium">Pay the {amount} deposit to finish booking</p>
+    <div className="flex flex-col gap-4 rounded-2xl border border-primary/20 bg-accent/40 p-5 sm:p-7">
+      <p className="eyebrow text-primary">Finish your booking</p>
+      <h2 className="text-xl font-medium tracking-tight">Pay the {amount} deposit</h2>
+      <p className="text-sm leading-relaxed text-muted-foreground">Your deposit is held on your card. The cancellation rules above explain when the shop keeps it.</p>
       {view.deposit.payUrl && (
         <a
           href={view.deposit.payUrl}
@@ -199,7 +201,7 @@ function PayDeposit({ view }: { view: ApprovalView }) {
       )}
       {view.deposit.payBy && (
         <p className="text-sm text-muted-foreground">
-          Hold expires at {inShopZone(view.deposit.payBy, view.shop.timezone)}.
+          Hold expires <time dateTime={view.deposit.payBy}>{inShopZone(view.deposit.payBy, view.shop.timezone)}</time>.
         </p>
       )}
     </div>

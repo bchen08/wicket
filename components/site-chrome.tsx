@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { ArrowRight, BellRing } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -33,10 +34,10 @@ export function SiteHeader() {
             Why Front Desk
           </a>
           <Button asChild>
-            <a href="/console">
+            <Link href="/console">
               Get started{" "}
               <ArrowRight data-icon="inline-end" aria-hidden="true" />
-            </a>
+            </Link>
           </Button>
         </nav>
       </div>
