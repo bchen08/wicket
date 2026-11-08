@@ -1,12 +1,13 @@
 # Texting
 
-Front Desk can send text messages. When a text sender is configured, three things happen by text:
+Front Desk can send text messages. When a text sender is configured, four things happen by text:
 
 1. **The approval link goes to the person.** An agent that books with the person's mobile number (MCP `customer_phone`, web `phone`) gets the link texted to that number. The result says so (`texted: true`), so the agent doesn't send it again.
 2. **The owner gets every alert on their phone.** Every [owner alert](frontdesk-api.md#owner-alerts) (a new booking, or a cancellation) is also texted to the shop's `ownerMobile`. The email or log line still goes out exactly as before.
 3. **The owner can sign in with a texted code.** "Text me a code" on `/console/unlock` texts a 6-digit code to `ownerMobile`. The code opens the console, just like the access code.
+4. **Connector sign-in verifies the number.** Someone connecting an agent at `/signin` gets a 6-digit code at the number they typed, and is signed in only once they enter it. See [connector-signin.md](connector-signin.md#the-texted-code).
 
-**Without a text sender, nothing changes.** Nothing is texted. Agents send the link themselves (`texted: false`), alerts go by email or log, and the owner unlocks with the access code. `/api/status` says `"texting": "off"`, which is not a problem.
+**Without a text sender, nothing changes.** Nothing is texted. Agents send the link themselves (`texted: false`), alerts go by email or log, the owner unlocks with the access code, and `/signin` takes the number as typed. `/api/status` says `"texting": "off"`, which is not a problem.
 
 Types are in [`lib/types/texting.ts`](../lib/types/texting.ts). The code lives in [`lib/server/notify/`](../lib/server/notify) (`texting.ts`, `text-sender.ts`, `photon.ts`, `twilio.ts`, `texts.ts`) and [`lib/server/frontdesk/owner-code.ts`](../lib/server/frontdesk/owner-code.ts).
 

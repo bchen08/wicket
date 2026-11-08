@@ -1,11 +1,20 @@
 import { randomBytes } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ClientRegistrationResponse, ListMyBookingsResult, TokenResponse } from "../../types/oauth";
 import { getFrontDeskDeps } from "../frontdesk/deps";
 import { createFrontDeskMcpHandler } from "../frontdesk/mcp";
+import { recordingTexter } from "../frontdesk/test-support";
 import { withCustomerSignin } from "../identity/customer";
+import type { TextSender } from "../notify/text-sender";
 import { authorizeGet, authorizePost, corsPreflight, registerPost, tokenPost } from "./http";
 import { s256 } from "./token";
+
+// The app's deps, with a text sender when a test sets one.
+const texting = vi.hoisted(() => ({ texter: null as TextSender | null }));
+vi.mock("./deps", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./deps")>();
+  return { ...actual, getSigninDeps: (origin: string) => ({ ...actual.getSigninDeps(origin), texter: texting.texter }) };
+});
 
 // The OAuth routes as HTTP, the way a connector drives them: register (JSON), authorize (302 to /signin),
 // the /signin form (303 back with a code), the token endpoint (form-encoded), then /api/mcp with the
@@ -13,6 +22,10 @@ import { s256 } from "./token";
 
 const ORIGIN = "http://localhost:3000";
 const CALLBACK = "https://agent.example/oauth/callback";
+
+afterEach(() => {
+  texting.texter = null;
+});
 
 describe("OAuth over HTTP", () => {
   it("register → authorize → sign in → token → list_my_bookings", async () => {
@@ -94,6 +107,48 @@ describe("OAuth over HTTP", () => {
     const json = text.trimStart().startsWith("{") ? text : text.split("\n").find((l) => l.startsWith("data:"))!.slice(5);
     const result = JSON.parse(json).result as { structuredContent: ListMyBookingsResult };
     expect(result.structuredContent.customer).toEqual({ name: "Http Person", phone: "+12125550100" });
+  });
+
+  it("takes the texted code from the form where texting is on", async () => {
+    const texter = recordingTexter();
+    texting.texter = texter;
+    const reg = await registerPost(
+      new Request(`${ORIGIN}/api/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ client_name: "HTTP Agent", redirect_uris: [CALLBACK] }),
+      }),
+    );
+    const client = (await reg.json()) as ClientRegistrationResponse;
+    const params = {
+      response_type: "code",
+      client_id: client.client_id,
+      redirect_uri: CALLBACK,
+      code_challenge: s256(randomBytes(32).toString("base64url")),
+      code_challenge_method: "S256",
+      state: "s2",
+    };
+    const submit = (fields: Record<string, string>) =>
+      authorizePost(
+        new Request(`${ORIGIN}/api/oauth/authorize`, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ ...params, decision: "allow", ...fields }),
+        }),
+      );
+
+    const asked = await submit({ name: "Code Person", phone: "+1 212 555 0101" });
+    expect(asked.status).toBe(303);
+    const signin = new URL(asked.headers.get("location")!);
+    expect(signin.pathname).toBe("/signin");
+    const codeId = signin.searchParams.get("code_id")!;
+    expect(texter.sent[0].to).toBe("+12125550101");
+
+    const answer = await submit({ code_id: codeId, code: texter.sent[0].body.slice(0, 6) });
+    expect(answer.status).toBe(303);
+    const back = new URL(answer.headers.get("location")!);
+    expect(`${back.origin}${back.pathname}`).toBe(CALLBACK);
+    expect(back.searchParams.get("code")).toMatch(/^fdc_/);
   });
 
   it("answers a bad token request as an OAuth error, and CORS preflights", async () => {

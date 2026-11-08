@@ -1,9 +1,10 @@
 import { normalizeUuid } from "../frontdesk/booking-store";
 import { getPostgresClient } from "../frontdesk/postgres-store";
-import type { AuthorizationCode, Customer, OAuthClient, OAuthToken, SigninStore } from "./store";
+import type { AuthorizationCode, Customer, OAuthClient, OAuthToken, SigninCode, SigninStore } from "./store";
 
-// Postgres SigninStore (postgres.js) for supabase/migrations/0008_signin.sql: customers, oauth_clients,
-// oauth_codes and oauth_tokens. Shares the booking store's client (one per DATABASE_URL).
+// Postgres SigninStore (postgres.js) for supabase/migrations/0008_signin.sql and 0010_signin_codes.sql:
+// customers, oauth_clients, oauth_codes, signin_codes and oauth_tokens. Shares the booking store's client
+// (one per DATABASE_URL).
 
 type CustomerRow = { id: string; shop_slug: string; name: string; phone: string };
 
@@ -25,6 +26,15 @@ type CodeRow = {
   code_challenge: string;
   scope: string;
   resource: string | null;
+  expires_at: Date;
+};
+
+type SigninCodeRow = {
+  id: string;
+  shop_slug: string;
+  code: string;
+  phone: string;
+  name: string;
   expires_at: Date;
 };
 
@@ -50,6 +60,15 @@ const toCode = (r: CodeRow): AuthorizationCode => ({
   codeChallenge: r.code_challenge,
   scope: r.scope,
   resource: r.resource,
+  expiresAt: r.expires_at,
+});
+
+const toSigninCode = (r: SigninCodeRow): SigninCode => ({
+  id: r.id,
+  shopSlug: r.shop_slug,
+  code: r.code,
+  phone: r.phone,
+  name: r.name,
   expiresAt: r.expires_at,
 });
 
@@ -139,6 +158,40 @@ export function createPostgresSigninStore(url: string): SigninStore {
                   scope, resource, expires_at
       `;
       return rows[0] ? toCode(rows[0]) : null;
+    },
+
+    async createSigninCode(c) {
+      const rows = await db<SigninCodeRow[]>`
+        insert into signin_codes (shop_slug, code, phone, name, expires_at)
+        values (${c.shopSlug}, ${c.code}, ${c.phone}, ${c.name}, ${c.expiresAt.toISOString()}::timestamptz)
+        returning id::text as id, shop_slug, code, phone, name, expires_at
+      `;
+      if (!rows[0]) throw new Error("Insert into signin_codes returned no row.");
+      return toSigninCode(rows[0]);
+    },
+
+    async getSigninCode(id, now) {
+      const key = normalizeUuid(id);
+      if (key === null) return null;
+      const rows = await db<SigninCodeRow[]>`
+        select id::text as id, shop_slug, code, phone, name, expires_at
+        from signin_codes
+        where id = ${key}::uuid and used_at is null and expires_at > ${now.toISOString()}::timestamptz
+      `;
+      return rows[0] ? toSigninCode(rows[0]) : null;
+    },
+
+    async useSigninCode(id, code, now) {
+      const key = normalizeUuid(id);
+      if (key === null) return null;
+      // One statement: only the right, unused, unexpired code is marked used, so it can be entered once.
+      const rows = await db<SigninCodeRow[]>`
+        update signin_codes set used_at = ${now.toISOString()}::timestamptz
+        where id = ${key}::uuid and code = ${code} and used_at is null
+          and expires_at > ${now.toISOString()}::timestamptz
+        returning id::text as id, shop_slug, code, phone, name, expires_at
+      `;
+      return rows[0] ? toSigninCode(rows[0]) : null;
     },
 
     async createTokens(tokens) {

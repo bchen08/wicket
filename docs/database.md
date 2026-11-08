@@ -13,6 +13,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 | [`supabase/migrations/0007_texting.sql`](../supabase/migrations/0007_texting.sql) | Texting: `policies.owner_mobile`, the `text` alert channel, and the `owner_codes` table (the owner's texted sign-in codes). Additive only. See [texting.md](texting.md#database-0007_textingsql). |
 | [`supabase/migrations/0008_signin.sql`](../supabase/migrations/0008_signin.sql) | Connector sign-in: `customers` (one per shop and phone), `bookings.customer_id`, and the OAuth tables `oauth_clients`, `oauth_codes`, `oauth_tokens`. See [connector-signin.md](connector-signin.md#database-0008_signinsql). |
 | [`supabase/migrations/0009_agents.sql`](../supabase/migrations/0009_agents.sql) | Agent identity (PAP 0.4): the `agents` table and `bookings.agent_client_id`. See [agent-identity.md](agent-identity.md). |
+| [`supabase/migrations/0010_signin_codes.sql`](../supabase/migrations/0010_signin_codes.sql) | Connector sign-in's texted codes: the `signin_codes` table. See [connector-signin.md](connector-signin.md#the-texted-code). |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -38,6 +39,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 - `agents (client_id pk, name, first_seen, last_seen)` (0009): one row per PAP agent whose `Poppy-Session` verified. `name` is its latest `client_name`, and `last_seen` is its latest verified request. The owner reads them with `GET /api/shops/[shop]/agents` ([agent-identity.md](agent-identity.md)).
 - `idempotency_keys`: from 0002, unused since the MVP reset, dropped by 0004.
 - `customers (id, shop_slug, name, phone, created_at, updated_at)`, unique `(shop_slug, phone)`, and `bookings.customer_id`: the person an agent signed in as (connector sign-in), null for bookings made without sign-in. `oauth_clients`, `oauth_codes` and `oauth_tokens` hold connector sign-in's clients, codes and tokens, stored as they are. See [connector-signin.md](connector-signin.md).
+- `signin_codes (id, shop_slug, code, phone, name, expires_at, used_at, created_at)` (0010): 6-digit codes texted at `/signin` where texting is on. Valid until `expires_at` (10 minutes), once: `used_at` is set when one is entered. Stored as they are.
 
 Double booking is impossible at the database level:
 
@@ -191,6 +193,10 @@ The code already deployed tolerates it, because it never reads the new column or
 ### Agent identity: applying 0009
 
 `0009_agents.sql` is applied like any other migration. It adds the `agents` table (RLS on, no policies) and the nullable `bookings.agent_client_id`, and seeds nothing; see [agent-identity.md](agent-identity.md). The code already deployed never reads either. The new code reads and writes `agent_client_id` on every booking, so if it's deployed before the integration has applied 0009, `/api/status` says `outdated` (missing `agents` and `bookings.agent_client_id`) and booking fails until the migration lands, as with 0005.
+
+### Connector sign-in's texted codes: applying 0010
+
+`0010_signin_codes.sql` is applied like any other migration. It adds the `signin_codes` table (RLS on, no policies) and seeds nothing. The code already deployed never reads it. Where texting is off, the new code never reads it either, but `/api/status` says `outdated` (missing `signin_codes`) until the migration lands. Where texting is on, Allow on `/signin` answers an error page until then, so apply it before deploying.
 
 ### 2. Get the connection string: use the transaction pooler
 

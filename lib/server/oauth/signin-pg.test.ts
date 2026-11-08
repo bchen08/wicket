@@ -60,6 +60,7 @@ if (!url) {
       await sql`delete from bookings where shop_slug = ${shop}`;
       await sql`delete from oauth_tokens where shop_slug = ${shop}`;
       await sql`delete from oauth_codes where shop_slug = ${shop}`;
+      await sql`delete from signin_codes where shop_slug = ${shop}`;
       await sql`delete from oauth_clients where shop_slug = ${shop}`;
       await sql`delete from customers where shop_slug = ${shop}`;
       await sql`delete from shops where slug = ${shop}`;
@@ -74,6 +75,28 @@ if (!url) {
       expect(await signin.getCustomer("not-a-uuid")).toBeNull();
       const other = await signin.upsertCustomer(shop, phone(2), "Lee");
       expect(other.id).not.toBe(first.id);
+    });
+
+    it("keeps a texted code until the right one is entered, once, and only in time", async () => {
+      const at = new Date("2026-11-09T17:00:00Z");
+      const expiresAt = new Date(at.getTime() + 600_000);
+      const input = { shopSlug: shop, code: "042917", phone: phone(4), name: "Texted Person", expiresAt };
+      const stored = await signin.createSigninCode(input);
+      expect(stored).toEqual({ ...input, id: expect.any(String) });
+
+      expect(await signin.getSigninCode(stored.id, at)).toEqual(stored);
+      expect(await signin.getSigninCode("not-a-uuid", at)).toBeNull();
+      expect(await signin.getSigninCode(stored.id, expiresAt)).toBeNull();
+
+      expect(await signin.useSigninCode(stored.id, "111111", at)).toBeNull();
+      expect(await signin.useSigninCode("not-a-uuid", "042917", at)).toBeNull();
+      expect(await signin.useSigninCode(stored.id, "042917", expiresAt)).toBeNull();
+
+      // Still good after those: of two at once, one gets it, and then it's gone.
+      const [a, b] = await Promise.all([signin.useSigninCode(stored.id, "042917", at), signin.useSigninCode(stored.id, "042917", at)]);
+      expect([a, b].filter(Boolean)).toEqual([stored]);
+      expect(await signin.useSigninCode(stored.id, "042917", at)).toBeNull();
+      expect(await signin.getSigninCode(stored.id, at)).toBeNull();
     });
 
     it("stores clients, a code that can be used once, and tokens with their customer", async () => {

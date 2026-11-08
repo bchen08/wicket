@@ -87,7 +87,7 @@ export async function authorizeGet(request: Request): Promise<Response> {
   }
 }
 
-/** POST /api/oauth/authorize: the /signin form (Allow or Deny). */
+/** POST /api/oauth/authorize: the /signin form (Allow or Deny, and the texted code where texting is on). */
 export async function authorizePost(request: Request): Promise<Response> {
   try {
     const fields = await readFields(request);
@@ -96,6 +96,8 @@ export async function authorizePost(request: Request): Promise<Response> {
       decision: fields.decision ?? "",
       name: fields.name,
       phone: fields.phone,
+      codeId: fields.code_id,
+      code: fields.code,
     });
     return authorizeAnswer(answer);
   } catch (err) {

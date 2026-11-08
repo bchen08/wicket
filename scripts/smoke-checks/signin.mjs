@@ -10,7 +10,8 @@
 //   S5 sign in as a test client: register → authorize → the /signin form → code → tokens (PKCE)
 //   S6 signed in, book without customer_name books as the customer; list_my_bookings lists it; cancel it
 //   S7 the refresh token gets a new access token that works
-// The booking S6 makes is cancelled, even after a failure. S6 is SKIPPED where texting is on (it would text a number).
+// The booking S6 makes is cancelled, even after a failure. S5–S7 are SKIPPED where texting is on: signing in
+// would text a number and wait for the code.
 
 import { createHash, randomBytes } from "node:crypto";
 
@@ -143,6 +144,7 @@ export default async function signin(ctx) {
   const session = {};
 
   await check("S5", "Sign in as a test client (register → authorize → /signin → tokens)", async () => {
+    if (texting) return { skipped: `texting is ${status.texting}: signing in would text the number and wait for the code` };
     const reg = await client.request("/api/oauth/register", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -202,8 +204,8 @@ export default async function signin(ctx) {
   });
 
   await check("S6", "Signed in: book without a name books as the customer; list_my_bookings; cancel", async () => {
-    if (!session.access) return { skipped: "S5 didn't sign in" };
     if (texting) return { skipped: `texting is ${status.texting}: a signed-in booking would text the customer's number` };
+    if (!session.access) return { skipped: "S5 didn't sign in" };
     const from = now() + 3 * 60 * 60 * 1000;
     const avail = await callTool("get_availability", {
       service_id: "beard-trim",

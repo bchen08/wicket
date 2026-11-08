@@ -76,6 +76,8 @@ export const REQUIRED_SCHEMA = {
     "used_at",
   ],
   oauth_tokens: ["token", "kind", "shop_slug", "client_id", "customer_id", "scope", "resource", "expires_at"],
+  // The code texted at /signin (0010_signin_codes.sql).
+  signin_codes: ["id", "shop_slug", "code", "phone", "name", "expires_at", "used_at"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type RequiredTable = keyof typeof REQUIRED_SCHEMA;

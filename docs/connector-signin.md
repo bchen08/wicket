@@ -4,15 +4,18 @@ People connect Front Desk to Claude or ChatGPT once and sign in with their name 
 
 Front Desk is the OAuth 2.1 authorization server for its own MCP endpoint (`<origin>/api/mcp`), following the [MCP authorization spec](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) (2026-07-28) and Claude's [lazy authentication](https://claude.com/docs/connectors/building/lazy-authentication) pattern. Every deployment (each preview, production) is its own issuer, built from the request's origin, with no setting.
 
-MVP: nothing here is hashed or rate-limited, and the phone number isn't verified yet (`TODO(ring-2)`: a texted code once texting lands). See [Security not built](#security-not-built).
+The phone number is verified with a [texted code](#the-texted-code) on deployments where [texting](texting.md) is on. Where it's off, the number is taken as typed.
+
+MVP: nothing here is hashed or rate-limited. See [Security not built](#security-not-built).
 
 ## What a person sees
 
 1. **Claude:** Customize → Connectors → **Add custom connector**, URL `https://<deployment>/api/mcp`. **ChatGPT** (developer mode): create a connector with that URL and Authentication **OAuth**.
 2. The agent asks to sign in, either right away (ChatGPT, or Claude's **Sign in now**) or as an inline **Connect** card the first time it needs the person (Claude's default: see [The gate](#the-gate)).
 3. The sign-in page, `/signin`, says which agent wants access to Hart's Barbers and from where (e.g. "Claude (claude.ai)"), and asks for their **name** and **mobile number**, with **Allow** and **Deny**. A US number can be typed the local way (`401 555 0123`); others need `+` and the country code.
-4. Allow → back to the agent, signed in. "Book me a haircut Wednesday morning" books under their name and number. They still approve every booking with the link `book` returns.
-5. "What appointments do I have at Hart's?" → `list_my_bookings`. "Cancel the Wednesday one" → `cancel` with that booking's id.
+4. **Where texting is on:** Allow texts a 6-digit code to that number, and `/signin` asks for it. Entering it (Allow again) finishes the sign-in. Where texting is off there is no code.
+5. Back to the agent, signed in. "Book me a haircut Wednesday morning" books under their name and number. They still approve every booking with the link `book` returns.
+6. "What appointments do I have at Hart's?" → `list_my_bookings`. "Cancel the Wednesday one" → `cancel` with that booking's id.
 
 The customer is found or created by **(shop, phone)**: signing in again with the same number, from any agent, is the same customer (with the newest name).
 
@@ -61,6 +64,24 @@ Redirect URIs match exactly, except loopback `http` URIs (`localhost`, `127.0.0.
 
 An unknown client, a metadata document that can't be read, or a redirect URI the client didn't declare is shown to the person as an error page (400) and never redirected. A wrong `response_type` or a missing PKCE `S256` challenge goes back to the redirect URI as an OAuth error (`unsupported_response_type`, `invalid_request`), with `state` and `iss`.
 
+### The texted code
+
+Only where texting is on (`deps.texter`: Photon or Twilio, see [texting.md](texting.md#which-sender)). Where it's off, the form signs in straight away, as it always did.
+
+1. The first `POST /api/oauth/authorize` (`name`, `phone`, `decision=allow`) checks the name and number, stores a row in `signin_codes` with a random 6-digit code, the number and the name, and texts `042917 is your code to sign in to Hart's Barbers on Front Desk. It works once, for 10 minutes.` Nothing happens to the customer, and no authorization code exists yet. It answers 303 to `/signin?…&code_id=<id>`. The id is opaque, so nothing personal is in the URL.
+2. `/signin` with a live `code_id` shows one field for the code and where it went (`SigninView.textedCode`, e.g. `•••• 0123`).
+3. The second `POST` (`code_id`, `code`, `decision=allow`) enters the code, in one `UPDATE … WHERE id = … AND code = … AND used_at IS NULL AND expires_at > now`, so it works once. Only then is the customer found or created, with the number and name stored in step 1 (never the form's), and the person goes back to the client with an authorization code. Spaces in the code are ignored.
+
+A post that goes wrong returns to `/signin`, with `?error=`:
+
+| `error` | When | What the page does |
+|---|---|---|
+| `send_failed` | The provider refused the text. Its message goes to the log (`oauth.signin_code_text_failed`), and nobody is signed in. | Asks for the name and number again |
+| `invalid_code` | The code isn't the one texted. It isn't used up. | Keeps asking for the code |
+| `code_expired` | The code is more than 10 minutes old or was already used, or `code_id` is unknown. | Asks for the name and number again, for a new code |
+
+Photon's shared lines can only text someone who has texted them first ([texting.md](texting.md)), so a deployment on a shared line answers `send_failed` for everyone else. Connector sign-in needs a dedicated line or Twilio.
+
 ### Codes and tokens
 
 - **Authorization code:** `fdc_…`, 10 minutes, exchanged once (a failed exchange uses it up too). The exchange checks the PKCE verifier against the stored S256 challenge, and, when sent, that `client_id` and `redirect_uri` match.
@@ -74,13 +95,15 @@ Everything carries `shop_slug`. Today there is one issuer, for `harts` (`SIGNIN_
 
 Additive: four new tables (RLS on, no policies) and one nullable column.
 
-- `customers (id, shop_slug, name, phone, created_at, updated_at)`, unique `(shop_slug, phone)`. `phone` is E.164, unverified.
+- `customers (id, shop_slug, name, phone, created_at, updated_at)`, unique `(shop_slug, phone)`. `phone` is E.164, verified with a texted code where texting is on and as typed where it's off.
 - `bookings.customer_id` → `customers`, null for bookings made without sign-in. Indexed for `list_my_bookings`.
 - `oauth_clients (shop_slug, client_id, kind cimd|registered, client_name, redirect_uris jsonb, fetched_at, created_at)`.
 - `oauth_codes (code, shop_slug, client_id, customer_id, redirect_uri, code_challenge, scope, resource, expires_at, used_at, created_at)`.
 - `oauth_tokens (token, kind access|refresh, shop_slug, client_id, customer_id, scope, resource, expires_at, created_at)`.
 
 Codes, tokens and client records are stored as they are (MVP rule). `/api/status` lists the new tables and `bookings.customer_id` in its schema check, so a database without 0008 shows `"schema": "outdated"`. **Apply 0008 before deploying this code:** `book` writes `customer_id` on every booking. Without `DATABASE_URL` (local `pnpm dev`) sign-ins live in memory and are lost on restart, like the demo bookings.
+
+`0010_signin_codes.sql` adds `signin_codes (id, shop_slug, code, phone, name, expires_at, used_at, created_at)`, RLS on, no policies: the [texted codes](#the-texted-code) waiting to be entered. Where texting is on, `/signin` needs it.
 
 ## Try it locally
 
@@ -94,7 +117,7 @@ curl -si localhost:3000/api/mcp -H 'content-type: application/json' -H 'accept: 
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_my_bookings","arguments":{}}}'
 ```
 
-The whole flow from a terminal: `pnpm smoke http://localhost:3000` runs S1–S7 ([SMOKE.md](../SMOKE.md#connector-sign-in-claude-and-chatgpt-connectors)), which register a client, sign in through `/signin`'s form, exchange the code, book without a name, list, cancel and refresh. MCP Inspector (`npx @modelcontextprotocol/inspector`) can sign in interactively too: connect to `http://localhost:3000/api/mcp` and use its auth flow.
+The whole flow from a terminal: `pnpm smoke http://localhost:3000` runs S1–S7 ([SMOKE.md](../SMOKE.md#connector-sign-in-claude-and-chatgpt-connectors)), which register a client, sign in through `/signin`'s form, exchange the code, book without a name, list, cancel and refresh. Where texting is on, S5–S7 are skipped, because signing in needs a code from a real phone. MCP Inspector (`npx @modelcontextprotocol/inspector`) can sign in interactively too: connect to `http://localhost:3000/api/mcp` and use its auth flow.
 
 A Claude connector needs a public HTTPS URL: a preview (with a Vercel bypass link) or a tunnel to `pnpm dev`.
 
@@ -102,7 +125,9 @@ A Claude connector needs a public HTTPS URL: a preview (with a Vercel bypass lin
 
 MVP rule: none of this is built; each is a line in the PR's "Security not built".
 
-- The mobile number isn't verified: anyone who types a number signs in as that number's customer and sees and cancels their bookings. `TODO(ring-2)`: a texted code once texting lands.
+- Where texting is off, the mobile number isn't verified: anyone who types a number signs in as that number's customer and sees and cancels their bookings.
+- Texted codes have no attempt limit or lockout: six digits for ten minutes can be guessed by a determined script, which signs in as that number's customer.
+- No limit on texting codes: anyone can make `/signin` text any number, as often as they like, which spends provider credit and could annoy the person.
 - Tokens, codes and client records are stored in plain text.
 - Refresh tokens aren't rotated, and nothing revokes tokens (no sign-out).
 - No rate limits on sign-in, registration or the token endpoint.
