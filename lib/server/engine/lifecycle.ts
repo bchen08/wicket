@@ -12,12 +12,16 @@ import { parseRfc3339 } from "../frontdesk/time";
 /**
  * What can be done to an existing booking. Agents may only cancel; owners may cancel, complete and
  * mark a no-show; the person (actor "customer") approves or declines; "system" expires a lapsed hold
- * or an unpaid deposit, and confirms a booking whose deposit was paid ("confirm_deposit").
+ * or an unpaid deposit, confirms a booking whose deposit was paid ("confirm_deposit"), and completes a
+ * past appointment the owner didn't mark (the nightly tidy-up, lib/server/frontdesk/nightly.ts).
  * Placing a booking is the "book" action, decided by the first overload of decide().
  */
 export type LifecycleAction = "cancel" | "complete" | "mark_no_show" | "approve" | "decline" | "expire" | "confirm_deposit";
 
-/** The actions an agent or the owner takes on a booking (the cancel tool and the owner routes). */
+/**
+ * The actions an agent or the owner takes on a booking (the cancel tool and the owner routes), and the
+ * one the system takes on a past appointment (complete, the nightly tidy-up).
+ */
 export type ManageAction = "cancel" | "complete" | "mark_no_show";
 
 /** Who is acting. "customer" is the person answering through the approval link. */
@@ -120,7 +124,7 @@ const ACTOR_ACTIONS: Record<LifecycleActor, readonly LifecycleAction[]> = {
   agent: ["cancel"],
   owner: ["cancel", "complete", "mark_no_show"],
   customer: ["approve", "decline"],
-  system: ["expire", "confirm_deposit"],
+  system: ["expire", "confirm_deposit", "complete"],
 };
 
 const OWNER_FINAL_NEXT = "Don't retry: this booking is final and can't change any more. Reload it to see its current status and history.";
@@ -231,6 +235,14 @@ function notYourAction(booking: DecideBooking, type: LifecycleAction, actor: Lif
       type,
       "A booking awaiting its deposit is confirmed when the person pays it.",
       "Don't retry. Send the person the approval link: its page has the Pay button.",
+    );
+  }
+  if (actor === "system") {
+    return invalidAction(
+      booking,
+      type,
+      `Front Desk doesn't ${type === "cancel" ? "cancel bookings" : "mark no-shows"} on its own.`,
+      "Don't retry: only the shop or the person's agent can do that.",
     );
   }
   return invalidAction(
@@ -386,13 +398,15 @@ export function decide(proposal: BookProposal, action: { type: "book"; actor: "a
  * | owner    | cancel       | awaiting_deposit/confirmed | before start                         | cancelled | released |
  * | owner    | cancel       | awaiting_deposit/confirmed | after start                          | invalid_request      |
  * | owner    | complete     | confirmed                  | after start                          | completed | released |
+ * | system   | complete     | confirmed                  | after start (the nightly tidy-up)    | completed | released |
  * | owner    | mark_no_show | confirmed                  | after start                          | no_show   | captured |
  * | owner    | complete / mark_no_show | confirmed       | before start                         | invalid_request      |
  * | owner    | complete / mark_no_show | awaiting_approval / awaiting_deposit | any time       | invalid_request      |
+ * | system   | complete     | confirmed before start, awaiting_approval / awaiting_deposit | any time | invalid_request |
  * | agent    | any          | cancelled/expired/completed/no_show | any time                    | not_cancellable      |
- * | owner    | any          | cancelled/expired/completed/no_show | any time                    | invalid_request      |
+ * | owner / system | any    | cancelled/expired/completed/no_show | any time                    | invalid_request      |
  * | any      | an action not in its list (agent: cancel; owner: cancel, complete, mark_no_show;  | invalid_request      |
- * |          | customer: approve, decline; system: expire, confirm_deposit) | any status | any time |              |
+ * |          | customer: approve, decline; system: expire, confirm_deposit, complete) | any status | any time |    |
  *
  * A booking with depositCents 0 always gets depositEffect "none" instead of released/captured. No money
  * moves during a hold (released: the person keeps everything). depositRequired comes from needsDeposit()
@@ -470,7 +484,8 @@ export function decide(
     return { nextStatus: "cancelled", depositEffect: depositEffect(booking, "released") };
   }
 
-  // complete / mark_no_show, by the owner, from awaiting_approval, awaiting_deposit or confirmed.
+  // complete / mark_no_show by the owner, or complete by the system (the nightly tidy-up), from
+  // awaiting_approval, awaiting_deposit or confirmed. The same rules for both.
   if (booking.status !== "confirmed") {
     const next =
       booking.status === "awaiting_approval"

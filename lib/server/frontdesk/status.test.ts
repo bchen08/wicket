@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { StatusResponse } from "../../types/frontdesk";
+import type { NightlyRun, StatusResponse } from "../../types/frontdesk";
 import { createMemoryStore } from "./memory-store";
 import { REQUIRED_SCHEMA, REQUIRED_TABLES, type PresentColumn } from "./schema";
 import { getStatus, redact, statusResponse, type DatabaseProbe, type StatusOptions } from "./status";
@@ -27,11 +27,15 @@ const previewEnv = (extra: Record<string, string | undefined> = {}) => ({
   ...extra,
 });
 
-/** A stub Postgres: these columns exist, and the shop "harts" has this name (null: no row). */
-function database(columns: PresentColumn[], shopName: string | null = PREVIEW_SHOP): StatusOptions {
+/**
+ * A stub Postgres: these columns exist, the shop "harts" has this name (null: no row), and the nightly
+ * tidy-up's newest run is `lastRun` (null: it never ran).
+ */
+function database(columns: PresentColumn[], shopName: string | null = PREVIEW_SHOP, lastRun: NightlyRun | null = null): StatusOptions {
   const probe: DatabaseProbe = {
     columns: async (tables) => columns.filter((c) => tables.includes(c.table)),
     shopName: async (slug) => (slug === "harts" ? shopName : null),
+    lastNightlyRun: async () => lastRun,
   };
   return { probe: () => probe };
 }
@@ -41,13 +45,18 @@ function failingDatabase(err: unknown): StatusOptions {
   const probe: DatabaseProbe = {
     columns: () => Promise.reject(err),
     shopName: () => Promise.reject(err),
+    lastNightlyRun: () => Promise.reject(err),
   };
   return { probe: () => probe };
 }
 
 const memoryOptions: StatusOptions = {
   memoryShopName: async (slug) => (await createMemoryStore().getShop(slug))?.name ?? null,
+  memoryLastNightlyRun: () => createMemoryStore().lastNightlyRun(),
 };
+
+/** A run of the nightly tidy-up, as the probe returns it. */
+const LAST_RUN: NightlyRun = { ranAt: "2026-11-10T08:00:04.512Z", expired: 2, completed: 5, depositsReleased: 3, failures: 1 };
 
 describe("GET /api/status", () => {
   it("in memory mode (pnpm dev without DATABASE_URL) is ready and allows writes", async () => {
@@ -68,6 +77,7 @@ describe("GET /api/status", () => {
       deposits: "off",
       approvalLinks: { origin: "http://localhost:3000" },
       alerts: "log",
+      lastNightlyRun: null,
       problems: [],
     });
   });
@@ -90,8 +100,37 @@ describe("GET /api/status", () => {
       deposits: "off",
       approvalLinks: { origin: ORIGIN },
       alerts: "log",
+      lastNightlyRun: null,
       problems: [],
     });
+  });
+
+  it("shows the nightly tidy-up's last run, which is never a problem", async () => {
+    const status = await getStatus(previewEnv(), ORIGIN, database(CURRENT, PREVIEW_SHOP, LAST_RUN));
+    expect(status.lastNightlyRun).toEqual(LAST_RUN);
+    expect(status.status).toBe("ready");
+
+    const memoryStore = createMemoryStore();
+    const run = await memoryStore.recordNightlyRun({ expired: 0, completed: 1, depositsReleased: 1, failures: 0 });
+    const memory = await getStatus({ OWNER_API_TOKEN: "t" }, ORIGIN, { ...memoryOptions, memoryLastNightlyRun: () => memoryStore.lastNightlyRun() });
+    expect(memory.lastNightlyRun).toEqual(run);
+  });
+
+  it("lastNightlyRun is null, not a second problem, when nightly_runs is missing (0006 not applied) or can't be read", async () => {
+    const without = CURRENT.filter((c) => c.table !== "nightly_runs");
+    const outdated = await getStatus(previewEnv(), ORIGIN, database(without, PREVIEW_SHOP, LAST_RUN));
+    expect(outdated.lastNightlyRun).toBeNull();
+    expect(outdated.database.missing).toEqual(["nightly_runs"]);
+    expect(outdated.problems).toHaveLength(1);
+
+    const probe: DatabaseProbe = {
+      columns: async (tables) => CURRENT.filter((c) => tables.includes(c.table)),
+      shopName: async () => PREVIEW_SHOP,
+      lastNightlyRun: () => Promise.reject(new Error(`relation "nightly_runs" does not exist ${DATABASE_URL}`)),
+    };
+    const failing = await getStatus(previewEnv(), ORIGIN, { probe: () => probe });
+    expect(failing.lastNightlyRun).toBeNull();
+    expect(failing.status).toBe("ready");
   });
 
   it("reports an unreachable database without leaking the connection string or its password", async () => {
@@ -119,7 +158,11 @@ describe("GET /api/status", () => {
   });
 
   it("counts a database that doesn't answer in time as unreachable", async () => {
-    const probe: DatabaseProbe = { columns: () => new Promise(() => {}), shopName: () => new Promise(() => {}) };
+    const probe: DatabaseProbe = {
+      columns: () => new Promise(() => {}),
+      shopName: () => new Promise(() => {}),
+      lastNightlyRun: () => new Promise(() => {}),
+    };
     const status = await getStatus(previewEnv(), ORIGIN, { probe: () => probe, timeoutMs: 20 });
     expect(status.database.reachable).toBe(false);
     expect(status.problems[0]).toMatch(/no answer within 0\.02 s/);

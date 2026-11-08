@@ -451,7 +451,7 @@ describe("deposits off (no STRIPE_SECRET_KEY): everything still books", () => {
   });
 
   it("/api/status says deposits off or stripe_test, and off is not a problem", async () => {
-    const memory = { memoryShopName: async () => "Hart's Barbers" };
+    const memory = { memoryShopName: async () => "Hart's Barbers", memoryLastNightlyRun: async () => null };
     const off = await getStatus({ OWNER_API_TOKEN: "t" }, TEST_BASE_URL, memory);
     expect(off).toMatchObject({ status: "ready", deposits: "off", problems: [] });
     const on = await getStatus({ OWNER_API_TOKEN: "t", STRIPE_SECRET_KEY: "sk_test_123" }, TEST_BASE_URL, memory);

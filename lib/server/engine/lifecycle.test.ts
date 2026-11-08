@@ -166,6 +166,31 @@ const TABLE: Row[] = [
     expected: { error: "invalid_request" },
   },
   {
+    // The nightly tidy-up: the same rule as the owner's complete.
+    label: "system | complete | confirmed | after start → completed, released",
+    actor: "system",
+    actions: ["complete"],
+    statuses: ["confirmed"],
+    nows: [AT_START, AFTER_START],
+    expected: { nextStatus: "completed", depositEffect: "released" },
+  },
+  {
+    label: "system | complete | confirmed before start, awaiting_approval / awaiting_deposit, or final → invalid_request",
+    actor: "system",
+    actions: ["complete"],
+    statuses: ALL_STATUSES.filter((s) => s !== "confirmed"),
+    nows: ANY_TIME,
+    expected: { error: "invalid_request" },
+  },
+  {
+    label: "system | complete | confirmed | before start → invalid_request",
+    actor: "system",
+    actions: ["complete"],
+    statuses: ["confirmed"],
+    nows: [WELL_BEFORE, INSIDE_WINDOW, at(-1)],
+    expected: { error: "invalid_request" },
+  },
+  {
     // An agent's only action is cancel; complete / mark_no_show from any status is the last row.
     label: "agent | any | cancelled/expired/completed/no_show | any time → not_cancellable",
     actor: "agent",
@@ -205,6 +230,7 @@ const ALLOWED: [string, BookingStatus, LifecycleActor, LifecycleAction, Date, Bo
   ["owner cancels awaiting_deposit", "awaiting_deposit", "owner", "cancel", INSIDE_WINDOW, "cancelled"],
   ["owner cancels confirmed", "confirmed", "owner", "cancel", INSIDE_WINDOW, "cancelled"],
   ["owner completes confirmed", "confirmed", "owner", "complete", AFTER_START, "completed"],
+  ["system completes a past confirmed booking", "confirmed", "system", "complete", AFTER_START, "completed"],
   ["owner marks confirmed a no-show", "confirmed", "owner", "mark_no_show", AFTER_START, "no_show"],
 ];
 
@@ -479,7 +505,7 @@ describe("decide: each actor may take only its own actions", () => {
     agent: ["cancel"],
     owner: ["cancel", "complete", "mark_no_show"],
     customer: ["approve", "decline"],
-    system: ["expire", "confirm_deposit"],
+    system: ["expire", "confirm_deposit", "complete"],
   };
 
   it("anything else is invalid_request, whatever the status and time, with plain words and a next_action", () => {

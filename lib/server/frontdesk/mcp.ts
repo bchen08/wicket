@@ -265,7 +265,6 @@ const bookingSchema = z.object({
   customer: z.object({
     displayName: z.string(),
     approved: z.boolean().describe("true once the person tapped Approve on the approval link."),
-    verified: z.boolean().describe("Deprecated: the same as approved. Read approved."),
     phone: z.string().optional().describe("The phone number the person gave when approving (E.164), if any."),
   }),
   agent: z.object({ name: z.string().describe("Best-effort label for the booking agent: the client's self-reported name.") }),

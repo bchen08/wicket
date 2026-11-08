@@ -311,7 +311,7 @@ Booking id: bd3db26a-83b1-403c-b923-357982915d3c. Don't book this time again whi
     "end": "2026-11-14T15:00:00-05:00",
     "display": "Sat 14 Nov, 2:30 pm EST",
     "status": "awaiting_approval",
-    "customer": { "displayName": "Maya", "approved": false, "verified": false },
+    "customer": { "displayName": "Maya", "approved": false },
     "agent": { "name": "unknown agent" },
     "depositCents": 1000,
     "createdAt": "2026-11-10T11:00:00-05:00",
@@ -324,8 +324,6 @@ Booking id: bd3db26a-83b1-403c-b923-357982915d3c. Don't book this time again whi
 ```
 
 This example ran with the clock frozen at Tue 10 Nov, 11:00 am. With Postgres, `createdAt` is the database's real time; `approval.expiresAt` always follows Front Desk's clock. The link's origin is the origin of the request the agent made to `/api/mcp`, so it works on previews and in production with no setting.
-
-Every `Booking` also carries `customer.verified`: a deprecated copy of `customer.approved`, kept for one release until the console reads `approved`. The other examples on this page leave it out.
 
 **How it decides:**
 1. It checks the arguments, the mandate included (`invalid_request`).
@@ -588,7 +586,7 @@ The agent (`cancel`) or the owner can drop a hold at any time; the link then sho
 
 ### Lazy expiry
 
-There's no background job yet (`TODO(ring-2)`). A hold past its deadline expires the next time something touches it, in the same transaction as that read or write, with one `expired` event (actor `system`):
+Once a day the [nightly tidy-up](nightly.md) expires every hold past its deadline, even one nobody reads. In between, a hold past its deadline expires the next time something touches it, in the same transaction as that read or write, with one `expired` event (actor `system`):
 - `book` expires lapsed holds around its start before inserting, so **a stale hold never blocks a new booking**;
 - `get_booking`, `cancel`, the owner's booking routes and the approval routes expire the booking they read;
 - the owner's `GET /api/shops/[shop]/bookings` expires lapsed holds in its range before listing;
@@ -730,7 +728,7 @@ One pure function, `decide()` in [`lib/server/engine/lifecycle.ts`](../lib/serve
 | customer | `POST …/decline` | `awaiting_approval` | before `approveBy` | `cancelled` | `released` |
 | customer | approve or decline | `awaiting_approval` past `approveBy`, or `expired` | any time | `approval_expired` | |
 | customer | approve or decline | any other status | any time | `approval_closed` | |
-| system | lazy expiry | `awaiting_approval` | at or after `approveBy` | `expired` | `released` |
+| system | lazy expiry, or the [nightly tidy-up](nightly.md) | `awaiting_approval` | at or after `approveBy` | `expired` | `released` |
 | agent | `cancel` tool | `awaiting_approval` | any time | `cancelled` | `released` |
 | owner | `POST …/cancel` | `awaiting_approval` | any time | `cancelled` | `released` |
 | owner | complete or no-show | `awaiting_approval` | any time | `invalid_request` | |
@@ -742,13 +740,14 @@ One pure function, `decide()` in [`lib/server/engine/lifecycle.ts`](../lib/serve
 | owner | `POST …/cancel` | `awaiting_deposit` or `confirmed` | before the start | `cancelled` | `released` |
 | owner | `POST …/cancel` | `awaiting_deposit` or `confirmed` | after the start | `invalid_request` | |
 | owner | `POST …/complete` | `confirmed` | after the start | `completed` | `released` |
+| system | the [nightly tidy-up](nightly.md) | `confirmed` | ended more than 3 hours ago | `completed` | `released` |
 | owner | `POST …/no-show` | `confirmed` | after the start | `no_show` | `captured` |
 | owner | complete or no-show | `confirmed` | before the start | `invalid_request` | |
 | owner | complete or no-show | `awaiting_deposit` | any time | `invalid_request` | |
 | owner | any | a final status | any time | `invalid_request` | |
 
 - A booking with `depositCents: 0` always gets `depositEffect: "none"` instead of `released` or `captured`. During a hold no money is involved, so dropping it releases (the person keeps everything).
-- Each actor may only take its own actions (agent: cancel; owner: cancel, complete, no-show; customer: approve, decline; system: expire). Anything else is `invalid_request`.
+- Each actor may only take its own actions (agent: cancel; owner: cancel, complete, no-show; customer: approve, decline; system: expire, confirm a paid deposit, complete a past appointment). Anything else is `invalid_request`. The system completes by the owner's rule (a confirmed booking, after its start); the nightly tidy-up only asks once the booking ended more than 3 hours ago.
 - **No money moves yet.** Every result and event says `depositCollected: false`. `TODO(ring-1c)`: hold, release and capture real deposits.
 - **Transitions are atomic.** The store changes the booking only if its status is still the one `decide()` saw (`UPDATE … WHERE status = <expected>`), and writes the event in the same statement. Of two concurrent transitions only one wins; the loser re-reads the booking and gets the right error (e.g. `not_cancellable`). Approve and decline also require `approve_by` to be still ahead, in the same statement, so a hold can't be approved after it ran out.
 
@@ -761,7 +760,7 @@ Every state change writes exactly one event, in the same transaction, starting w
 | `id` | Increasing id, as a string. Events sort by `at`, then `id`. |
 | `bookingId` | The booking. |
 | `at` | RFC 3339 in the shop's offset. With Postgres, the database's time (see [Freezing time](#freezing-time-frontdesk_now)). |
-| `actor` | `agent`, `owner`, `customer` (the person, through the approval link) or `system` (a hold that ran out). |
+| `actor` | `agent`, `owner`, `customer` (the person, through the approval link) or `system` (a hold that ran out, a deposit paid or not paid in time, a past appointment the [nightly tidy-up](nightly.md) completed). |
 | `type` | `booked`, `approved`, `declined`, `expired`, `cancelled`, `completed` or `no_show`. Ring 1c adds more. |
 | `data` | `booked`: `{ status: "awaiting_approval", agentName, mandate? }`. A transition: `{ from, to, depositEffect, depositCollected }`. |
 
@@ -839,6 +838,7 @@ Public: no token, and it never shows a secret value or a connection string. Alwa
   "ownerAccess": "configured",
   "approvalLinks": { "origin": "https://emergent-git-my-branch.vercel.app" },
   "alerts": "log",
+  "lastNightlyRun": { "ranAt": "2026-11-10T08:00:04.512Z", "expired": 1, "completed": 4, "depositsReleased": 3, "failures": 0 },
   "problems": [
     "The database schema is outdated, missing approvals.token: rebuild the Preview database from this branch with GitHub → Actions → Preview database → Run workflow (docs/database.md)."
   ]
@@ -852,6 +852,7 @@ Public: no token, and it never shows a secret value or a connection string. Alwa
 - `database.writesAllowed`: never in production; elsewhere only when `shopName` ends in "(preview)" (the Preview database) or the data is in memory. A preview on a database without that mark is `not_ready`, since it might be production's.
 - `ownerAccess` is whether `OWNER_API_TOKEN` is set. `approvalLinks.origin` is the request's origin: approval links are built on the origin of the request that creates them.
 - `alerts` is how [owner alerts](#owner-alerts) go out: `email` when `RESEND_API_KEY` is set (Production), else `log`. Neither is a problem.
+- `lastNightlyRun` is the [nightly tidy-up](nightly.md)'s newest run against this database: when it ran (UTC) and its counts. `null` when it never ran here (previews, until someone calls it), or when it can't be read. Never a problem.
 
 ## Owner routes
 
@@ -1523,7 +1524,6 @@ These are marked `TODO(ring-N)` in the code:
 | ring-2 | A signed-in agent identity instead of the self-reported client name | `lib/server/frontdesk/mcp.ts` (`agentNameFrom`) |
 | ring-2 | `get_booking` and `cancel` still trust anyone holding the booking id; agent identity fixes this | `lib/server/frontdesk/service.ts` (`getBooking`, `cancelBooking`), `app/api/mcp/route.ts` |
 | ring-2 | Require a mandate once agents sign in | `lib/server/engine/lifecycle.ts` (`decide`, book), `lib/server/frontdesk/service.ts` (`book`), `lib/types/frontdesk.ts` (`Mandate`) |
-| ring-2 | A scheduled job that expires lapsed holds (today: lazy expiry on the next read or book) | `lib/server/frontdesk/booking-store.ts` (`refreshBooking`), `lib/server/frontdesk/service.ts` (`bookOnce`) |
 | ring-2 | OAuth or connector sign-in for agents (Ring 1b deliberately needs none) | `app/api/mcp/route.ts` |
 
 A UI for any of this is v0's lane. The approval page (`app/approve/[token]/page.tsx`) and the unlock page (`app/console/unlock/page.tsx`) are plain stand-ins until v0 restyles them.
