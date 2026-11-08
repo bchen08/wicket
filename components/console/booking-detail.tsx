@@ -8,6 +8,7 @@ import { BookingDepositDisplay, bookingTime, money } from "@/components/console/
 import { BookingHistory } from "@/components/console/booking-history";
 import { CopyApprovalLink } from "@/components/copy-approval-link";
 import { RefreshBookings } from "@/components/refresh-bookings";
+import { AgentBadge } from "@/components/console/agent-badge";
 
 export async function BookingDetail({ id }: { id: string }) {
   let data: BookingDetailResponse;
@@ -22,10 +23,10 @@ export async function BookingDetail({ id }: { id: string }) {
   // Read the clock only after the uncached booking request.
   // eslint-disable-next-line react-hooks/purity
   const now = Date.now();
-  const details = [
+  const details: [string, React.ReactNode][] = [
     ["Customer", booking.customer.displayName],
     ["Phone", booking.customer.phone ?? "Not provided"],
-    ["Booked through", booking.agent.name],
+    ["Booked through", <AgentBadge key="agent" agent={booking.agent} showClientId />],
     ["Customer approval", booking.customer.approved ? "Approved" : "Not approved"],
     ["Service", booking.serviceName],
     ["Appointment", booking.display],

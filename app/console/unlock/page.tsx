@@ -13,6 +13,8 @@ import { textingMode } from "@/lib/server/notify/texting";
 // which texts a 6-digit code to the owner's mobile and comes back here with ?code=sent; the code then posts
 // to /api/owner/session as `code` (303 → /console, or back here with ?error=code).
 
+export const instant = false;
+
 export const metadata: Metadata = {
   title: "Unlock bookings — Front Desk",
   robots: { index: false, follow: false },
@@ -57,8 +59,8 @@ async function TextMeACode({
   const message = TEXT_MESSAGES[key];
   const askForCode = key === "sent" || key === "code";
   return (
-    <div className="flex flex-col gap-3 border-t border-border pt-5">
-      <p className="text-muted-foreground">Or get a code by text.</p>
+    <div className="flex flex-col gap-4">
+      <p className="text-sm text-muted-foreground">Sign in with a code sent to the owner&apos;s mobile.</p>
       {message ? (
         <p
           role={message.alert ? "alert" : "status"}
@@ -104,7 +106,7 @@ async function TextMeACode({
         <button
           type="submit"
           className={buttonVariants({
-            variant: "outline",
+            variant: askForCode ? "outline" : "default",
             size: "lg",
             className: "min-h-12 w-full",
           })}
@@ -114,6 +116,27 @@ async function TextMeACode({
       </form>
     </div>
   );
+}
+
+async function AccessCode({ searchParams }: Pick<PageProps<"/console/unlock">, "searchParams">) {
+  await connection();
+  const texting = textingMode(process.env) !== "off";
+  const { error } = await searchParams;
+  const form = <div className="flex flex-col gap-4">
+    <WrongCode searchParams={searchParams} />
+    <form method="post" action="/api/owner/session" className="flex flex-col gap-3">
+      <label className="flex flex-col gap-2 text-sm">
+        Access code
+        <input type="password" name="token" required autoComplete="current-password" className="min-h-12 w-full rounded-lg border border-border bg-background px-4 py-3 text-base" />
+      </label>
+      <button type="submit" className={buttonVariants({ variant: texting ? "outline" : "default", size: "lg", className: "min-h-12 w-full" })}>Unlock</button>
+    </form>
+  </div>;
+  if (!texting) return <><p className="text-sm text-muted-foreground">Enter the shop&apos;s access code to see its bookings.</p>{form}</>;
+  return <details className="border-t border-border pt-4" open={error === "1" || error === "no_mobile" || error === "send_failed"}>
+    <summary className="mb-4 cursor-pointer rounded-sm py-2 text-sm text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">Use the access code instead</summary>
+    {form}
+  </details>;
 }
 
 export default function UnlockPage({
@@ -130,39 +153,9 @@ export default function UnlockPage({
       <section className="mt-6 flex flex-col gap-5 rounded-2xl border border-border bg-surface/40 p-6 sm:mt-12 sm:p-8">
         <p className="eyebrow text-primary">For the shop owner</p>
         <h1 className="section-title">Welcome back.</h1>
-        <p className="text-muted-foreground">
-          Enter the shop&apos;s access code to see its bookings.
-        </p>
-        <Suspense fallback={null}>
-          <WrongCode searchParams={searchParams} />
-        </Suspense>
-        <form
-          method="post"
-          action="/api/owner/session"
-          className="flex flex-col gap-3"
-        >
-          <label className="flex flex-col gap-1 text-sm">
-            Access code
-            <input
-              type="password"
-              name="token"
-              required
-              autoComplete="current-password"
-              className="min-h-12 w-full rounded-lg border border-border bg-background px-4 py-3 text-base"
-            />
-          </label>
-          <button
-            type="submit"
-            className={buttonVariants({
-              size: "lg",
-              className: "min-h-12 w-full",
-            })}
-          >
-            Unlock
-          </button>
-        </form>
         <Suspense fallback={null}>
           <TextMeACode searchParams={searchParams} />
+          <AccessCode searchParams={searchParams} />
         </Suspense>
       </section>
     </main>
