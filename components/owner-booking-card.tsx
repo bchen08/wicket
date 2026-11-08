@@ -2,6 +2,9 @@ import type { Booking, BookingStatus } from "@/lib/types/frontdesk";
 import { DateTime } from "luxon";
 import { cn } from "@/components/utils";
 import { CopyApprovalLink } from "@/components/copy-approval-link";
+import Link from "next/link";
+import { BookingActions } from "@/components/console/booking-actions";
+import { BookingDepositDisplay } from "@/components/console/booking-deposit";
 
 const STATUS_LABELS: Record<BookingStatus, string> = {
   awaiting_approval: "Awaiting approval",
@@ -13,7 +16,7 @@ const STATUS_LABELS: Record<BookingStatus, string> = {
   no_show: "No-show",
 };
 
-function StatusBadge({ status }: { status: BookingStatus }) {
+export function StatusBadge({ status }: { status: BookingStatus }) {
   return (
     <span
       className={cn(
@@ -28,7 +31,7 @@ function StatusBadge({ status }: { status: BookingStatus }) {
   );
 }
 
-function BookingCard({ booking }: { booking: Booking }) {
+function BookingCard({ booking, now }: { booking: Booking; now: number }) {
   return (
     <article
       className={cn(
@@ -40,7 +43,7 @@ function BookingCard({ booking }: { booking: Booking }) {
         <p className="text-sm font-medium">{booking.display}</p>
         <StatusBadge status={booking.status} />
       </div>
-      <h3 className="text-lg font-medium">{booking.serviceName}</h3>
+      <h3 className="text-lg font-medium"><Link href={`/console/bookings/${booking.id}`} className="underline decoration-border underline-offset-4 hover:text-primary">{booking.serviceName}<span className="sr-only"> for {booking.customer.displayName} — view booking details</span></Link></h3>
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <span>{booking.customer.displayName}</span>
         {booking.customer.approved && (
@@ -53,7 +56,7 @@ function BookingCard({ booking }: { booking: Booking }) {
         <p className="text-sm">Phone: {booking.customer.phone}</p>
       )}
       <p className="text-sm text-muted-foreground">via {booking.agent.name}</p>
-      {booking.status === "awaiting_approval" && booking.approval && (
+      {(booking.status === "awaiting_approval" || booking.status === "awaiting_deposit") && booking.approval && (
         <div className="flex flex-col gap-3 rounded-lg bg-surface p-4">
           <p className="text-sm text-muted-foreground">
             Hold expires{" "}
@@ -69,16 +72,10 @@ function BookingCard({ booking }: { booking: Booking }) {
           />
         </div>
       )}
-      {booking.depositCents > 0 && (
-        <p className="border-t border-border pt-3 text-sm text-muted-foreground">
-          {new Intl.NumberFormat("en-US", {
-            style: "currency",
-            currency: "USD",
-            minimumFractionDigits: booking.depositCents % 100 ? 2 : 0,
-          }).format(booking.depositCents / 100)}{" "}
-          deposit · not collected yet
-        </p>
-      )}
+      <div className="border-t border-border pt-3">
+        <BookingDepositDisplay deposit={booking.deposit} />
+      </div>
+      <BookingActions booking={booking} now={now} />
     </article>
   );
 }
@@ -86,9 +83,11 @@ function BookingCard({ booking }: { booking: Booking }) {
 export function BookingGroup({
   title,
   bookings,
+  now,
 }: {
   title: string;
   bookings: Booking[];
+  now: number;
 }) {
   return (
     <section aria-label={title} className="flex min-w-0 flex-col gap-3">
@@ -102,7 +101,7 @@ export function BookingGroup({
         <ul className="flex flex-col gap-3">
           {bookings.map((booking) => (
             <li key={booking.id}>
-              <BookingCard booking={booking} />
+              <BookingCard booking={booking} now={now} />
             </li>
           ))}
         </ul>

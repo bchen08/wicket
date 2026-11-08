@@ -64,6 +64,7 @@ export function RulesForm({ policies }: { policies: Policies }) {
       depositHorizonDays: Number(data.get("depositHorizonDays")),
       cancelWindowHours: Number(data.get("cancelWindowHours")),
       phone: String(data.get("phone")).trim() || null,
+      ownerEmail: String(data.get("ownerEmail")).trim() || null,
       depositRule: String(data.get("depositRule")),
       lateCancelRule: String(data.get("lateCancelRule")),
       noShowRule: String(data.get("noShowRule")),
@@ -124,6 +125,14 @@ export function RulesForm({ policies }: { policies: Policies }) {
               required
             />
           </FieldGroup>
+          <FormInput
+            name="ownerEmail"
+            label="Alert email"
+            type="email"
+            maxLength={254}
+            defaultValue={policies.ownerEmail ?? ""}
+            hint="Where new-booking and cancellation emails go."
+          />
           <FormInput
             name="phone"
             label="Shop phone"
