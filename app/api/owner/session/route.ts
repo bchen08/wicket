@@ -1,13 +1,14 @@
 import { connection } from "next/server";
 import { ownerSessionDelete, ownerSessionGet, ownerSessionPost } from "@/lib/server/frontdesk/owner-session";
 
-// POST /api/owner/session — trade the shop's access code (OWNER_API_TOKEN) for the fd_owner cookie:
-//   JSON (OwnerSessionRequest → OwnerSessionResponse), or a form post from /console/unlock
-//   (303 → /console, or → /console/unlock?error=1 on a wrong token).
+// POST /api/owner/session — trade the shop's access code (OWNER_API_TOKEN), or a code texted by
+//   POST /api/owner/code, for the fd_owner cookie: JSON (OwnerSessionRequest → OwnerSessionResponse), or a
+//   form post from /console/unlock (303 → /console, or → /console/unlock?error=1 on a wrong token,
+//   ?error=code on a wrong code).
 // GET /api/owner/session — whether this browser holds the cookie (OwnerSessionResponse).
 // DELETE /api/owner/session — sign out: clears the cookie (OwnerSessionResponse).
 // Types in lib/types/frontdesk.ts. Errors use the ApiError envelope.
-// Stub. TODO(ring-2): owner sign-in by texted code replaces this.
+// Stub. TODO(ring-2): per-owner sign-in replaces the shared token.
 
 export async function POST(request: Request) {
   // Reads the environment and the caller's cookie: request-time only, never prerendered.

@@ -62,8 +62,8 @@ export function signInCustomer(store: SigninStore, shopSlug: string, name: strin
 
 // ---- The gate (/api/mcp) ----
 
-/** true when book's customer_name is absent: missing, null or blank. */
-function noName(value: unknown): boolean {
+/** true when a book field the customer can fill is absent: missing, null or blank. */
+function isBlank(value: unknown): boolean {
   return value === undefined || value === null || (typeof value === "string" && value.trim() === "");
 }
 
@@ -86,7 +86,7 @@ export async function signinNeededFor(request: Request): Promise<string | null> 
     if (params?.name === "list_my_bookings") return "Sign in to Front Desk to see your bookings.";
     if (params?.name === "book") {
       const args = (params.arguments && typeof params.arguments === "object" ? params.arguments : {}) as Record<string, unknown>;
-      if (noName(args.customer_name)) {
+      if (isBlank(args.customer_name)) {
         return "Sign in to Front Desk to book as yourself, or call book again with customer_name.";
       }
     }
@@ -152,10 +152,19 @@ export function customerFrom(ctx: { http?: { authInfo?: AuthInfo } } | undefined
     : null;
 }
 
-/** book's raw arguments with customer_name filled from the signed-in customer when the agent sent none. */
+/**
+ * book's raw arguments with customer_name and customer_phone filled from the signed-in customer, each only
+ * when the agent sent none. The number then works like any customer_phone: stored, and texted the approval
+ * link where texting is on.
+ */
 export function bookArgsFor(rawArgs: unknown, customer: SignedInCustomer | null): unknown {
+  if (!customer) return rawArgs;
   const args = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
-  return customer && noName(args.customer_name) ? { ...args, customer_name: customer.name } : rawArgs;
+  return {
+    ...args,
+    customer_name: isBlank(args.customer_name) ? customer.name : args.customer_name,
+    customer_phone: isBlank(args.customer_phone) ? customer.phone : args.customer_phone,
+  };
 }
 
 // ---- list_my_bookings ----

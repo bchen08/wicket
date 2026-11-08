@@ -80,6 +80,17 @@ Never book on production. These checks run only where `/api/status` shows `"writ
 22. **[by hand]** (`stripe_test`) The owner moves the money. Set the lead time to 0 (`PUT /api/shops/harts/policies` with `{"leadTimeMin":0}`), book the next Haircut start, approve and pay it as in 20, and once it has started, `POST /api/shops/harts/bookings/<id>/no-show` → `deposit.state: "captured"`, and Stripe shows the $10 **Succeeded**. Do the same with another booking and `…/complete` → `deposit.state: "released"`, and Stripe shows that payment **Canceled**. Put the lead time back to 120 afterwards.
 23. **[by hand]** On a deployment without `STRIPE_SECRET_KEY` (`"deposits": "off"`), approving a Haircut on its page lands on "You're booked", and the owner's list shows it with `deposit.state: "not_collected"`.
 
+## Texting
+
+`/api/status` says `"texting": "photon"` (iMessage), `"twilio"` (SMS) or `"off"`, by which variables are set (Production only; see [docs/texting.md](docs/texting.md)). `off` is not a problem: nothing is texted and everything works as before. `pnpm smoke` runs T1–T4 (`scripts/smoke-checks/texting.mjs`); it never texts anyone.
+
+- **T1 [smoke]** `/api/status` has `texting`: `photon`, `twilio` or `off`.
+- **T2 [smoke]** Where texting is `off`: `POST /api/owner/code` → 400 `invalid_request` with `details.reason: "texting_off"`. SKIPPED where texting is on: it would text the owner (T5).
+- **T3 [smoke]** `POST /api/owner/session` with `{"code":"000000"}` → 401 `unauthorized`, and no cookie.
+- **T4 [smoke]** Where writes are allowed and texting is `off`: MCP `book` with `customer_phone` → `texted: false` and `booking.customer.phone` is that number; the run then declines it. SKIPPED where texting is on.
+- **T5 [by hand]** (production, texting on, Hart's `ownerMobile` set) At `/console/unlock`, tap **Text me a code** → the owner's phone gets "<6 digits> is your Front Desk code for Hart's Barbers…" within a minute, and the page asks for it. Enter it → `/console`. Enter the same code again (in a private window) → "That code didn't work". Where texting is off, the page shows only the access-code form.
+- **T6 [by hand]** (production, texting on) The next real booking an agent makes with the person's phone: the person gets "<agent> asked Hart's Barbers to book … Approve or decline: <link>", and the agent's result said `texted: true`. Once it's approved (or cancelled), the owner's phone gets "New booking: …" (or "Cancelled: …"), and `/api/shops/harts/alerts` lists a `text` alert `sent` next to the email or log one. Never book on production to test this: wait for a real booking.
+
 ## Connector sign-in (Claude and ChatGPT connectors)
 
 Front Desk is the OAuth authorization server for its own MCP endpoint, so a person connects it to Claude or ChatGPT once, signs in with their name and mobile number, and their agent books as them. See [docs/connector-signin.md](docs/connector-signin.md). S1–S4 are read-only and run everywhere; S5–S7 sign in and book, so they run only where `/api/status` shows `"writesAllowed": true` (the booking they make is cancelled). The checks live in `scripts/smoke-checks/signin.mjs`.
@@ -89,7 +100,7 @@ Front Desk is the OAuth authorization server for its own MCP endpoint, so a pers
 - **S3 [smoke]** An MCP `tools/call` of `list_my_bookings` with no token → **HTTP 401** with `WWW-Authenticate: Bearer … resource_metadata="<origin>/.well-known/oauth-protected-resource/api/mcp"`. That 401 is what makes Claude show its sign-in step. (Every other anonymous call answers exactly as before; item 7 and the booking loop check that.)
 - **S4 [smoke]** `/api/oauth/authorize` with an unknown `client_id` → 400 page, no redirect.
 - **S5 [smoke]** Sign in as a test client: register (`POST /api/oauth/register`) → `GET /api/oauth/authorize` → 302 to `/signin`, which names the client → post the form (name `Smoke Test`, a fictional 555-01xx number, Allow) → 303 to the client's redirect URI with `code`, `state` and `iss` → `POST /api/oauth/token` with the PKCE verifier → an access token (3600 s) and a refresh token.
-- **S6 [smoke]** With that token, `book` a Beard trim **without** `customer_name` → booked for `Smoke Test` with the number; `list_my_bookings` lists it; `cancel` it → `cancelled`.
+- **S6 [smoke]** With that token, `book` a Beard trim **without** `customer_name` → booked for `Smoke Test` with the number; `list_my_bookings` lists it; `cancel` it → `cancelled`. SKIPPED where texting is on: it would text the number.
 - **S7 [smoke]** The refresh token gets a new access token, and `list_my_bookings` works with it.
 - **S8 [browser]** In Claude (Customize → Connectors → Add custom connector, URL `<origin>/api/mcp`; a preview needs a bypass link): Claude shows a sign-in step, either when connecting or as a **Connect** card the first time it needs it. Sign in with a name and number on `/signin`. Then "book me a haircut Wednesday morning" books without asking for a name (you still approve it with the link), "What appointments do I have at Hart's?" lists it, and "cancel the Wednesday one" cancels it.
 - **S9 [browser]** An agent that never signs in can still browse and book as before (it is asked for a name, and gets the approval link).

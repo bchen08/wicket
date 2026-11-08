@@ -51,11 +51,13 @@ export const REQUIRED_SCHEMA = {
     "late_cancel_rule",
     "no_show_rule",
     "owner_email",
+    "owner_mobile",
     "updated_at",
   ],
   blocked_times: ["id", "staff_id", "during", "reason"],
   alerts: ["id", "shop_slug", "booking_id", "kind", "channel", "recipient", "status", "error", "created_at"],
   nightly_runs: ["id", "ran_at", "expired", "completed", "deposits_released", "failures"],
+  owner_codes: ["id", "shop_slug", "code", "sent_to", "expires_at", "used_at"],
   // Connector sign-in (0008_signin.sql), queried by lib/server/oauth/postgres-store.ts.
   customers: ["id", "shop_slug", "name", "phone", "updated_at"],
   oauth_clients: ["shop_slug", "client_id", "kind", "client_name", "redirect_uris", "fetched_at"],

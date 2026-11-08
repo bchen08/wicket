@@ -52,7 +52,7 @@ export function webPaths(shopSlug: string) {
 // ---- Errors in the web API's words ----
 
 /** MCP argument names → the web API's field names. */
-const WEB_FIELD: Record<string, string> = { service_id: "service", customer_name: "name" };
+const WEB_FIELD: Record<string, string> = { service_id: "service", customer_name: "name", customer_phone: "phone" };
 
 /**
  * A service-layer error as a web caller should read it: the same code and details, but field names and
@@ -68,7 +68,8 @@ export function forWeb(err: unknown, shopSlug: string): unknown {
       .replace(/\bget_availability\b/g, `GET ${paths.availability}`)
       .replace(/\blist_services\b/g, `GET ${paths.services}`)
       .replace(/\bservice_id\b/g, "service")
-      .replace(/\bcustomer_name\b/g, "name");
+      .replace(/\bcustomer_name\b/g, "name")
+      .replace(/\bcustomer_phone\b/g, "phone");
   const field = err.details?.field;
   const details =
     typeof field === "string" && Object.hasOwn(WEB_FIELD, field) ? { ...err.details, field: WEB_FIELD[field] } : err.details;
@@ -245,8 +246,8 @@ export type WebBookOutcome = { response: WebBookResponse; approvalUrl: string; o
 
 /**
  * POST /api/shops/[shop]/book: hold a start until the person approves it, exactly like the MCP book tool
- * (the same function), from web fields: service, start, name, optional bookedBy and mandate. Errors are
- * the same codes, in the web API's words (forWeb).
+ * (the same function), from web fields: service, start, name, optional bookedBy, mandate and phone (texted
+ * the approval link where texting is on). Errors are the same codes, in the web API's words (forWeb).
  */
 export async function webBook(
   deps: FrontDeskDeps,
@@ -271,6 +272,7 @@ export async function webBook(
       start: fields.start,
       customer_name: fields.name,
       mandate: fields.mandate,
+      customer_phone: fields.phone,
     });
     outcome = await book(deps, shopSlug, input, webAgentName(bookedBy ?? undefined, userAgent));
   } catch (err) {
@@ -283,20 +285,24 @@ export async function webBook(
 
 function bookResponse(
   deps: FrontDeskDeps,
-  { booking, staffName, holdDisplay }: BookOutcome,
+  { booking, texted, staffName, holdDisplay }: BookOutcome,
   approval: NonNullable<Booking["approval"]>,
 ): WebBookResponse {
   // The approval link is <origin>/approve/<token>; its API is /api/approvals/<token>.
   const statusUrl = `${deps.baseUrl}/api/approvals/${approval.url.slice(approval.url.lastIndexOf("/") + 1)}`;
   const name = booking.customer.displayName;
+  const send = texted
+    ? `Front Desk texted ${name} the link to approve or decline at ${booking.customer.phone}, so don't send it again ` +
+      `(it's ${approval.url} if they ask). `
+    : `Send ${name} this link right away to approve or decline: ${approval.url}. `;
   const next_action =
     `Held ${booking.serviceName} with ${staffName}, ${booking.display}, for ${name}. It is not confirmed yet. ` +
-    `Send ${name} this link right away to approve or decline: ${approval.url}. ` +
+    send +
     `The hold lapses at ${holdDisplay ?? approval.expiresAt}. ` +
     `Then GET ${statusUrl} to see what they did: status pending, awaiting_deposit (approved, deposit not paid yet: ` +
     "send the same link again), approved, declined or expired. " +
     "Don't book this time again while the hold is on.";
-  return { booking, statusUrl, next_action };
+  return { booking, statusUrl, texted, next_action };
 }
 
 // ---- Booking page ----
@@ -429,11 +435,14 @@ Content-Type: application/json
 - start: a slot start from step 1 for that service, copied exactly. Required.
 - name: the name the booking is under, 1 to 80 characters. Required. Ask the person if you don't know it.
 - bookedBy: your name as an agent; the person and the shop see it. Optional.
+- phone: the person's mobile number with its country code, e.g. "+14015550123". Optional; only if they gave
+  it to you. Where the shop can text, Front Desk texts them the approval link and the answer has
+  "texted": true, so you don't send it again.
 - mandate: optional, the person's limits, e.g. {"priceCapCents": 5000, "depositCapCents": 1000,
   "window": {"from": "2026-11-14T12:00:00-05:00", "to": "2026-11-14T18:00:00-05:00"}}. Money is in cents.
   The booking is refused if it breaks them.
 
-Success is HTTP 201: {"booking": {...}, "statusUrl": "...", "next_action": "..."}. booking.status is
+Success is HTTP 201: {"booking": {...}, "statusUrl": "...", "texted": false, "next_action": "..."}. booking.status is
 awaiting_approval, booking.approval.url is the approval link, booking.approval.expiresAt is when the hold
 lapses, and booking.id is the booking's id. Follow next_action.
 
@@ -443,7 +452,7 @@ curl -s -X POST ${url(paths.book)} -H "Content-Type: application/json" \\
   -d '{"service":"${example}","start":"<a slot start>","name":"Maya","bookedBy":"my-agent"}'
 
 In a browser you can submit a plain HTML form instead: POST the same fields (service, start, name,
-bookedBy) as application/x-www-form-urlencoded to ${url(paths.book)}. Success redirects (303) to the
+bookedBy, phone) as application/x-www-form-urlencoded to ${url(paths.book)}. Success redirects (303) to the
 approval page. A refusal redirects back to the page the form was on, with ?error=<code>&message=<text>.
 
 Book once per booking: booking the same time again while the hold is on gets slot_taken.
@@ -451,7 +460,7 @@ Book once per booking: booking the same time again while the hold is on gets slo
 ### Step 3: send the approval link
 
 Send the person booking.approval.url right away (if you posted a form in a browser, it's the page you
-landed on). The page shows the shop, the service, the time, the price, the deposit, the rules, your name
+landed on), unless the answer says "texted": true: then Front Desk already texted it to them. The page shows the shop, the service, the time, the price, the deposit, the rules, your name
 and the name booked under. The person approves, not you: opening the link and tapping Approve is their
 consent. If the service has a deposit, approving takes them to a payment page to place it as a hold on
 their card (charged only for a no-show or a late cancellation), and the booking is confirmed once it's

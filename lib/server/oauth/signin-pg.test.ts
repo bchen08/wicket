@@ -128,7 +128,7 @@ if (!url) {
       now = new Date(at(-1, 12));
       const maya = await signin.upsertCustomer(shop, phone(4), "Maya Booker");
       const lee = await signin.upsertCustomer(shop, phone(5), "Lee Booker");
-      const mine = await book(deps, shop, { service_id: "trim", start: at(0, 10), customer_name: maya.name }, "vitest", maya);
+      const mine = await book(deps, shop, { service_id: "trim", start: at(0, 10), customer_name: maya.name, customer_phone: maya.phone }, "vitest", maya);
       expect(mine.booking.customer).toMatchObject({ displayName: "Maya Booker", phone: maya.phone });
       await book(deps, shop, { service_id: "trim", start: at(0, 11), customer_name: lee.name }, "vitest", lee);
       await book(deps, shop, { service_id: "trim", start: at(0, 12), customer_name: "Anonymous" }, "vitest");

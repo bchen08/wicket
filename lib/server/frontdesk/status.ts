@@ -1,4 +1,5 @@
 import type { NightlyRun, StatusResponse } from "../../types/frontdesk";
+import { textingMode } from "../notify/texting";
 import { configuredStripeKey, getFrontDeskDeps } from "./deps";
 import { NO_STORE } from "./http";
 import { configuredOwnerToken } from "./owner-auth";
@@ -292,6 +293,8 @@ export async function getStatus(env: Env, origin: string, options: StatusOptions
     approvalLinks: { origin },
     alerts: toAlertChannel(env.RESEND_API_KEY),
     lastNightlyRun: await readLastNightlyRun(env, database, options),
+    // Off is fine too: nothing is texted, and everything else works as before.
+    texting: textingMode(env),
     problems,
   };
 }
@@ -314,6 +317,7 @@ export async function statusResponse(request: Request, env: Env, options: Status
       approvalLinks: { origin },
       alerts: toAlertChannel(env.RESEND_API_KEY),
       lastNightlyRun: null,
+      texting: textingMode(env),
       problems: [`The status check itself failed (${describeError(err, env.DATABASE_URL)}): see this deployment's function logs in Vercel.`],
     };
   }

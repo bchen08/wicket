@@ -3,7 +3,7 @@ import type { Booking, BookResult, CancelResult, GetBookingResult } from "../../
 import type { ListMyBookingsResult } from "../../types/oauth";
 import { createFrontDeskMcpHandler } from "../frontdesk/mcp";
 import type { FrontDeskDeps } from "../frontdesk/service";
-import { EXAMPLE_BOOKINGS, memoryDeps, NOW } from "../frontdesk/test-support";
+import { EXAMPLE_BOOKINGS, memoryDeps, NOW, recordingTexter } from "../frontdesk/test-support";
 import { createMemorySigninStore } from "../oauth/memory-store";
 import type { Customer, SigninStore } from "../oauth/store";
 import { bookArgsFor, parseCustomerName, parseMobile, withCustomerSignin } from "./customer";
@@ -203,6 +203,20 @@ describe("with a valid token", () => {
     expect(mine.bookings.map((b) => b.id)).toEqual([booking.id]);
   });
 
+  it("where texting is on, book texts the approval link to the customer's number, or to a number the agent sends", async () => {
+    const texter = recordingTexter();
+    deps = memoryDeps({ initialBookings: EXAMPLE_BOOKINGS, texter });
+    const token = await tokenFor(maya);
+
+    const mine = (await callTool("book", { service_id: "haircut", start: SLOT }, token)).structuredContent as BookResult;
+    expect(mine.texted).toBe(true);
+    expect(texter.sent.map((t) => t.to)).toEqual(["+14015550123"]);
+
+    const theirs = (await callTool("book", { service_id: "haircut", start: LATER_SLOT, customer_phone: "+14015550177" }, token)).structuredContent as BookResult;
+    expect(theirs.booking.customer.phone).toBe("+14015550177");
+    expect(texter.sent.map((t) => t.to)).toEqual(["+14015550123", "+14015550177"]);
+  });
+
   it("list_my_bookings returns only that customer's bookings, sorted by start, with statuses kept current", async () => {
     const mayaToken = await tokenFor(maya);
     const leeToken = await tokenFor(lee);
@@ -259,11 +273,13 @@ describe("helpers", () => {
     for (const bad of ["", "   ", "x".repeat(81), "Ma\u0000ya", "Ma\nya", null]) expect(parseCustomerName(bad)).toBeNull();
   });
 
-  it("bookArgsFor fills customer_name only when signed in and missing", () => {
+  it("bookArgsFor fills customer_name and customer_phone only when signed in and missing", () => {
     const args = { service_id: "haircut", start: SLOT };
-    expect(bookArgsFor(args, maya)).toEqual({ ...args, customer_name: "Maya Lopez" });
-    expect(bookArgsFor({ ...args, customer_name: "" }, maya)).toEqual({ ...args, customer_name: "Maya Lopez" });
-    expect(bookArgsFor({ ...args, customer_name: "Leo" }, maya)).toEqual({ ...args, customer_name: "Leo" });
+    const filled = { ...args, customer_name: "Maya Lopez", customer_phone: "+14015550123" };
+    expect(bookArgsFor(args, maya)).toEqual(filled);
+    expect(bookArgsFor({ ...args, customer_name: "", customer_phone: null }, maya)).toEqual(filled);
+    const own = { ...args, customer_name: "Leo", customer_phone: "+14015550177" };
+    expect(bookArgsFor(own, maya)).toEqual(own);
     expect(bookArgsFor(args, null)).toBe(args);
   });
 });

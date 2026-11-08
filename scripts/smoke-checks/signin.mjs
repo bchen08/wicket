@@ -1,6 +1,5 @@
-// Connector sign-in checks for pnpm smoke (SMOKE.md → "Connector sign-in", docs/connector-signin.md).
-// Node 20+ built-ins only; no repo code imported. runSmoke (scripts/smoke.mjs) calls runSigninChecks with its
-// check runner and HTTP client.
+// pnpm smoke feature check: connector sign-in (SMOKE.md → "Connector sign-in", docs/connector-signin.md).
+// Loaded by scripts/smoke.mjs.
 //
 // Read-only, everywhere:
 //   S1 protected resource metadata for /api/mcp names this deployment as the issuer
@@ -11,7 +10,7 @@
 //   S5 sign in as a test client: register → authorize → the /signin form → code → tokens (PKCE)
 //   S6 signed in, book without customer_name books as the customer; list_my_bookings lists it; cancel it
 //   S7 the refresh token gets a new access token that works
-// The booking S6 makes is cancelled, even after a failure.
+// The booking S6 makes is cancelled, even after a failure. S6 is SKIPPED where texting is on (it would text a number).
 
 import { createHash, randomBytes } from "node:crypto";
 
@@ -24,13 +23,11 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 const s256 = (verifier) => createHash("sha256").update(verifier).digest("base64url");
 
-/**
- * Run the sign-in checks. `ctx` comes from runSmoke: check(item, title, run), expect(ok, evidence), client
- * ({ request }), http(res), snippet(text), baseUrl, writesAllowed, agent (the smoke agent's name), customerName,
- * now() and random().
- */
-export async function runSigninChecks(ctx) {
-  const { check, expect, client, http, snippet, baseUrl, writesAllowed, agent, customerName, now, random } = ctx;
+/** @param {any} ctx the feature-check context from runSmoke */
+export default async function signin(ctx) {
+  const { check, expect, client, http, snippet, baseUrl, status, now, random, SMOKE_AGENT: agent, SMOKE_CUSTOMER: customerName } = ctx;
+  const writesAllowed = status.database?.writesAllowed === true;
+  const texting = status.texting === "photon" || status.texting === "twilio";
   const resourceMetadata = `${baseUrl}/.well-known/oauth-protected-resource/api/mcp`;
 
   let nextId = 1;
@@ -206,6 +203,7 @@ export async function runSigninChecks(ctx) {
 
   await check("S6", "Signed in: book without a name books as the customer; list_my_bookings; cancel", async () => {
     if (!session.access) return { skipped: "S5 didn't sign in" };
+    if (texting) return { skipped: `texting is ${status.texting}: a signed-in booking would text the customer's number` };
     const from = now() + 3 * 60 * 60 * 1000;
     const avail = await callTool("get_availability", {
       service_id: "beard-trim",

@@ -39,8 +39,8 @@ import {
 } from "./catalog";
 
 // Postgres ShopCatalog + BookingStore (postgres.js), for the schema in
-// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql, 0004_alerts.sql, 0005_deposits.sql
-// and 0006_nightly.sql; bookings.customer_id is from 0008_signin.sql.
+// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql, 0004_alerts.sql, 0005_deposits.sql,
+// 0006_nightly.sql and 0007_texting.sql; bookings.customer_id is from 0008_signin.sql.
 
 /** SQLSTATE exclusion_violation: the bookings.no_overlap constraint fired. */
 const EXCLUSION_VIOLATION = "23P01";
@@ -197,6 +197,7 @@ type PoliciesRow = {
   late_cancel_rule: string;
   no_show_rule: string;
   owner_email: string | null;
+  owner_mobile: string | null;
 };
 
 /** `patch` without its undefined fields, so spreading it never overwrites a value with undefined. */
@@ -225,6 +226,7 @@ function toPolicies(r: PoliciesRow): Policies {
     lateCancelRule: r.late_cancel_rule,
     noShowRule: r.no_show_rule,
     ownerEmail: r.owner_email,
+    ownerMobile: r.owner_mobile,
   };
 }
 
@@ -263,7 +265,7 @@ const expiredEventJson = (db: Db) => db`
 
 const policyColumns = (db: Db) => db`
   lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone,
-  deposit_rule, late_cancel_rule, no_show_rule, owner_email
+  deposit_rule, late_cancel_rule, no_show_rule, owner_email, owner_mobile
 `;
 
 type AlertRow = {
@@ -662,6 +664,32 @@ function bookingStoreOn(conn: Conn): BookingStore {
       `;
       return rows[0] ? toNightlyRunFromRow(rows[0]) : null;
     },
+
+    // ---- Texting: the owner's sign-in codes ----
+
+    async saveOwnerCode(code) {
+      await db`
+        insert into owner_codes (shop_slug, code, sent_to, expires_at)
+        values (${code.shopSlug}, ${code.code}, ${code.sentTo}, ${code.expiresAt.toISOString()}::timestamptz)
+      `;
+    },
+
+    async redeemOwnerCode(shopSlug, code, now) {
+      // The newest matching code. Under READ COMMITTED a concurrent UPDATE of the same row re-checks
+      // used_at is null once the first commits, so only one of two racing requests gets a row back.
+      const at = now.toISOString();
+      const rows = await db`
+        update owner_codes set used_at = ${at}::timestamptz
+        where used_at is null and id = (
+          select id from owner_codes
+          where shop_slug = ${shopSlug} and code = ${code} and used_at is null and expires_at > ${at}::timestamptz
+          order by id desc
+          limit 1
+        )
+        returning id
+      `;
+      return rows.length > 0;
+    },
   };
   return store;
 }
@@ -783,6 +811,7 @@ function catalogOn(conn: Conn): ShopCatalog {
             late_cancel_rule = ${p.lateCancelRule},
             no_show_rule = ${p.noShowRule},
             owner_email = ${p.ownerEmail},
+            owner_mobile = ${p.ownerMobile},
             updated_at = now()
           where shop_slug = ${slug}
           returning ${policyColumns(tx)}

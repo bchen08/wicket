@@ -113,7 +113,7 @@ Reads the shop's booking rules. No arguments. Read-only. Agents should call it b
 
 A shop without a policies row gets the defaults: 120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules.
 
-`policies` is `AgentPolicies`: every `Policies` field except `ownerEmail`, which only the owner routes show. It isn't a rule an agent needs, and the owner's address isn't for every agent that connects.
+`policies` is `AgentPolicies`: every `Policies` field except `ownerEmail` and `ownerMobile`, which only the owner routes show. They aren't rules an agent needs, and the owner's address and number aren't for every agent that connects.
 
 **Input**
 
@@ -266,6 +266,7 @@ Other `invalid_request` cases:
 - `start` must be one of the starts `get_availability` just returned for the same service. Any other time is refused with the most specific code (see Errors).
 - **Call it once per booking.** Calling it again for the same time gets `slot_taken` while the first hold is on (the database's `no_overlap` constraint), so a retry can't double-book. If a call timed out, an agent that has the booking id calls `get_booking`; otherwise it checks `get_availability` or with the person before booking again.
 - **`mandate` is optional:** the person's limits. The server refuses a booking outside them (`outside_mandate`) and shows them on the approval page. See [Mandate](#mandate). `TODO(ring-2)`: required once agents sign in.
+- **`customer_phone` is optional:** the person's mobile number, E.164. It's stored on the booking (`customer.phone`). Where texting is on, Front Desk texts the approval link to it and the result has `texted: true`; the agent then doesn't send the link again. `texted: false` means the agent sends it as usual. See [texting.md](texting.md#1-the-approval-link-by-text).
 - **No deposit is collected yet.** `depositCents` is the deposit the service required when it was booked; it will be collected once deposits are enabled.
 - **The owner isn't told about a hold**, only about a booking the person approved.
 - `agent.name` is a best-effort label: the MCP client's self-reported name, with control characters removed and cut to 80 characters. Clients on the 2026-07-28 protocol send it with every request. Stateless 2025-era requests don't, so those bookings show `"unknown agent"`. MCP Inspector is one of these.
@@ -277,6 +278,7 @@ Other `invalid_request` cases:
 | `start` | string | Required. A slot `start` from `get_availability`, RFC 3339 with offset. Any offset is accepted if it's the same instant. |
 | `customer_name` | string | 1–80 characters after trimming, without the NUL character (U+0000). The name the booking is under. Required unless the agent is signed in as the person, when it defaults to the name they signed in with; leaving it out without sign-in asks them to sign in (HTTP 401, see [connector-signin.md](connector-signin.md#the-gate)). |
 | `mandate` | object | Optional. `{ priceCapCents?, depositCapCents?, window?: { from, to } }`. See [Mandate](#mandate). |
+| `customer_phone` | string | Optional; defaults to the signed-in person's number ([connector-signin.md](connector-signin.md#the-gate)). The person's mobile, E.164 (spaces, dashes, dots and parentheses are ignored); anything else is `invalid_request`, `details.field: "customer_phone"`. Stored as `customer.phone`, and texted the approval link where texting is on. |
 
 **Input**
 
@@ -858,6 +860,7 @@ Public: no token, and it never shows a secret value or a connection string. Alwa
   "approvalLinks": { "origin": "https://emergent-git-my-branch.vercel.app" },
   "alerts": "log",
   "lastNightlyRun": { "ranAt": "2026-11-10T08:00:04.512Z", "expired": 1, "completed": 4, "depositsReleased": 3, "failures": 0 },
+  "texting": "off",
   "problems": [
     "The database schema is outdated, missing approvals.token: rebuild the Preview database from this branch with GitHub → Actions → Preview database → Run workflow (docs/database.md)."
   ]
@@ -872,6 +875,7 @@ Public: no token, and it never shows a secret value or a connection string. Alwa
 - `ownerAccess` is whether `OWNER_API_TOKEN` is set. `approvalLinks.origin` is the request's origin: approval links are built on the origin of the request that creates them.
 - `alerts` is how [owner alerts](#owner-alerts) go out: `email` when `RESEND_API_KEY` is set (Production), else `log`. Neither is a problem.
 - `lastNightlyRun` is the [nightly tidy-up](nightly.md)'s newest run against this database: when it ran (UTC) and its counts. `null` when it never ran here (previews, until someone calls it), or when it can't be read. Never a problem.
+- `texting` is how texts go out: `photon` (iMessage), `twilio` (SMS) or `off`, by which variables are set ([texting.md](texting.md#which-sender)). `off` is not a problem.
 
 ## Owner routes
 
@@ -945,12 +949,14 @@ curl -s http://localhost:3000/api/shops/harts/bookings -H "Authorization: Bearer
 
 ### Owner session (stub)
 
-The owner enters the shop's access code (`OWNER_API_TOKEN`) once at **`/console/unlock`**; the server answers with an HttpOnly cookie holding it, and every owner route accepts that cookie. `/console` forwards the browser's cookie to the bookings list, so it works with no token in page code. `TODO(ring-2): owner sign-in by texted code replaces this.`
+The owner enters the shop's access code (`OWNER_API_TOKEN`) once at **`/console/unlock`**; the server answers with an HttpOnly cookie holding it, and every owner route accepts that cookie. `/console` forwards the browser's cookie to the bookings list, so it works with no token in page code. Where texting is on, the owner can instead ask for a 6-digit code by text (`POST /api/owner/code`) and send it as `{ "code": "…" }`: it sets the same cookie. See [texting.md](texting.md#3-owner-sign-in-by-texted-code).
 
 | Method and path | Request | Response | Success |
 |---|---|---|---|
 | `POST /api/owner/session` | `OwnerSessionRequest` `{ "token": "…" }` as JSON | `OwnerSessionResponse` `{ "signedIn": true, "expiresAt": "…" }`, plus `Set-Cookie: fd_owner=…` | 200 |
 | `POST /api/owner/session` | a form post with a `token` field (what `/console/unlock` sends) | `Set-Cookie: fd_owner=…` and `Location: /console` | 303 |
+| `POST /api/owner/session` | `{ "code": "042917" }` as JSON, or a form post with a `code` field: a code from `POST /api/owner/code` ([texting](texting.md#3-owner-sign-in-by-texted-code)) | the same cookie; a wrong, used or expired code → 401 (form: 303 → `/console/unlock?error=code`) | 200 / 303 |
+| `POST /api/owner/code` | no body | `OwnerCodeResponse`: a code texted to `ownerMobile`, valid 10 minutes, once (form: 303 → `/console/unlock?code=sent`) | 200 / 303 |
 | `GET /api/owner/session` | | `OwnerSessionResponse`: `{ "signedIn": true }` or `{ "signedIn": false }` | 200 |
 | `DELETE /api/owner/session` | | `OwnerSessionResponse` `{ "signedIn": false }`, plus a `Set-Cookie` that clears `fd_owner` | 200 |
 
@@ -1057,6 +1063,7 @@ The examples below assume `export OWNER_API_TOKEN=<the deployment's token>`.
 | `phone` | 1–40 characters, or `null` to remove it |
 | `depositRule`, `lateCancelRule`, `noShowRule` | At most 1000 characters; `""` clears it |
 | `ownerEmail` | An email address with an `@`, at most 254 characters, or `null` to remove it. Where [owner alerts](#owner-alerts) are emailed. Nothing else is checked: Resend refuses what it can't send to, and the alert is recorded as `failed` with its message. |
+| `ownerMobile` | A mobile number in E.164 (spaces, dashes, dots and parentheses are ignored; stored without them), or `null` to remove it. Where texting is on, owner alerts are also texted here and the sign-in code goes here ([texting.md](texting.md)). |
 
 Text is stored trimmed. A shop without a policies row gets one, starting from the defaults. The change is merged into the stored row in one step, so two `PUT`s of different fields at the same moment both take effect.
 
@@ -1082,7 +1089,8 @@ curl -s -X PUT http://localhost:3000/api/shops/harts/policies \
     "depositRule": "Services with a deposit need it when you book. We hold the deposit on your card at booking; it is only charged if you miss the appointment or cancel late.",
     "lateCancelRule": "Cancel at least 24 hours before your appointment and the deposit is released. Cancel within 24 hours and we keep the deposit as a late-cancellation fee.",
     "noShowRule": "If you don't show up, we keep the deposit. Otherwise it is released after your appointment.",
-    "ownerEmail": null
+    "ownerEmail": null,
+    "ownerMobile": null
   }
 }
 ```
@@ -1307,6 +1315,8 @@ No alert for a hold on its own, a hold that lapses, or anything the owner does t
 - `log` everywhere else: one JSON line in the function log (Vercel → Logs), e.g. `{"event":"booking.confirmed","id":"…","shop":"harts","service":"haircut","start":"…","customer_first_name":"Maya","subject":"New booking: Haircut, Sat 14 Nov 2:30 pm"}`. It has the customer's first name only. Previews have no `RESEND_API_KEY`, so their alerts are always logged.
 
 `/api/status` says which (`"alerts": "email"` or `"log"`); neither is a problem.
+
+**By text, too.** Where texting is on (`/api/status` `"texting"` isn't `"off"`) and the shop has an `ownerMobile`, each alert is also texted there, and recorded as a second alert with `channel: "text"` (`recipient` the number; `sent` or `failed`). The email or log alert is unchanged. See [texting.md](texting.md#2-owner-alerts-by-text).
 
 **When.** After the change is committed, before the response. A failed alert never changes the booking or the answer: Resend refusing the email or not answering within 8 seconds is recorded with `status: "failed"` and the error, and logged as `booking.notify_failed`. There are no retries (`TODO(ring-2)`).
 

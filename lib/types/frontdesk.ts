@@ -3,12 +3,15 @@
 // Money is always an integer number of cents. Instants are RFC 3339 strings with an offset.
 
 import type { BookingDeposit, DepositsMode } from "./deposits";
+import type { TextingMode } from "./texting";
 import type { NightlyRun } from "./nightly";
 
 export type { BookingDeposit, DepositsMode, DepositState } from "./deposits";
 export type { NightlyCounts, NightlyRun, NightlyRunResponse } from "./nightly";
 // The web booking API's shapes (plain HTTP booking for agents without MCP, and the booking page).
 export type * from "./web-booking";
+// Texting: the text sender's mode and the owner's texted sign-in code (docs/texting.md).
+export type * from "./texting";
 
 /** A business that takes bookings. */
 export type Shop = {
@@ -99,7 +102,7 @@ export type ApiError = {
 
 /**
  * How a shop takes bookings, and where the owner's alerts go. Set by the owner through the owner routes.
- * Agents read everything but ownerEmail through get_policies (AgentPolicies).
+ * Agents read everything but ownerEmail and ownerMobile through get_policies (AgentPolicies).
  */
 export type Policies = {
   /** Minimum minutes between now and an appointment's start. Default 120. */
@@ -129,10 +132,16 @@ export type Policies = {
    * owner routes show it; get_policies leaves it out.
    */
   ownerEmail: string | null;
+  /**
+   * The owner's mobile number, E.164 (e.g. "+14015550123"), or null. Where texting is on (StatusResponse.texting
+   * isn't "off"), every owner alert is also texted here, and POST /api/owner/code texts the sign-in code here.
+   * Only the owner routes show it; get_policies leaves it out.
+   */
+  ownerMobile: string | null;
 };
 
-/** The shop's rules as agents read them through get_policies: Policies without the owner's email. */
-export type AgentPolicies = Omit<Policies, "ownerEmail">;
+/** The shop's rules as agents read them through get_policies: Policies without the owner's email and mobile. */
+export type AgentPolicies = Omit<Policies, "ownerEmail" | "ownerMobile">;
 
 /** One opening window in a staff member's regular week, in the shop's local time. */
 export type WeeklyHours = {
@@ -320,7 +329,10 @@ export type Booking = {
     displayName: string;
     /** true once the person tapped Approve on the approval link. */
     approved: boolean;
-    /** The phone number the person gave when approving, E.164, e.g. "+14015550123". Absent if they gave none. Not checked. */
+    /**
+     * The person's phone number, E.164, e.g. "+14015550123": the one the agent gave with book (customer_phone),
+     * or the one the person gave when approving, which replaces it. Absent if neither gave one. Not checked.
+     */
     phone?: string;
   };
   agent: {
@@ -368,11 +380,23 @@ export type BookInput = {
   customer_name?: string;
   /** The person's limits. The server refuses a booking outside them (outside_mandate). Optional for now. */
   mandate?: Mandate;
+  /**
+   * The person's mobile number, E.164, e.g. "+14015550123" (spaces, dashes, dots and parentheses are
+   * ignored). Optional. Stored on the booking (Booking.customer.phone). Where texting is on, Front Desk texts
+   * the approval link to it (BookResult.texted).
+   */
+  customer_phone?: string;
 };
 
 /** structuredContent of a successful `book` call. booking.status is awaiting_approval, with booking.approval set. */
 export type BookResult = {
   booking: Booking;
+  /**
+   * true when Front Desk texted the approval link to customer_phone: don't send it again. false when no phone
+   * was given, texting is off on this deployment, or the text didn't go through: send booking.approval.url
+   * to the person yourself.
+   */
+  texted: boolean;
 };
 
 /** Input of the `get_booking` tool. */
@@ -429,17 +453,23 @@ export type BookingsResponse = {
   bookings: Booking[];
 };
 
-// ---- Owner session (stub; TODO(ring-2): owner sign-in by texted code replaces it) ----
+// ---- Owner session ----
 
 /**
- * POST /api/owner/session body, as JSON. The same route also takes a plain HTML form post with a `token`
- * field (303 → /console, or → /console/unlock?error=1 on a wrong token). On success the answer sets the
- * HttpOnly fd_owner cookie, which holds the token for 12 hours.
+ * POST /api/owner/session body, as JSON: the shop's access code, or a code texted by POST /api/owner/code.
+ * The same route also takes a plain HTML form post with a `token` field (303 → /console, or →
+ * /console/unlock?error=1 on a wrong token) or a `code` field (303 → /console, or → /console/unlock?error=code).
+ * On success the answer sets the HttpOnly fd_owner cookie, which holds the access code for 12 hours.
  */
-export type OwnerSessionRequest = {
-  /** The deployment's OWNER_API_TOKEN: the shop's access code. */
-  token: string;
-};
+export type OwnerSessionRequest =
+  | {
+      /** The deployment's OWNER_API_TOKEN: the shop's access code. */
+      token: string;
+    }
+  | {
+      /** The 6-digit code POST /api/owner/code texted to the owner. Works once, within 10 minutes of sending. */
+      code: string;
+    };
 
 /** POST, GET and DELETE /api/owner/session. */
 export type OwnerSessionResponse = {
@@ -461,7 +491,8 @@ export type PoliciesResponse = {
  * PUT /api/shops/[shop]/policies body. Send the fields to change (at least one); the others keep their
  * values. Ranges: leadTimeMin 0–10080, horizonDays 1–365, depositHorizonDays 1–365,
  * cancelWindowHours 0–720, phone 1–40 characters or null, each rule at most 1000 characters,
- * ownerEmail an address containing "@" of at most 254 characters, or null.
+ * ownerEmail an address containing "@" of at most 254 characters, or null, ownerMobile an E.164 number
+ * (spaces, dashes, dots and parentheses are ignored), or null.
  */
 export type UpdatePoliciesRequest = Partial<Policies>;
 
@@ -476,11 +507,13 @@ export type AlertKind = "booking_confirmed" | "booking_cancelled";
 
 /**
  * How it went out. `email`: through Resend to the shop's ownerEmail (only where RESEND_API_KEY is set and
- * the shop has an ownerEmail). `log`: one JSON line in the function log, everywhere else.
+ * the shop has an ownerEmail). `log`: one JSON line in the function log, everywhere else. `text`: a text to
+ * the shop's ownerMobile, sent as well as the email or log line, where texting is on (StatusResponse.texting)
+ * and the shop has an ownerMobile.
  */
-export type AlertChannel = "email" | "log";
+export type AlertChannel = "email" | "log" | "text";
 
-/** `sent`: the email was accepted by Resend. `logged`: the log line was written. `failed`: see Alert.error. */
+/** `sent`: the email or text was accepted by the provider. `logged`: the log line was written. `failed`: see Alert.error. */
 export type AlertStatus = "sent" | "logged" | "failed";
 
 /** One alert to the shop owner, recorded whatever happened to it. */
@@ -492,7 +525,7 @@ export type Alert = {
   bookingId: string;
   kind: AlertKind;
   channel: AlertChannel;
-  /** The email address it went to; null for a log line. */
+  /** The email address or mobile number (E.164) it went to; null for a log line. */
   recipient: string | null;
   status: AlertStatus;
   /** Why it failed, e.g. "Resend answered HTTP 403: …". null unless status is failed. */
@@ -684,13 +717,19 @@ export type StatusResponse = {
    * How owner alerts go out: `email` when RESEND_API_KEY is set (to shops with an ownerEmail; the others are
    * still logged), else `log`. Neither is a problem.
    */
-  alerts: AlertChannel;
+  alerts: Exclude<AlertChannel, "text">;
   /**
    * The nightly tidy-up's newest run (GET /api/jobs/nightly, by Vercel Cron at 08:00 UTC): when it ran and
    * what it did. null when it has never run against this database, or it can't be read (the database is
    * unreachable, or 0006 isn't applied: then `database.missing` names nightly_runs). Never a problem.
    */
   lastNightlyRun: NightlyRun | null;
+  /**
+   * How texts go out: `photon` (iMessage) when PHOTON_* is set, else `twilio` (SMS) when TWILIO_* is set, else
+   * `off`. Off is not a problem: approval links are sent by the agent, alerts go by email or log, and the owner
+   * signs in with the access code.
+   */
+  texting: TextingMode;
   /** One sentence each, saying what to fix and where. Empty when ready. */
   problems: string[];
 };

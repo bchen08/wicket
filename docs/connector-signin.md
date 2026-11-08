@@ -31,7 +31,7 @@ The customer is found or created by **(shop, phone)**: signing in again with the
 Claude starts sign-in only on an HTTP 401 with `WWW-Authenticate` (a tool error inside a 200 doesn't), then retries the same call with the new token. That is why the refusal happens in the HTTP layer, before the MCP SDK runs, and why it's limited to calls that only make sense signed in: an agent that sends `customer_name` never sees it.
 
 With a valid token:
-- **`book`** fills `customer_name` from the customer when the agent leaves it out, stores the customer's phone on the booking from the start (`customer.phone`), and records the booking as theirs (`bookings.customer_id`). An agent may still send a name (booking for someone else); the booking is still the customer's.
+- **`book`** fills `customer_name` and `customer_phone` from the customer when the agent leaves them out, and records the booking as theirs (`bookings.customer_id`). The number works like any `customer_phone`: stored as `customer.phone` and, where texting is on, texted the approval link (`texted: true`). An agent may still send a name or number (booking for someone else); the booking is still the customer's.
 - **`list_my_bookings`** (new) returns the customer (`name`, `phone`) and their bookings at the shop that end within the last 7 days or later, any status, sorted by start, at most 50 (`ListMyBookingsResult` in [`lib/types/oauth.ts`](../lib/types/oauth.ts)). Lapsed holds read as expired; a hold carries its approval link. Each line of the text has the booking id.
 - **`get_booking`** and **`cancel`** work on those ids, so the agent never guesses one. They behave as before otherwise (an id is still enough, signed in or not).
 

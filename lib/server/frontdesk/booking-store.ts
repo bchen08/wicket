@@ -42,7 +42,7 @@ export type NewBooking = {
   mandate: Mandate | null;
   /** The signed-in customer the booking belongs to (connector sign-in), or absent/null for an anonymous agent. */
   customerId?: string | null;
-  /** The signed-in customer's phone (E.164), stored as customer_phone from the start. Absent/null: none yet. */
+  /** The person's phone number (E.164): customer_phone from book (filled from the signed-in customer if the agent sent none), or null/absent. */
   customerPhone?: string | null;
 };
 
@@ -129,11 +129,24 @@ export type NewAlert = {
   bookingId: string;
   kind: AlertKind;
   channel: AlertChannel;
-  /** The email address it went to; null for a log line. */
+  /** The email address or mobile number (E.164) it went to; null for a log line. */
   recipient: string | null;
   status: AlertStatus;
   /** Why it failed; null unless status is failed. */
   error: string | null;
+};
+
+// ---- Texting: the owner's sign-in codes ----
+
+/** A sign-in code texted to the owner (the owner_codes table). Stored as it is (MVP: no hashing). */
+export type NewOwnerCode = {
+  shopSlug: string;
+  /** Six digits, e.g. "042917". */
+  code: string;
+  /** The ownerMobile it was texted to (E.164). */
+  sentTo: string;
+  /** When it stops working: sent + 10 minutes. */
+  expiresAt: Date;
 };
 
 /** The event a transition writes. The store stamps `at` (Postgres now(), the memory store's clock). */
@@ -237,6 +250,17 @@ export interface BookingStore {
   recordNightlyRun(counts: NightlyCounts): Promise<NightlyRun>;
   /** The newest run (by ran_at, then id), or null if it has never run. */
   lastNightlyRun(): Promise<NightlyRun | null>;
+
+  // ---- Texting: the owner's sign-in codes ----
+
+  /** Store a code that was just texted to the owner. */
+  saveOwnerCode(code: NewOwnerCode): Promise<void>;
+  /**
+   * Redeem a code, in one statement: if the shop has an unused code equal to `code` with expires_at > now, mark
+   * it used (used_at = now) and return true; otherwise false. Of two requests with the same code, only one
+   * gets true, so a code works once.
+   */
+  redeemOwnerCode(shopSlug: string, code: string, now: Date): Promise<boolean>;
 }
 
 /** The staff member is already booked for part of that time. Another agent got there first. */
