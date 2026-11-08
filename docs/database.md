@@ -201,6 +201,10 @@ OWNER_API_TOKEN=<64 hex characters>
 | `OWNER_API_TOKEN` | Vercel (per environment), local | For the owner routes and `/console` | The shop's access code: the owner routes' Bearer token and the `fd_owner` cookie's value. |
 | `FRONTDESK_NOW` | Local, demos | No | Freeze Front Desk's clock at an RFC 3339 instant. |
 | `DATABASE_URL_TEST` | Local, CI if wanted | No | A scratch Postgres for the Postgres tests. |
+| `VERCEL_ENV`, `VERCEL_GIT_COMMIT_SHA` | Set by Vercel | — | `/api/status` reports them as `environment` and `commit`. Unset locally: `development`, `null`. |
+| `VERCEL_AUTOMATION_BYPASS_SECRET` | Set by Vercel (Protection Bypass for Automation); a verifier's shell | — | The secret `pnpm smoke --bypass` sends past Vercel Authentication. The app doesn't read it. |
+| `PREVIEW_DB_URL` | GitHub Actions secret | For the Preview database workflow | The Preview project's Session pooler string (port 5432). |
+| `SUPABASE_ACCESS_TOKEN` | GitHub Actions secret | No | Only if the Supabase CLI ever asks for one in the Preview database workflow. |
 
 ## Production and Preview databases
 
@@ -209,10 +213,10 @@ Every PR gets a Vercel Preview deployment, and the verifier tests `book` there. 
 | Vercel environment | `DATABASE_URL` points at | Migrations applied by |
 |---|---|---|
 | Production | the production Supabase project | the GitHub integration, on merge to `main` |
-| Preview | a second, scratch Supabase project | you, with the CLI (below) |
+| Preview | a second, scratch Supabase project (`emergent-preview`, ref `qaaaxyzvyeigzjqltrlb`) | the **Preview database** workflow, on every PR that changes `supabase/` (below) |
 | Local | whatever `.env.local` says, or unset for in-memory data | you |
 
-**Tell them apart by the shop name.** In the Preview database, the shop is named **Hart's Barbers (preview)**. Before anything writes to a preview, check that `/api/shops/harts/services` on it shows "(preview)"; [VERIFIER.md](VERIFIER.md) requires this. If the name is plain, that preview is using the production database, and nothing may write to it.
+**Tell them apart by the shop name.** In the Preview database, the shop is named **Hart's Barbers (preview)**. `/api/status` reads it: `database.writesAllowed` is `true` only on a non-production deployment whose shop name ends in "(preview)" (or with in-memory data), and a preview on any other database reports `not_ready`, because it might be production's. Nothing may write to a deployment whose `writesAllowed` is `false`; [VERIFIER.md](VERIFIER.md) and `pnpm smoke` both check it.
 
 ### One-time setup
 
@@ -238,38 +242,46 @@ Every PR gets a Vercel Preview deployment, and the verifier tests `book` there. 
 4. **Split the variable in Vercel,** under **Settings → Environment Variables**:
    - Edit the existing `DATABASE_URL` so it applies to **Production** only.
    - Add another `DATABASE_URL`, type Secret, for **Preview** only. Its value is the Preview project's **Transaction pooler** string (port 6543), the same kind production uses.
-5. **Redeploy a preview** and open `/api/shops/harts/services` on it. It should show "Hart's Barbers (preview)", while production still shows "Hart's Barbers".
+5. **Redeploy a preview** and open `/api/status` on it. It should show `"shopName": "Hart's Barbers (preview)"` and `"writesAllowed": true`, while production shows "Hart's Barbers" and `false`.
+6. **Give GitHub the Preview database,** so the workflow below can rebuild it: under the repository's **Settings → Secrets and variables → Actions**, add the secret `PREVIEW_DB_URL`, the Preview project's **Session pooler** string (port 5432; the one the CLI uses).
 
-### When a PR adds a migration
+### The Preview database keeps itself current
 
-Before the verifier runs, push the PR's new migration to the Preview database from the PR branch:
+[`.github/workflows/preview-db.yml`](../.github/workflows/preview-db.yml) (**Actions → Preview database**) rebuilds the Preview database from a PR's branch:
 
-```bash
-npx supabase@3 db push --remote="$PREVIEW_DB_URL"
-```
+- **When:** a PR that changes anything under `supabase/` is opened or gets a new push. To run it by hand (for example after a run for another PR, or to clear test bookings), open **Actions → Preview database → Run workflow** and pick the branch.
+- **What:** `npx supabase@3 db reset --remote="$PREVIEW_DB_URL" --yes` (every migration on that branch, then `supabase/seed.sql`), then `update shops set name = 'Hart''s Barbers (preview)' where slug = 'harts';`, which it checks.
+- **Only ever the Preview database:** before the reset it stops with an error unless `PREVIEW_DB_URL` contains `postgres.qaaaxyzvyeigzjqltrlb`, the Preview project's ref (a plain constant in the workflow, not a secret).
+- **No access token:** CLI 3 resets a database given by connection string without one. If Supabase ever asks for one, add a `SUPABASE_ACCESS_TOKEN` Actions secret; the workflow passes it on when it exists.
+
+**One shared Preview database: the most recent PR wins.** Every preview deployment uses the same Preview database, and the workflow's concurrency group `preview-db` runs one rebuild at a time, so the schema is whichever branch ran last. When PR A adds a migration and PR B then rebuilds from a branch without it, A's preview is on the older schema again: its `/api/status` says `not_ready` (`schema: "outdated"`, naming what's missing), and `pnpm smoke` says BLOCKED instead of failing. Re-run the workflow on A's branch before verifying A. A rebuild also deletes every booking in the Preview database, including test bookings.
 
 Production gets the migration from the integration when the PR merges.
 
 ### Resetting the Preview database
 
-The Preview database is scratch, so reset it whenever it drifts from `main`: for example after a PR whose migration changed or was abandoned, or to clear test bookings. From an up-to-date `main` checkout:
+The Preview database is scratch, so rebuild it whenever it drifts: run **Actions → Preview database → Run workflow** on the branch you want (`main`, or a PR's branch). To clear only the bookings, run `delete from bookings;` in the **Preview** project's SQL editor.
+
+If GitHub Actions isn't available, the same thing by hand, from an up-to-date checkout:
 
 ```bash
-npx supabase@3 db reset --remote="$PREVIEW_DB_URL"
+npx supabase@3 db reset --remote="$PREVIEW_DB_URL" --yes
 ```
 
-The reset re-seeds, which brings back the plain shop name, so run the `update shops …` from step 3 again. If you forget, the verifier just won't book there, which is the safe direction.
+```sql
+update shops set name = 'Hart''s Barbers (preview)' where slug = 'harts';
+```
 
-> ⚠️ **`db reset` deletes every row and rebuilds the schema.** Before running it, check that `$PREVIEW_DB_URL` contains the Preview project's ref (`postgres.<ref>`). Never point it at production.
+The reset re-seeds, which brings back the plain shop name, so the `update shops …` must follow. If you forget, `/api/status` on previews says `not_ready` and nothing books there, which is the safe direction.
 
-To clear only the bookings, run `delete from bookings;` in the **Preview** project's SQL editor.
+> ⚠️ **`db reset` deletes every row and rebuilds the schema.** Before running it by hand, check that `$PREVIEW_DB_URL` contains the Preview project's ref (`postgres.qaaaxyzvyeigzjqltrlb`). Never point it at production.
 
 ## What happens without `DATABASE_URL`
 
 | Where | Behavior |
 |---|---|
 | Local (`pnpm dev`, tests) | Front Desk uses an in-memory copy of the seed data (including Hart's policies) and logs one warning. Bookings, events and owner changes are lost when the server restarts. Good for UI work without a database. |
-| Vercel (the `VERCEL` env var is set) | Every Front Desk call fails with an `internal` error, and the function log says `DATABASE_URL is not set`. A deployment never serves fake data. |
+| Vercel (the `VERCEL` env var is set) | Every Front Desk call fails with an `internal` error, and the function log says `DATABASE_URL is not set`. A deployment never serves fake data. `/api/status` says `not_ready` and which environment's variable to set. |
 
 The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/deps.ts).
 
@@ -281,10 +293,11 @@ The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/dep
 DATABASE_URL_TEST=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm test
 ```
 
-Three files use it:
+Four files use it:
 
 | File | What it covers |
 |---|---|
+| [`lib/server/frontdesk/status-pg.test.ts`](../lib/server/frontdesk/status-pg.test.ts) | `/api/status` on a real database: every column in `REQUIRED_SCHEMA` exists once every migration has run, the shop's name, and the schema reported `current`. Read-only. |
 | [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, lazy expiry, approval answers, and the owner writes (policies, services, hours, blocks). |
 | [`lib/server/frontdesk/flow-pg.test.ts`](../lib/server/frontdesk/flow-pg.test.ts) | The lifecycle flow through the service layer, the code the MCP tools and owner routes call: book (and the same slot again → slot_taken), approve, cancel (released, captured, none), cancel after the start, an owner no-show, and concurrent books and cancels. |
 | [`lib/server/consent/consent-pg.test.ts`](../lib/server/consent/consent-pg.test.ts) | The consent flow on Postgres: approve with and without a phone (the token and the phone stored as they are), decline, and lazy expiry (a stale hold never blocks a new booking; exactly one `expired` event under concurrency). |
@@ -315,9 +328,10 @@ Every schema change is a new migration file in an ordinary PR. The GitHub integr
 
    Keep the `0001`, `0002`, … numbering. Supabase applies files in version order. `supabase migration new` names files with a timestamp (`20261108120000_x.sql`), which sorts after every numbered file, so a later `0004` would be refused as out of order.
 2. **Never edit a migration that has been merged.** Production has already run it. To fix one, add another, such as `0004_fix_…`.
-3. **Test it locally:** apply every migration and the seed to a throwaway Postgres, then run the Postgres tests. See [Running the Postgres tests](#running-the-postgres-tests).
-4. **Open a PR, and push the migration to the Preview database** so the PR's preview runs against the new schema. See [When a PR adds a migration](#when-a-pr-adds-a-migration). The **Supabase Preview** check is skipped on PRs unless preview branches are enabled in Supabase, so production isn't touched before merge.
-5. **Merge.** On the push to `main`, the integration applies the new file to production and records it. To confirm, check that the **Supabase Preview** check on the merge commit is green, or look at **Branches → main → View Logs** in Supabase.
+3. **When the code reads or writes the new column, add it to `REQUIRED_SCHEMA`** in [`lib/server/frontdesk/schema.ts`](../lib/server/frontdesk/schema.ts), in the same PR. `/api/status` calls a database `current` only if every column listed there exists, and `schema.test.ts` fails when `postgres-store.ts` uses a column the list lacks (or the list names one nothing uses).
+4. **Test it locally:** apply every migration and the seed to a throwaway Postgres, then run the Postgres tests. See [Running the Postgres tests](#running-the-postgres-tests).
+5. **Open a PR.** The Preview database workflow rebuilds the Preview database from your branch, so the PR's preview runs against the new schema; check that `/api/status` on the preview says `"schema": "current"`. See [The Preview database keeps itself current](#the-preview-database-keeps-itself-current). The **Supabase Preview** check is skipped on PRs unless preview branches are enabled in Supabase, so production isn't touched before merge.
+6. **Merge.** On the push to `main`, the integration applies the new file to production and records it. To confirm, check that the **Supabase Preview** check on the merge commit is green, or look at **Branches → main → View Logs** in Supabase.
 
 **Keep each migration compatible with the code that's already deployed.** On merge, Vercel deploys the new code while Supabase applies the migration, in no guaranteed order. Only add things the current code tolerates: new tables, nullable columns or columns with a default, constraints its writes already meet. Rename or drop something in a later PR, once no deployed code uses it.
 

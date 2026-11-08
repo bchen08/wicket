@@ -1,0 +1,96 @@
+# Keeps the Preview database (Supabase project emergent-preview) on the schema of the PR that last changed
+# supabase/. It rebuilds the database from the PR branch (every migration, then the seed) and marks it as
+# the Preview database, so previews can be verified without anyone touching a terminal.
+#
+# There is ONE Preview database for every PR: the most recent run wins. See docs/database.md →
+# "The Preview database keeps itself current".
+#
+# Secrets: PREVIEW_DB_URL (the Preview project's Session pooler string, port 5432). Optional:
+# SUPABASE_ACCESS_TOKEN, only if the Supabase CLI asks for one.
+
+name: Preview database
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - "supabase/**"
+  # Actions → Preview database → Run workflow, choosing the branch to rebuild from.
+  workflow_dispatch:
+
+# One shared database: runs queue up instead of overlapping, and a newer run replaces any run still
+# waiting. Whichever run happens last decides the schema.
+concurrency:
+  group: preview-db
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  reset:
+    name: Rebuild the Preview database from this branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PREVIEW_DB_URL: ${{ secrets.PREVIEW_DB_URL }}
+      # The Preview project's ref. Not a secret: it only says which database this workflow may reset.
+      PREVIEW_PROJECT_REF: qaaaxyzvyeigzjqltrlb
+
+    steps:
+      - name: Refuse any database but the Preview project's
+        # db reset deletes every row. It must never run against production or anything else.
+        run: |
+          if [ -z "$PREVIEW_DB_URL" ]; then
+            echo "::error::The PREVIEW_DB_URL secret isn't available to this run (not set, or a PR from a fork)."
+            exit 1
+          fi
+          case "$PREVIEW_DB_URL" in
+            *"postgres.${PREVIEW_PROJECT_REF}"*)
+              echo "PREVIEW_DB_URL is the Preview project's ($PREVIEW_PROJECT_REF)." ;;
+            *)
+              echo "::error::PREVIEW_DB_URL doesn't contain postgres.$PREVIEW_PROJECT_REF, so it isn't the Preview database. Refusing to reset it."
+              exit 1 ;;
+          esac
+
+      - name: Check out the branch
+        uses: actions/checkout@v4
+        with:
+          # The PR's head commit, as its Vercel preview builds it (not the merge with main).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Reset the database to this branch's migrations and seed
+        env:
+          OPTIONAL_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          # Only export the token when the secret exists: an empty one could be rejected as malformed.
+          if [ -n "$OPTIONAL_ACCESS_TOKEN" ]; then export SUPABASE_ACCESS_TOKEN="$OPTIONAL_ACCESS_TOKEN"; fi
+          # --yes: no prompt (CI has no terminal). The reset re-runs supabase/seed.sql afterwards.
+          npx --yes supabase@3 db reset --remote="$PREVIEW_DB_URL" --yes
+
+      - name: Mark it as the Preview database
+        # The seed names the shop plain "Hart's Barbers". "(preview)" is what /api/status and the verifier look
+        # for before anything writes.
+        run: |
+          command -v psql >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q postgresql-client; }
+          name="$(psql "$PREVIEW_DB_URL" -v ON_ERROR_STOP=1 -tAq \
+            -c "update shops set name = 'Hart''s Barbers (preview)' where slug = 'harts' returning name;")"
+          if [ "$name" != "Hart's Barbers (preview)" ]; then
+            echo "::error::Couldn't mark the shop: got '$name'. Did the seed run?"
+            exit 1
+          fi
+          echo "Shop renamed to: $name"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Preview database rebuilt"
+            echo ""
+            echo "From \`${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}\` at \`$(git rev-parse --short=7 HEAD)\`. Every PR shares this database: the most recent run wins."
+            echo "Check a preview with \`pnpm smoke <PREVIEW_URL> --bypass <secret>\` (docs/VERIFIER.md)."
+          } >> "$GITHUB_STEP_SUMMARY"

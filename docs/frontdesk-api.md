@@ -815,6 +815,38 @@ Public: no token.
 }
 ```
 
+### `GET /api/status` → `StatusResponse`
+
+Public: no token, and it never shows a secret value or a connection string. Always **200**, never cached. It says what this deployment is and whether it's ready to verify; `pnpm smoke` reads it before anything else (see [VERIFIER.md](VERIFIER.md)).
+
+```json
+{
+  "status": "not_ready",
+  "environment": "preview",
+  "commit": "abcdef0",
+  "database": {
+    "mode": "postgres",
+    "reachable": true,
+    "shopName": "Hart's Barbers (preview)",
+    "writesAllowed": true,
+    "schema": "outdated",
+    "missing": ["approvals.token"]
+  },
+  "ownerAccess": "configured",
+  "approvalLinks": { "origin": "https://emergent-git-my-branch.vercel.app" },
+  "problems": [
+    "The database schema is outdated, missing approvals.token: rebuild the Preview database from this branch with GitHub → Actions → Preview database → Run workflow (docs/database.md)."
+  ]
+}
+```
+
+- `status` is `ready` exactly when `problems` is empty. Each problem is one sentence saying what to fix and where.
+- `environment` is `VERCEL_ENV` (`development` when unset); `commit` is `VERCEL_GIT_COMMIT_SHA`'s first 7 characters, or `null`.
+- `database.mode` is `postgres` when `DATABASE_URL` is set, else `memory`. `reachable` is whether it answered (within 8 seconds per query).
+- `database.schema` is `current` only if every table and column Front Desk reads and writes exists (`REQUIRED_SCHEMA` in `lib/server/frontdesk/schema.ts`), `outdated` with `missing` naming what isn't there (`table.column`, or a bare table name), or `unknown` when the database couldn't be inspected.
+- `database.writesAllowed`: never in production; elsewhere only when `shopName` ends in "(preview)" (the Preview database) or the data is in memory. A preview on a database without that mark is `not_ready`, since it might be production's.
+- `ownerAccess` is whether `OWNER_API_TOKEN` is set. `approvalLinks.origin` is the request's origin: approval links are built on the origin of the request that creates them.
+
 ## Owner routes
 
 The owner's console reads the bookings list; the other routes change the shop's rules and act on bookings.

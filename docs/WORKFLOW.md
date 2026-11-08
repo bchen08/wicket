@@ -11,11 +11,13 @@ Issue (goal + "done when")
    │
    ▼  every push to a PR branch
 CI (lint · typecheck · build)          +  Vercel preview deployment (own URL)
+                                       +  Preview database rebuilt if supabase/ changed
    │
    ├─ red ─▶ paste the failure into the same Claude session / v0 chat ─▶ fix on same branch
    ▼ green
-Verifier (fresh session, docs/VERIFIER.md) checks issue + SMOKE.md on the preview
+Verifier (fresh session, docs/VERIFIER.md): pnpm smoke, then issue + SMOKE.md on the preview
    │
+   ├─ BLOCKED ───▶ fix the environment (Preview database, Vercel variables), run it again
    ├─ NOT READY ─▶ back to the author's session
    ▼ READY
 Human review: read the diff, click the preview, approve
@@ -24,7 +26,7 @@ Human review: read the diff, click the preview, approve
 Squash-merge to main, delete branch
    │
    ▼
-Vercel deploys main to production automatically ─▶ run SMOKE.md on production
+Vercel deploys main to production automatically ─▶ pnpm smoke <production URL> + SMOKE.md
    │
    └─ broken? ─▶ Vercel "Instant Rollback" first, then a revert PR
 ```
