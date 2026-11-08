@@ -142,7 +142,7 @@ export function parseApproveBody(body: unknown): string | null {
 /**
  * Approve (ApproveRequest → ApproveResponse): opening the link and approving is the consent. The
  * booking becomes confirmed (customer.approved true; customer.phone when a phone was given), and the owner
- * is alerted (once). Only while pending: already answered or cancelled → approval_closed; the hold
+ * is alerted once (booking_confirmed), after the commit. Only while pending: already answered or cancelled → approval_closed; the hold
  * lapsed → approval_expired ("Ask your agent to book again."). In one transaction, only if the hold is
  * still on: the booking is confirmed with an "approved" event (actor customer) and the phone stored.
  * TODO(ring-1c): a service with a deposit goes to awaiting_deposit instead (see decide()).
@@ -170,16 +170,17 @@ export async function approveBooking(deps: FrontDeskDeps, token: string, body?: 
     },
   });
   if (!answered.ok) throw await whyNotPending(deps, token, "approve");
-  // The owner hears about a booking only once the person approved it, never about a hold.
-  await alertOwner(deps.notifier, answered.booking);
+  // Committed: the owner hears about it now (never about a hold alone). A failed alert is recorded, not thrown.
+  await alertOwner(deps, "booking_confirmed", answered.booking);
   return { booking: answered.booking };
 }
 
 // ---- POST /api/approvals/[token]/decline ----
 
 /**
- * Decline (→ DeclineResponse): the booking becomes cancelled (cancelled_by customer), freeing the slot.
- * Only while pending (approval_closed, approval_expired).
+ * Decline (→ DeclineResponse): the booking becomes cancelled (cancelled_by customer), freeing the slot, and
+ * the owner is alerted (booking_cancelled), after the commit. Only while pending (approval_closed,
+ * approval_expired).
  */
 export async function declineBooking(deps: FrontDeskDeps, token: string): Promise<DeclineResponse> {
   const ctx = await openApproval(deps, token);
@@ -197,5 +198,6 @@ export async function declineBooking(deps: FrontDeskDeps, token: string): Promis
     },
   });
   if (!answered.ok) throw await whyNotPending(deps, token, "decline");
+  await alertOwner(deps, "booking_cancelled", answered.booking, "customer");
   return { booking: answered.booking };
 }

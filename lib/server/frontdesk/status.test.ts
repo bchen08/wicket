@@ -66,6 +66,7 @@ describe("GET /api/status", () => {
       },
       ownerAccess: "configured",
       approvalLinks: { origin: "http://localhost:3000" },
+      alerts: "log",
       problems: [],
     });
   });
@@ -86,6 +87,7 @@ describe("GET /api/status", () => {
       },
       ownerAccess: "configured",
       approvalLinks: { origin: ORIGIN },
+      alerts: "log",
       problems: [],
     });
   });
@@ -149,6 +151,14 @@ describe("GET /api/status", () => {
       "OWNER_API_TOKEN isn't set, so the owner routes and /console refuse everyone: set OWNER_API_TOKEN for Preview " +
         "in Vercel → Settings → Environment Variables, then redeploy.",
     ]);
+  });
+
+  it("says alerts go by email when RESEND_API_KEY is set, by log otherwise; neither is a problem", async () => {
+    const email = await getStatus(previewEnv({ VERCEL_ENV: "production", RESEND_API_KEY: "re_live_123" }), ORIGIN, database(CURRENT));
+    expect(email.alerts).toBe("email");
+    expect(JSON.stringify(email)).not.toContain("re_live_123");
+    const log = await getStatus(previewEnv({ RESEND_API_KEY: " " }), ORIGIN, database(CURRENT));
+    expect(log).toMatchObject({ status: "ready", alerts: "log", problems: [] });
   });
 
   it("never allows writes in production, even on a database marked (preview)", async () => {

@@ -46,6 +46,14 @@ describe("createFrontDeskDeps", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("emails owner alerts only when RESEND_API_KEY is set (and the shop has an ownerEmail); otherwise logs them", () => {
+    const alert = { ownerEmail: "dana@example.com" } as Parameters<ReturnType<typeof createFrontDeskDeps>["notifier"]["route"]>[0];
+    const withKey = createFrontDeskDeps({ RESEND_API_KEY: "re_test_123" }, vi.fn());
+    expect(withKey.notifier.route(alert)).toEqual({ channel: "email", recipient: "dana@example.com" });
+    expect(withKey.notifier.route({ ...alert, ownerEmail: null })).toEqual({ channel: "log", recipient: null });
+    expect(createFrontDeskDeps({}, vi.fn()).notifier.route(alert)).toEqual({ channel: "log", recipient: null });
+  });
+
   it("ignores PUBLIC_BASE_URL: approval links use the request's origin", () => {
     const deps = createFrontDeskDeps({ PUBLIC_BASE_URL: "https://frontdesk.example.com" }, vi.fn());
     expect(deps.baseUrl).toBe("http://localhost:3000");

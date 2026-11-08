@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type {
+  AlertsResponse,
   BlockResponse,
   BlocksResponse,
   BookingDetailResponse,
@@ -32,7 +33,7 @@ import {
 import { parseRfc3339 } from "./time";
 
 // Owner use cases behind the /api/shops/[shop]/* owner routes (policies, hours, blocks, services,
-// booking actions). Transport-agnostic like service.ts: http.ts checks the owner token and turns
+// booking actions, alerts). Transport-agnostic like service.ts: http.ts checks the owner token and turns
 // results and FrontDeskErrors into responses.
 //
 // Every request body is validated with zod (strict: unknown fields are rejected). A failure becomes
@@ -171,7 +172,8 @@ function parseQueryInstant(field: "from" | "to", value: string | null | undefine
 
 // ---- Policies ----
 
-const { leadTimeMin, horizonDays, depositHorizonDays, cancelWindowHours, phoneMaxLength, ruleMaxLength } = POLICY_LIMITS;
+const { leadTimeMin, horizonDays, depositHorizonDays, cancelWindowHours, phoneMaxLength, ruleMaxLength, ownerEmailMaxLength } =
+  POLICY_LIMITS;
 
 function ruleText(field: string) {
   const message = `${field} must be text of at most ${ruleMaxLength} characters ("" to clear it).`;
@@ -179,6 +181,7 @@ function ruleText(field: string) {
 }
 
 const phoneMessage = `phone must be text of 1–${phoneMaxLength} characters, or null to remove it.`;
+const ownerEmailMessage = `ownerEmail must be an email address (with an @) of at most ${ownerEmailMaxLength} characters, or null to remove it.`;
 
 const updatePoliciesSchema = z
   .strictObject({
@@ -198,6 +201,15 @@ const updatePoliciesSchema = z
     depositRule: ruleText("depositRule").optional(),
     lateCancelRule: ruleText("lateCancelRule").optional(),
     noShowRule: ruleText("noShowRule").optional(),
+    // Only what gives a clear error: an "@", the length, no NUL. Resend rejects anything else it can't send to.
+    ownerEmail: z
+      .string({ error: ownerEmailMessage })
+      .trim()
+      .max(ownerEmailMaxLength, { error: ownerEmailMessage })
+      .refine((v) => v.includes("@"), { error: ownerEmailMessage })
+      .refine(hasNoNul, noNul("ownerEmail"))
+      .nullable()
+      .optional(),
   } satisfies Record<keyof Policies, z.ZodType>) // same keys as the contract, no more, no fewer
   .refine(atLeastOneField, { error: "Send at least one policy field to change." });
 
@@ -595,4 +607,15 @@ export async function getBookingDetail(
   await requireShop(deps, shopSlug);
   const booking = await requireBooking(deps, shopSlug, bookingId);
   return { booking: withApprovalOrigin(deps, booking), events: await deps.store.listEvents(booking.id) };
+}
+
+// ---- Alerts ----
+
+/** How many alerts GET /api/shops/[shop]/alerts returns. */
+export const ALERTS_LIMIT = 50;
+
+/** GET /api/shops/[shop]/alerts: the shop's newest 50 alerts, newest first, whatever happened to them. */
+export async function listShopAlerts(deps: FrontDeskDeps, shopSlug: string): Promise<AlertsResponse> {
+  const shop = await requireShop(deps, shopSlug);
+  return { shop, alerts: await deps.store.listAlerts(shopSlug, ALERTS_LIMIT) };
 }

@@ -30,6 +30,7 @@ const readyStatus = (overrides = {}) => ({
   },
   ownerAccess: "configured",
   approvalLinks: { origin: BASE },
+  alerts: "log",
   problems: [],
   ...overrides,
 });
@@ -42,10 +43,13 @@ const toolError = (code) => ({ isError: true, content: [{ type: "text", text: JS
 
 /**
  * A fake deployment. `route(url, init, state)` may answer a request first (return a Response) to change one
- * behavior. `doubleBook: true` lets the same start be booked twice (a broken server).
+ * behavior. `doubleBook: true` lets the same start be booked twice (a broken server). `ownerToken` is the
+ * token its owner routes accept. Approving, declining and cancelling record owner alerts, like the real one.
  */
-function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = {}) {
-  const state = { requests: [], bookings: [], mcp: [] };
+function fakeDeployment({ status = readyStatus(), route, doubleBook = false, ownerToken = PREVIEW_OWNER_TOKEN } = {}) {
+  const state = { requests: [], bookings: [], mcp: [], alerts: [] };
+  const alert = (b, kind) => state.alerts.unshift({ id: String(state.alerts.length + 1), bookingId: b.id, kind, channel: "log", status: "logged", error: null });
+  const isOwner = (headers) => headers.get("authorization") === `Bearer ${ownerToken}`;
   const held = (start) => state.bookings.some((b) => b.start === start && b.status === "awaiting_approval");
   const view = (b) => ({
     id: b.id,
@@ -73,9 +77,10 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = 
       });
     }
     if (method === "GET" && url.pathname === "/api/shops/harts/bookings") {
-      return headers.get("authorization") === `Bearer ${PREVIEW_OWNER_TOKEN}`
-        ? json({ bookings: [] })
-        : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
+      return isOwner(headers) ? json({ bookings: [] }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
+    }
+    if (method === "GET" && url.pathname === "/api/shops/harts/alerts") {
+      return isOwner(headers) ? json({ alerts: state.alerts.slice(0, 50) }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
     }
     if (url.pathname === "/api/shops/nope/services") return apiError(404, "not_found");
     if (method === "GET" && url.pathname === "/api/mcp") return new Response(null, { status: 405 });
@@ -83,8 +88,17 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = 
     const decline = /^\/api\/approvals\/([^/]+)\/decline$/.exec(url.pathname);
     if (method === "POST" && decline) {
       const b = state.bookings.find((x) => x.token === decline[1]);
-      if (!b || b.status !== "awaiting_approval") return apiError(409, "not_pending");
+      if (!b || b.status !== "awaiting_approval") return apiError(409, "approval_closed");
       b.status = "cancelled";
+      alert(b, "booking_cancelled");
+      return json({ booking: view(b) });
+    }
+    const approve = /^\/api\/approvals\/([^/]+)\/approve$/.exec(url.pathname);
+    if (method === "POST" && approve) {
+      const b = state.bookings.find((x) => x.token === approve[1]);
+      if (!b || b.status !== "awaiting_approval") return apiError(409, "approval_closed");
+      b.status = "confirmed";
+      alert(b, "booking_confirmed");
       return json({ booking: view(b) });
     }
 
@@ -120,8 +134,9 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = 
       }
       if (name === "cancel") {
         const b = state.bookings.find((x) => x.id === args.booking_id);
-        if (!b || b.status !== "awaiting_approval") return reply(toolError("not_cancellable"));
+        if (!b || !["awaiting_approval", "confirmed"].includes(b.status)) return reply(toolError("not_cancellable"));
         b.status = "cancelled";
+        alert(b, "booking_cancelled");
         return reply(toolResult({ booking: view(b) }));
       }
     }
@@ -154,11 +169,13 @@ describe("pnpm smoke", () => {
 
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(results(run.rows)).toEqual(Array(15).fill("PASS"));
-    expect(run.line).toBe("PASS: 15 passed.");
-    expect(run.output).toMatch(/\nPASS: 15 passed\.$/);
-    // Every booking it made is declined.
-    expect(deployment.state.bookings.map((b) => b.status)).toEqual(["cancelled"]);
+    expect(results(run.rows)).toEqual(Array(20).fill("PASS"));
+    expect(run.line).toBe("PASS: 20 passed.");
+    expect(run.output).toMatch(/\nPASS: 20 passed\.$/);
+    // One booking declined; the other approved, then cancelled by the cleanup.
+    expect(deployment.state.bookings.map((b) => b.status)).toEqual(["cancelled", "cancelled"]);
+    expect(run.rows.find((r) => r.title.includes("booking_cancelled"))).toMatchObject({ item: "14", evidence: "booking_cancelled by log, logged" });
+    expect(run.rows.find((r) => r.title.includes("booking_confirmed"))).toMatchObject({ item: "17", evidence: "booking_confirmed by log, logged" });
     // The bypass secret went on every request, and the secret itself is never printed.
     expect(deployment.state.requests.every((r) => r.headers.get(BYPASS_HEADER) === "bypass-secret")).toBe(true);
     expect(run.output).not.toContain("bypass-secret");
@@ -185,8 +202,8 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("FAIL");
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.item === "2")).toMatchObject({ result: "FAIL", evidence: "HTTP 500 boom" });
-    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(14);
-    expect(run.line).toBe("FAIL: 1 failed, 14 passed, 0 skipped.");
+    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(19);
+    expect(run.line).toBe("FAIL: 1 failed, 19 passed, 0 skipped.");
   });
 
   it("BLOCKED: not_ready prints the problems, runs nothing else and exits 2", async () => {
@@ -248,26 +265,55 @@ describe("pnpm smoke", () => {
     const run = await smoke(deployment);
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual(["5", "11", "11", "12", "14", "14"]);
+    expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual(["5", "5", "11", "11", "12", "14", "14", "14", "17", "17"]);
     // No cleanup row either: it made no bookings.
-    expect(run.line).toBe("PASS: 8 passed, 6 skipped (a skipped check is not a pass: verify those by hand).");
+    expect(run.line).toBe("PASS: 9 passed, 10 skipped (a skipped check is not a pass: verify those by hand).");
     expect(deployment.state.mcp.some((c) => c.params?.name === "book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.headers.get("authorization"))).toBe(false);
   });
 
   it("--owner-token overrides the preview token, and is never printed", async () => {
-    let sent;
-    const deployment = fakeDeployment({
-      route: (url, init) => {
-        if (url.pathname !== "/api/shops/harts/bookings") return undefined;
-        sent = new Headers(init.headers).get("authorization");
-        return sent ? json({ bookings: [] }) : apiError(401, "unauthorized", UNLOCK_NEXT_ACTION);
-      },
-    });
+    const deployment = fakeDeployment({ ownerToken: "prod-secret-token" });
     const run = await smoke(deployment, { ownerToken: "prod-secret-token" });
-    expect(sent).toBe("Bearer prod-secret-token");
+    const sent = deployment.state.requests.map((r) => r.headers.get("authorization")).filter(Boolean);
+    expect(sent.length).toBeGreaterThan(0);
+    expect(new Set(sent)).toEqual(new Set(["Bearer prod-secret-token"]));
     expect(run.exitCode).toBe(EXIT.pass);
     expect(run.output).not.toContain("prod-secret-token");
+  });
+
+  it("FAIL: an alert that's missing, or recorded as failed", async () => {
+    // A server that records no booking_cancelled alert, and a failed booking_confirmed one.
+    const deployment = fakeDeployment({
+      route: (url, init, state) => {
+        if (url.pathname !== "/api/shops/harts/alerts" || !new Headers(init.headers).get("authorization")) return undefined;
+        const confirmed = state.alerts.filter((a) => a.kind === "booking_confirmed").map((a) => ({ ...a, channel: "email", status: "failed", error: "Resend answered HTTP 403: nope" }));
+        return json({ alerts: confirmed });
+      },
+    });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.fail);
+    expect(run.rows.find((r) => r.title.includes("booking_cancelled"))).toMatchObject({
+      result: "FAIL",
+      evidence: "no booking_cancelled alert for booking-1 among the newest 0",
+    });
+    expect(run.rows.find((r) => r.title.includes("booking_confirmed"))).toMatchObject({
+      result: "FAIL",
+      evidence: "booking_confirmed by email, failed: Resend answered HTTP 403: nope",
+    });
+  });
+
+  it("without an owner token (not a preview), the alert checks are SKIPPED, but the approval still runs", async () => {
+    const deployment = fakeDeployment({ status: readyStatus({ environment: "development", database: { ...readyStatus().database, mode: "memory" } }) });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.pass);
+    expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.title)).toEqual([
+      `Owner bookings with Bearer ${PREVIEW_OWNER_TOKEN} → 200`,
+      `Owner alerts with Bearer ${PREVIEW_OWNER_TOKEN} → 200`,
+      "The owner's alerts list has booking_cancelled for it",
+      "The owner's alerts list has booking_confirmed for it",
+    ]);
+    expect(run.rows.find((r) => r.item === "17" && r.title.startsWith("Book another"))).toMatchObject({ result: "PASS" });
   });
 
   it("declines every booking it made even when a booking check fails", async () => {
@@ -277,8 +323,8 @@ describe("pnpm smoke", () => {
     const run = await smoke(deployment);
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.title.includes("slot_taken"))).toMatchObject({ result: "FAIL", evidence: "booked again: booking-2" });
-    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "2 made, 2 declined: none left behind" });
-    expect(deployment.state.bookings.map((b) => b.status)).toEqual(["cancelled", "cancelled"]);
+    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "3 made, 3 declined or cancelled: none left behind" });
+    expect(deployment.state.bookings.map((b) => b.status)).toEqual(["cancelled", "cancelled", "cancelled"]);
   });
 
   it("fails the cleanup row when a booking can't be declined or cancelled", async () => {
@@ -293,7 +339,7 @@ describe("pnpm smoke", () => {
     });
     const run = await smoke(deployment);
     expect(run.exitCode).toBe(EXIT.fail);
-    expect(run.rows.at(-1)).toMatchObject({ result: "FAIL", evidence: "still held: booking-1 (internal)" });
+    expect(run.rows.at(-1)).toMatchObject({ result: "FAIL", evidence: "still held: booking-1 (internal), booking-2 (internal)" });
   });
 });
 
