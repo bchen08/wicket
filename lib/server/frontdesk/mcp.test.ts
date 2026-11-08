@@ -23,7 +23,7 @@ import {
   memoryDeps,
   NOW,
   PHONE_E164,
-  recordingNotifier,
+  alertSummary,
   withCatalog,
 } from "./test-support";
 
@@ -210,13 +210,17 @@ describe("MCP /api/mcp", () => {
     expect(data.services.find((s) => s.id === "beard-trim")).toMatchObject({ depositCents: 0 });
   });
 
-  it("get_policies returns Hart's rules, and reads them in plain language", async () => {
+  it("get_policies returns Hart's rules, and reads them in plain language, without the owner's email", async () => {
+    deps = memoryDeps({ policies: { ownerEmail: "dana@example.com" } });
     const result = await callTool("get_policies");
     expect(result.isError).toBeFalsy();
+    const { ownerEmail, ...rules } = SEED.policies.harts;
+    expect(ownerEmail).toBeNull();
     expect(result.structuredContent).toEqual({
       shop: { slug: "harts", name: "Hart's Barbers", timezone: "America/New_York" },
-      policies: SEED.policies.harts,
+      policies: rules,
     } satisfies GetPoliciesResult);
+    expect(JSON.stringify(result)).not.toContain("dana@example.com");
     const text = result.content[0].text;
     expect(text).toContain("Bookings are open.");
     expect(text).toContain("Book at least 2 hours ahead.");
@@ -349,7 +353,7 @@ describe("MCP book tool", () => {
     expect(text).toContain(booking.id);
     expect(text).not.toContain("replayed");
     // The owner hears nothing about a hold.
-    expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
+    expect(alertSummary(deps.notifier)).toEqual([]);
 
     const after = await callTool("get_availability", {
       service_id: "haircut",

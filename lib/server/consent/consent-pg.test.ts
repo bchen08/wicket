@@ -143,7 +143,12 @@ if (!url) {
         depositEffect: "none",
         depositCollected: false,
       });
-      expect(notifier.alerts.slice(alertsBefore).map((b) => [b.id, b.status])).toEqual([[booking.id, "confirmed"]]);
+      expect(notifier.alerts.slice(alertsBefore).map((a) => [a.kind, a.booking.id, a.booking.status])).toEqual([
+        ["booking_confirmed", booking.id, "confirmed"],
+      ]);
+      // Recorded in the alerts table.
+      const [recorded] = await deps.store.listAlerts(shop, 1);
+      expect(recorded).toMatchObject({ shopSlug: shop, bookingId: booking.id, kind: "booking_confirmed", channel: "log", status: "logged" });
 
       // Any answer now: approval_closed, and the owner isn't told twice.
       expect((await failure(approveBooking(deps, token, {}))).code).toBe("approval_closed");
@@ -237,7 +242,7 @@ if (!url) {
       ]);
     });
 
-    it("decline → cancelled by the customer, the slot freed, no owner alert", async () => {
+    it("decline → cancelled by the customer, the slot freed, one booking_cancelled owner alert", async () => {
       setNow(time(4, 0, 9));
       const alertsBefore = notifier.alerts.length;
       const start = time(4, 1, 14);
@@ -255,7 +260,9 @@ if (!url) {
       const wednesday = { service_id: "trim", from: time(4, 1, 0), to: time(4, 2, 0), limit: 50 };
       expect((await getAvailability(deps, shop, wednesday)).slots.map((s) => s.start)).toContain(start);
       expect(await hold(start, "Someone Else")).toMatchObject({ status: "awaiting_approval" });
-      expect(notifier.alerts.length - alertsBefore).toBe(0);
+      expect(notifier.alerts.slice(alertsBefore).map((a) => [a.kind, a.booking.id, a.cancelledBy])).toEqual([
+        ["booking_cancelled", booking.id, "customer"],
+      ]);
     });
 
     it("an agent cancelling the hold closes the link: the page shows expired, answers are approval_closed", async () => {

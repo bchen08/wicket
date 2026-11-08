@@ -1,5 +1,8 @@
 import postgres from "postgres";
 import type {
+  AlertChannel,
+  AlertKind,
+  AlertStatus,
   BlockedTime,
   Booking,
   BookingActor,
@@ -12,6 +15,7 @@ import type {
 import {
   normalizeUuid,
   SlotTakenError,
+  toAlert,
   toBooking,
   toBookingEvent,
   type AnswerApprovalResult,
@@ -31,7 +35,7 @@ import {
 } from "./catalog";
 
 // Postgres ShopCatalog + BookingStore (postgres.js), for the schema in
-// supabase/migrations/0001_skeleton.sql, 0002_rules.sql and 0003_consent.sql.
+// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql and 0004_alerts.sql.
 
 /** SQLSTATE exclusion_violation: the bookings.no_overlap constraint fired. */
 const EXCLUSION_VIOLATION = "23P01";
@@ -165,6 +169,7 @@ type PoliciesRow = {
   deposit_rule: string;
   late_cancel_rule: string;
   no_show_rule: string;
+  owner_email: string | null;
 };
 
 /** `patch` without its undefined fields, so spreading it never overwrites a value with undefined. */
@@ -192,6 +197,7 @@ function toPolicies(r: PoliciesRow): Policies {
     depositRule: r.deposit_rule,
     lateCancelRule: r.late_cancel_rule,
     noShowRule: r.no_show_rule,
+    ownerEmail: r.owner_email,
   };
 }
 
@@ -229,7 +235,40 @@ const expiredEventJson = (db: Db) => db`
 
 const policyColumns = (db: Db) => db`
   lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone,
-  deposit_rule, late_cancel_rule, no_show_rule
+  deposit_rule, late_cancel_rule, no_show_rule, owner_email
+`;
+
+type AlertRow = {
+  id: string;
+  shop_slug: string;
+  booking_id: string;
+  kind: AlertKind;
+  channel: AlertChannel;
+  recipient: string | null;
+  status: AlertStatus;
+  error: string | null;
+  created_at: Date;
+  timezone: string;
+};
+
+const toAlertFromRow = (r: AlertRow) =>
+  toAlert({
+    id: r.id,
+    shopSlug: r.shop_slug,
+    bookingId: r.booking_id,
+    kind: r.kind,
+    channel: r.channel,
+    recipient: r.recipient,
+    status: r.status,
+    error: r.error,
+    createdAt: r.created_at,
+    timezone: r.timezone,
+  });
+
+/** The columns of an Alert. `a` is alerts or a CTE with the same columns, joined to shops as `sh`. */
+const alertColumns = (db: Db) => db`
+  a.id::text as id, a.shop_slug, a.booking_id::text as booking_id, a.kind, a.channel, a.recipient,
+  a.status, a.error, a.created_at, sh.timezone
 `;
 
 /**
@@ -457,6 +496,37 @@ function bookingStoreOn(conn: Conn): BookingStore {
         throw err;
       }
     },
+
+    // ---- Owner alerts ----
+
+    async recordAlert(alert) {
+      const key = normalizeUuid(alert.bookingId);
+      if (key === null) throw new Error(`Alert for a booking id that isn't a UUID: ${alert.bookingId}`);
+      const rows = await db<AlertRow[]>`
+        with a as (
+          insert into alerts (shop_slug, booking_id, kind, channel, recipient, status, error)
+          values (
+            ${alert.shopSlug}, ${key}::uuid, ${alert.kind}, ${alert.channel}, ${alert.recipient},
+            ${alert.status}, ${alert.error}
+          )
+          returning *
+        )
+        select ${alertColumns(db)} from a join shops sh on sh.slug = a.shop_slug
+      `;
+      if (!rows[0]) throw new Error("Insert into alerts returned no row.");
+      return toAlertFromRow(rows[0]);
+    },
+
+    async listAlerts(shopSlug, limit) {
+      const rows = await db<AlertRow[]>`
+        select ${alertColumns(db)}
+        from alerts a join shops sh on sh.slug = a.shop_slug
+        where a.shop_slug = ${shopSlug}
+        order by a.created_at desc, a.id desc
+        limit ${limit}
+      `;
+      return rows.map(toAlertFromRow);
+    },
   };
   return store;
 }
@@ -556,7 +626,7 @@ function catalogOn(conn: Conn): ShopCatalog {
           select ${policyColumns(tx)} from policies where shop_slug = ${slug} for update
         `;
         if (!stored) throw new Error("Select from policies returned no row.");
-        // Absent or undefined fields keep their stored values; phone: null clears the phone.
+        // Absent or undefined fields keep their stored values; phone: null clears the phone, ownerEmail: null the email.
         const p: Policies = { ...toPolicies(stored), ...defined(patch) };
         const rows = await tx<PoliciesRow[]>`
           update policies set
@@ -569,6 +639,7 @@ function catalogOn(conn: Conn): ShopCatalog {
             deposit_rule = ${p.depositRule},
             late_cancel_rule = ${p.lateCancelRule},
             no_show_rule = ${p.noShowRule},
+            owner_email = ${p.ownerEmail},
             updated_at = now()
           where shop_slug = ${slug}
           returning ${policyColumns(tx)}

@@ -22,8 +22,8 @@ import { bookingActionPost, bookingDetailGet, bookingsResponse, policiesGet, pol
 import { createFrontDeskMcpHandler } from "./mcp";
 import { NOT_SET_UP_NEXT_ACTION, UNLOCK_NEXT_ACTION } from "./owner-auth";
 import { SEED } from "./memory-store";
-import type { FrontDeskDeps } from "./service";
-import { approvalToken, customerOf, memoryDeps, PHONE_E164, recordingNotifier } from "./test-support";
+import { agentPolicies, type FrontDeskDeps } from "./service";
+import { alertSummary, approvalToken, customerOf, memoryDeps, PHONE_E164 } from "./test-support";
 
 // Issue #8's "Done when" list, end to end: the real MCP handler (what /api/mcp mounts) and the real
 // owner HTTP handlers (what the /api/shops/* route files call) over ONE deps object, the way
@@ -201,7 +201,7 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect(data.policies.depositRule).toMatch(/hold the deposit on your card at booking/);
     expect(data.policies.lateCancelRule).toMatch(/at least 24 hours .* released.*within 24 hours .* keep the deposit/);
     expect(data.policies.noShowRule).toMatch(/don't show up, we keep the deposit.*released/);
-    expect(data.policies).toEqual(SEED.policies.harts);
+    expect(data.policies).toEqual(agentPolicies(SEED.policies.harts));
     // The text relays the same rules.
     expect(text).toMatch(/at least 2 hours ahead/);
     expect(text).toMatch(/24 hours/);
@@ -258,7 +258,7 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     const detail = await bookingDetail(first.data.booking.id);
     expect(detail.booking).toEqual(first.data.booking); // the same link, for the owner to copy
     expect(detail.events.map((e) => [e.type, e.actor])).toEqual([["booked", "agent"]]);
-    expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
+    expect(alertSummary(deps.notifier)).toEqual([]);
   });
 
   it("4. MCP cancel more than 24 hours ahead → cancelled, depositEffect released, and the slot is offered again", async () => {
@@ -460,8 +460,7 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
       ["approved", "customer"],
     ]);
     // The owner hears about it exactly once, when it was approved.
-    const alerts = (deps.notifier as ReturnType<typeof recordingNotifier>).alerts;
-    expect(alerts.map((b) => [b.id, b.status])).toEqual([[booking.id, "confirmed"]]);
+    expect(alertSummary(deps.notifier)).toEqual([["booking_confirmed", booking.id, "confirmed"]]);
   });
 
   it("a second agent booking the same slot while it's on hold gets slot_taken", async () => {
@@ -498,7 +497,8 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
     expect(declined.booking).toMatchObject({ id: held.id, status: "cancelled", customer: { approved: false } });
     expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).toContain(THU_1000);
     expect((await approvalView(token)).status).toBe("declined");
-    expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
+    // The owner hears that it was declined.
+    expect(alertSummary(deps.notifier)).toEqual([["booking_cancelled", held.id, "cancelled"]]);
   });
 
   it("approving with no body (no phone): confirmed and approved, no customer.phone", async () => {

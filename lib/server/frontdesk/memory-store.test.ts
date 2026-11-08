@@ -366,6 +366,7 @@ describe("owner writes", () => {
       depositRule: "d",
       lateCancelRule: "l",
       noShowRule: "n",
+      ownerEmail: "dana@example.com",
     };
     expect(await store.savePolicies("harts", { ...next, extra: "ignored" } as Policies)).toEqual(next);
     expect(await store.getPolicies("harts")).toEqual(next);
