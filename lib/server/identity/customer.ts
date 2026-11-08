@@ -53,8 +53,8 @@ export function parseMobile(value: unknown): string | null {
 
 /**
  * Sign the person in at the shop: the customer with this phone, created if new, with `name` as their name.
- * TODO(ring-2): verify the phone with a texted code once the texting PR lands. Until then anyone who types
- * a number signs in as that number's customer.
+ * Where texting is on, /signin only gets here once the code texted to the number was entered
+ * (lib/server/oauth/authorize.ts). Where it's off, anyone who types a number signs in as that number's customer.
  */
 export function signInCustomer(store: SigninStore, shopSlug: string, name: string, phone: string): Promise<Customer> {
   return store.upsertCustomer(shopSlug, phone, name);

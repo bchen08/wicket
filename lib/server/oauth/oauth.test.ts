@@ -1,15 +1,15 @@
 import { randomBytes } from "node:crypto";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AuthorizationParams, ClientRegistrationResponse, TokenResponse } from "../../types/oauth";
 import type { Clock } from "../clock";
 import { createMemoryStore } from "../frontdesk/memory-store";
-import { NOW } from "../frontdesk/test-support";
+import { failingTexter, NOW, recordingTexter } from "../frontdesk/test-support";
 import { answerAuthorization, getSigninView, startAuthorization } from "./authorize";
 import { isMetadataDocumentUrl, METADATA_CACHE_MS, redirectUriAllowed, registerClient } from "./clients";
 import type { SigninDeps } from "./deps";
 import { authorizationServerMetadataGet, protectedResourceGet } from "./http";
 import { createMemorySigninStore } from "./memory-store";
-import { ACCESS_TOKEN_SECONDS, CODE_SECONDS, REFRESH_TOKEN_SECONDS } from "./metadata";
+import { ACCESS_TOKEN_SECONDS, CODE_SECONDS, REFRESH_TOKEN_SECONDS, TEXTED_CODE_SECONDS } from "./metadata";
 import type { SigninStore } from "./store";
 import { exchangeToken, s256 } from "./token";
 
@@ -222,6 +222,170 @@ describe("authorization code + PKCE with a Client ID Metadata Document", () => {
       const view = await getSigninView(deps, (n) => location.searchParams.get(n));
       expect(view).toMatchObject({ kind: "ask", error });
     }
+  });
+});
+
+describe("a texted code at sign-in", () => {
+  const PHONE = "+14015550123";
+  let texter: ReturnType<typeof recordingTexter>;
+
+  beforeEach(() => {
+    texter = recordingTexter();
+    deps = { ...deps, texter };
+  });
+
+  /** Post the /signin form. Returns where it sent the person. */
+  async function post(params: AuthorizationParams, fields: { name?: unknown; phone?: unknown; codeId?: unknown; code?: unknown }): Promise<URL> {
+    const answer = await answerAuthorization(deps, { params, decision: "allow", name: "", phone: "", ...fields });
+    expect(answer.status).toBe(303);
+    return new URL((answer as { location: string }).location);
+  }
+
+  /** Allow with a name and number: returns the texted code, its id, and the /signin URL that asks for it. */
+  async function requestCode(params: AuthorizationParams, name = "Maya Lopez", phone = PHONE) {
+    const signin = await post(params, { name, phone });
+    expect(signin.pathname).toBe("/signin");
+    const codeId = signin.searchParams.get("code_id");
+    expect(codeId).toBeTruthy();
+    const code = /^(\d{6}) /.exec(texter.sent.at(-1)!.body)?.[1];
+    expect(code).toBeTruthy();
+    return { codeId: codeId!, code: code!, signin };
+  }
+
+  const viewAt = (url: URL) => getSigninView(deps, (n) => url.searchParams.get(n));
+
+  it("needs the code: Allow only texts it, and the post with the code signs in", async () => {
+    const upsert = vi.spyOn(store, "upsertCustomer");
+    const createCode = vi.spyOn(store, "createCode");
+    const { verifier, challenge } = pkce();
+    const params = authParams({ code_challenge: challenge });
+
+    expect(await getSigninView(deps, (n) => (params as Record<string, string>)[n])).toMatchObject({ kind: "ask", textedCode: null });
+
+    // A US number typed the local way is texted as E.164, and nothing is signed in yet.
+    const { codeId, code, signin } = await requestCode(params, "Maya Lopez", "(401) 555-0123");
+    expect(texter.sent).toEqual([{ to: PHONE, body: `${code} is your code to sign in to Hart's Barbers on Front Desk. It works once, for 10 minutes.` }]);
+    expect(upsert).not.toHaveBeenCalled();
+    expect(createCode).not.toHaveBeenCalled();
+
+    // The page asks for the code, and only the masked number and an id are in the URL and the view.
+    expect(signin.search).not.toMatch(/4015550123|Maya/);
+    expect(await viewAt(signin)).toMatchObject({ kind: "ask", textedCode: { id: codeId, sentTo: "•••• 0123" }, error: null });
+
+    const back = await post(params, { codeId, code });
+    expect(`${back.origin}${back.pathname}`).toBe(CALLBACK);
+    expect(back.searchParams.get("state")).toBe("xyz-state");
+    expect(back.searchParams.get("iss")).toBe(BASE);
+    const tokens = await tokensFor(back.searchParams.get("code")!, verifier);
+    expect((await store.getToken(tokens.access_token, "access"))?.customer).toMatchObject({ name: "Maya Lopez", phone: PHONE });
+  });
+
+  it("signs in the number the code was texted to, whatever else the form says", async () => {
+    const { verifier, challenge } = pkce();
+    const params = authParams({ code_challenge: challenge });
+    const { codeId, code } = await requestCode(params);
+    const back = await post(params, { codeId, code, name: "Someone Else", phone: "+12125550100" });
+    const tokens = await tokensFor(back.searchParams.get("code")!, verifier);
+    expect((await store.getToken(tokens.access_token, "access"))?.customer).toMatchObject({ name: "Maya Lopez", phone: PHONE });
+  });
+
+  it("never signs in without a code id: a post with only a code texts a new one", async () => {
+    const upsert = vi.spyOn(store, "upsertCustomer");
+    const params = authParams();
+    const back = await post(params, { name: "Maya Lopez", phone: PHONE, code: "123456" });
+    expect(back.pathname).toBe("/signin");
+    expect(back.searchParams.get("code_id")).toBeTruthy();
+    expect(texter.sent).toHaveLength(1);
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("keeps asking after a wrong code, which doesn't use the code up", async () => {
+    const params = authParams();
+    const { codeId, code } = await requestCode(params);
+    const wrong = code === "000000" ? "000001" : "000000";
+    for (const given of [wrong, "12345", "abcdef", `${code}\u0000`, "", undefined, 123456]) {
+      const back = await post(params, { codeId, code: given });
+      expect(back.pathname).toBe("/signin");
+      expect(back.searchParams.get("error")).toBe("invalid_code");
+      expect(back.searchParams.get("code_id")).toBe(codeId);
+      expect(await viewAt(back)).toMatchObject({ textedCode: { id: codeId }, error: "invalid_code" });
+    }
+    // Spaces inside the code are fine.
+    const back = await post(params, { codeId, code: ` ${code.slice(0, 3)} ${code.slice(3)} ` });
+    expect(`${back.origin}${back.pathname}`).toBe(CALLBACK);
+  });
+
+  it("works once", async () => {
+    const params = authParams();
+    const { codeId, code } = await requestCode(params);
+    expect((await post(params, { codeId, code })).searchParams.get("code")).toBeTruthy();
+    const again = await post(params, { codeId, code });
+    expect(again.pathname).toBe("/signin");
+    expect(again.searchParams.get("code")).toBeNull();
+    expect(await viewAt(again)).toMatchObject({ textedCode: null, error: "code_expired" });
+  });
+
+  it("lasts 10 minutes, then goes back to asking for the name and number", async () => {
+    const params = authParams();
+    const first = await requestCode(params);
+    now = new Date(NOW.getTime() + TEXTED_CODE_SECONDS * 1000 - 1);
+    expect((await post(params, first)).searchParams.get("code")).toBeTruthy();
+
+    now = new Date(NOW);
+    const second = await requestCode(params);
+    now = new Date(NOW.getTime() + TEXTED_CODE_SECONDS * 1000);
+    const late = await post(params, second);
+    expect(late.pathname).toBe("/signin");
+    expect(await viewAt(late)).toMatchObject({ textedCode: null, error: "code_expired" });
+  });
+
+  it("treats a malformed code id as a code that ran out", async () => {
+    const params = authParams();
+    const back = await post(params, { codeId: "not-a-uuid\u0000", code: "123456" });
+    expect(back.searchParams.get("error")).toBe("invalid_code");
+    expect(await viewAt(back)).toMatchObject({ textedCode: null, error: "code_expired" });
+  });
+
+  it("stays on the name and number when the text doesn't go through, and signs nobody in", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const upsert = vi.spyOn(store, "upsertCustomer");
+    const failing = failingTexter("Twilio answered HTTP 400: The 'To' number is not valid.");
+    deps = { ...deps, texter: failing };
+    const back = await post(authParams(), { name: "Maya Lopez", phone: PHONE });
+    expect(back.pathname).toBe("/signin");
+    expect(back.searchParams.get("error")).toBe("send_failed");
+    expect(back.searchParams.get("code_id")).toBeNull();
+    expect(await viewAt(back)).toMatchObject({ textedCode: null, error: "send_failed" });
+    expect(failing.tried).toHaveLength(1);
+    expect(upsert).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("oauth.signin_code_text_failed"));
+    log.mockRestore();
+  });
+
+  it("texts nothing for a bad name or number", async () => {
+    expect((await post(authParams(), { name: "", phone: PHONE })).searchParams.get("error")).toBe("invalid_name");
+    expect((await post(authParams(), { name: "Maya", phone: "12345" })).searchParams.get("error")).toBe("invalid_phone");
+    expect(texter.sent).toEqual([]);
+  });
+
+  it("can be denied at the code step", async () => {
+    const params = authParams();
+    const { codeId, code } = await requestCode(params);
+    const answer = await answerAuthorization(deps, { params, decision: "deny", name: "", phone: "", codeId, code });
+    expect(new URL((answer as { location: string }).location).searchParams.get("error")).toBe("access_denied");
+  });
+
+  it("doesn't change anything where texting is off: no code, no text, signed in on Allow", async () => {
+    const params = authParams();
+    const { codeId } = await requestCode(params);
+    deps = { ...deps, texter: null };
+    const stale = new URLSearchParams({ ...params, code_id: codeId });
+    expect(await getSigninView(deps, (n) => stale.get(n))).toMatchObject({ kind: "ask", textedCode: null, error: null });
+    const sentBefore = texter.sent.length;
+    const back = await post(params, { name: "Maya Lopez", phone: PHONE });
+    expect(`${back.origin}${back.pathname}`).toBe(CALLBACK);
+    expect(back.searchParams.get("code")).toBeTruthy();
+    expect(texter.sent).toHaveLength(sentBefore);
   });
 });
 

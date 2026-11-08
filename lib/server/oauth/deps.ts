@@ -1,6 +1,7 @@
 import type { Clock } from "../clock";
 import type { ShopCatalog } from "../frontdesk/catalog";
 import { ConfigurationError, getFrontDeskDeps } from "../frontdesk/deps";
+import type { TextSender } from "../notify/text-sender";
 import { createMemorySigninStore } from "./memory-store";
 import { createPostgresSigninStore } from "./postgres-store";
 import type { SigninStore } from "./store";
@@ -16,6 +17,8 @@ export type SigninDeps = {
   /** For the shop's name on /signin. */
   catalog: Pick<ShopCatalog, "getShop">;
   store: SigninStore;
+  /** Where set, /signin texts a code to the number and signs in only once it's entered. Null or absent: texting is off. */
+  texter?: TextSender | null;
   /** Fetches Client ID Metadata Documents. globalThis.fetch in the app; tests pass a fake. */
   fetch: typeof fetch;
   /** The origin this deployment is served from, without a trailing slash: the issuer. */
@@ -44,7 +47,7 @@ export function getSigninStore(): SigninStore {
 }
 
 /**
- * The sign-in deps: Front Desk's clock and catalog, the sign-in store, and `origin` as the issuer (routes
+ * The sign-in deps: Front Desk's clock, catalog and text sender, the sign-in store, and `origin` as the issuer (routes
  * pass their request's origin, so previews and production each issue for themselves with no setting).
  */
 export function getSigninDeps(origin: string): SigninDeps {
@@ -53,6 +56,7 @@ export function getSigninDeps(origin: string): SigninDeps {
     clock: frontDesk.clock,
     catalog: frontDesk.catalog,
     store: getSigninStore(),
+    texter: frontDesk.texter,
     fetch: globalThis.fetch,
     baseUrl: origin,
   };

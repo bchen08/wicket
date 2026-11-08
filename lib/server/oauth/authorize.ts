@@ -1,9 +1,12 @@
 import { randomBytes } from "node:crypto";
 import type { AuthorizationParams, SigninFormError, SigninView } from "../../types/oauth";
 import { parseCustomerName, parseMobile, signInCustomer } from "../identity/customer";
+import type { TextSender } from "../notify/text-sender";
+import { maskPhone } from "../notify/texting";
+import { newTextedCode, signinCodeText } from "../notify/texts";
 import { ClientError, clientDisplayName, resolveClient } from "./clients";
 import type { SigninDeps } from "./deps";
-import { CODE_SECONDS, SCOPE, SIGNIN_PATH, SIGNIN_SHOP_SLUG } from "./metadata";
+import { CODE_SECONDS, SCOPE, SIGNIN_PATH, SIGNIN_SHOP_SLUG, TEXTED_CODE_SECONDS } from "./metadata";
 import type { OAuthClient } from "./store";
 
 // The authorization endpoint (/api/oauth/authorize) and the /signin page behind it: authorization code
@@ -13,6 +16,10 @@ import type { OAuthClient } from "./store";
 //   /signin?…                    "<client> wants to book at Hart's as you": name, mobile number, Allow / Deny
 //   POST /api/oauth/authorize    the form: find or create the customer by (shop, phone), then 303 to the
 //                                client's redirect_uri with code, state and iss (or error=access_denied)
+//
+// Where texting is on, Allow doesn't sign in yet. It texts a 6-digit code to the number and 303s back to
+// /signin?…&code_id=<id>, which asks for the code; the post with the right code is what signs in. Nothing
+// happens to the customer until then.
 //
 // A request with an unknown client or a redirect URI the client didn't declare is never sent back to the
 // client: the person sees the error. Other mistakes go back to the redirect URI as OAuth errors.
@@ -112,7 +119,14 @@ function redirectHost(redirectUri: string): string {
   }
 }
 
-const FORM_ERRORS: readonly SigninFormError[] = ["invalid_name", "invalid_phone", "internal"];
+const FORM_ERRORS: readonly SigninFormError[] = [
+  "invalid_name",
+  "invalid_phone",
+  "send_failed",
+  "invalid_code",
+  "code_expired",
+  "internal",
+];
 
 /**
  * What /signin shows for its query: who wants access and the form, or why the request can't go on. A
@@ -130,13 +144,17 @@ export async function getSigninView(
   }
   const shop = await deps.catalog.getShop(SIGNIN_SHOP_SLUG);
   const error = get("error");
+  const codeId = deps.texter ? get("code_id") : null;
+  const textedCode = codeId ? await deps.store.getSigninCode(codeId, deps.clock.now()) : null;
   return {
     kind: "ask",
     clientName: clientDisplayName(check.client),
     clientHost: redirectHost(check.params.redirect_uri),
     shop: { slug: SIGNIN_SHOP_SLUG, name: shop?.name ?? SIGNIN_SHOP_SLUG },
     params: check.params,
-    error: FORM_ERRORS.find((code) => code === error) ?? null,
+    textedCode: textedCode && { id: textedCode.id, sentTo: maskPhone(textedCode.phone) },
+    // A code that has run out sends the person back to the name and number, whatever the last post said.
+    error: codeId && !textedCode ? "code_expired" : (FORM_ERRORS.find((code) => code === error) ?? null),
   };
 }
 
@@ -157,14 +175,51 @@ function newCode(): string {
 }
 
 /**
+ * Store a new code for this person and text it to their number. Returns its id, or null when the text
+ * didn't go through (the provider's message is logged, not shown, since it can name the number).
+ */
+async function textSigninCode(deps: SigninDeps, texter: TextSender, name: string, phone: string): Promise<string | null> {
+  const code = newTextedCode();
+  const expiresAt = new Date(deps.clock.now().getTime() + TEXTED_CODE_SECONDS * 1000);
+  // Stored first, so a code that arrives always works.
+  const stored = await deps.store.createSigninCode({ shopSlug: SIGNIN_SHOP_SLUG, code, phone, name, expiresAt });
+  const shop = await deps.catalog.getShop(SIGNIN_SHOP_SLUG);
+  try {
+    await texter.send(phone, signinCodeText(code, shop?.name ?? SIGNIN_SHOP_SLUG));
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        event: "oauth.signin_code_text_failed",
+        shop: SIGNIN_SHOP_SLUG,
+        provider: texter.provider,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  }
+  return stored.id;
+}
+
+/** Enter a texted code: who it was texted to, or null. Spaces are ignored; anything but six digits is simply wrong. */
+async function enterSigninCode(deps: SigninDeps, codeId: string, given: unknown): Promise<{ name: string; phone: string } | null> {
+  const code = typeof given === "string" ? given.replace(/\s+/g, "") : "";
+  if (!/^[0-9]{6}$/.test(code)) return null;
+  return deps.store.useSigninCode(codeId, code, deps.clock.now());
+}
+
+/**
  * POST /api/oauth/authorize, the /signin form: `decision` "allow" (with name and phone) or "deny". Allow
  * finds or creates the customer by (shop, phone), stores a code (10 minutes, PKCE challenge, redirect URI)
  * and sends the person back to the client with it. A name or number that doesn't work sends them back to
  * /signin with ?error=invalid_name or invalid_phone (nothing personal in the URL).
+ *
+ * Where texting is on, Allow with a name and number only texts the code and sends them back to /signin to
+ * enter it. Allow with `codeId` and the right `code` is the only way to sign in; the name and number are the
+ * ones the code was texted for, never the form's.
  */
 export async function answerAuthorization(
   deps: SigninDeps,
-  form: { params: AuthorizationParams; decision: string; name: unknown; phone: unknown },
+  form: { params: AuthorizationParams; decision: string; name: unknown; phone: unknown; codeId?: unknown; code?: unknown },
 ): Promise<AuthorizeResponse> {
   const check = await checkAuthorizationRequest(deps, form.params);
   if (check.kind === "error") return { status: 400, message: check.message };
@@ -174,16 +229,31 @@ export async function answerAuthorization(
   if (form.decision !== "allow") {
     return { status: 303, location: errorRedirect(deps, params, "access_denied", "The person didn't allow access.") };
   }
-  const back = (error: SigninFormError) => ({
-    status: 303 as const,
-    location: `${deps.baseUrl}${SIGNIN_PATH}?${authorizationQuery(params)}&error=${error}`,
-  });
-  const name = parseCustomerName(form.name);
-  if (!name) return back("invalid_name");
-  const phone = parseMobile(form.phone);
-  if (!phone) return back("invalid_phone");
+  /** Back to /signin: asking for the code when `codeId` is given, else for the name and number. */
+  const toSignin = (extra: { error?: SigninFormError; codeId?: string }) => {
+    const query = authorizationQuery(params);
+    if (extra.codeId) query.set("code_id", extra.codeId);
+    if (extra.error) query.set("error", extra.error);
+    return { status: 303 as const, location: `${deps.baseUrl}${SIGNIN_PATH}?${query}` };
+  };
 
-  const customer = await signInCustomer(deps.store, SIGNIN_SHOP_SLUG, name, phone);
+  let person: { name: string; phone: string } | null;
+  if (deps.texter && typeof form.codeId === "string" && form.codeId !== "") {
+    person = await enterSigninCode(deps, form.codeId, form.code);
+    if (!person) return toSignin({ error: "invalid_code", codeId: form.codeId });
+  } else {
+    const name = parseCustomerName(form.name);
+    if (!name) return toSignin({ error: "invalid_name" });
+    const phone = parseMobile(form.phone);
+    if (!phone) return toSignin({ error: "invalid_phone" });
+    if (deps.texter) {
+      const codeId = await textSigninCode(deps, deps.texter, name, phone);
+      return codeId ? toSignin({ codeId }) : toSignin({ error: "send_failed" });
+    }
+    person = { name, phone };
+  }
+
+  const customer = await signInCustomer(deps.store, SIGNIN_SHOP_SLUG, person.name, person.phone);
   const code = newCode();
   await deps.store.createCode({
     code,

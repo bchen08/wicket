@@ -1,10 +1,11 @@
 import { normalizeUuid } from "../frontdesk/booking-store";
-import type { AuthorizationCode, Customer, OAuthClient, OAuthToken, SigninStore } from "./store";
+import type { AuthorizationCode, Customer, OAuthClient, OAuthToken, SigninCode, SigninStore } from "./store";
 
 // In-memory SigninStore: for `pnpm dev` without DATABASE_URL and for tests. Mirrors the Postgres store's
 // rules: one customer per (shop, phone), a code is used at most once.
 
 type StoredCode = AuthorizationCode & { usedAt: Date | null };
+type StoredSigninCode = SigninCode & { usedAt: Date | null };
 
 const copy = <T extends object>(value: T): T => structuredClone(value);
 
@@ -12,8 +13,19 @@ export function createMemorySigninStore(): SigninStore {
   const customers = new Map<string, Customer>();
   const clients = new Map<string, OAuthClient>();
   const codes = new Map<string, StoredCode>();
+  const signinCodes = new Map<string, StoredSigninCode>();
   const tokens = new Map<string, OAuthToken>();
   const clientKey = (shopSlug: string, clientId: string) => `${shopSlug}\n${clientId}`;
+  /** The texted code with this id if it can still be entered at `now`. */
+  const liveSigninCode = (id: string, now: Date) => {
+    const key = normalizeUuid(id);
+    const stored = key === null ? undefined : signinCodes.get(key);
+    return stored && stored.usedAt === null && stored.expiresAt.getTime() > now.getTime() ? stored : null;
+  };
+  const publicSigninCode = ({ usedAt, ...rest }: StoredSigninCode): SigninCode => {
+    void usedAt;
+    return copy(rest);
+  };
 
   return {
     async upsertCustomer(shopSlug, phone, name) {
@@ -53,6 +65,24 @@ export function createMemorySigninStore(): SigninStore {
       const { usedAt, ...rest } = stored;
       void usedAt;
       return copy(rest);
+    },
+
+    async createSigninCode(code) {
+      const stored: StoredSigninCode = { ...copy(code), id: crypto.randomUUID(), usedAt: null };
+      signinCodes.set(stored.id, stored);
+      return publicSigninCode(stored);
+    },
+
+    async getSigninCode(id, now) {
+      const stored = liveSigninCode(id, now);
+      return stored ? publicSigninCode(stored) : null;
+    },
+
+    async useSigninCode(id, code, now) {
+      const stored = liveSigninCode(id, now);
+      if (!stored || stored.code !== code) return null;
+      stored.usedAt = now;
+      return publicSigninCode(stored);
     },
 
     async createTokens(list) {

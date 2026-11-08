@@ -209,9 +209,12 @@ describe("connector sign-in smoke checks", () => {
     expect(named.requests.filter((r) => r.path === "/api/mcp").length).toBeGreaterThan(0);
   });
 
-  it("skips the signed-in booking where texting is on: it would text the number", async () => {
-    const { rows, server } = await run({ texting: "twilio" });
+  it("skips signing in and the signed-in booking where texting is on: they would text the number", async () => {
+    const { rows, server, requests } = await run({ texting: "twilio" });
+    expect(rows.find((r) => r.item === "S5")).toMatchObject({ result: "SKIPPED", evidence: expect.stringContaining("texting is twilio") });
     expect(rows.find((r) => r.item === "S6")).toMatchObject({ result: "SKIPPED", evidence: expect.stringContaining("texting is twilio") });
+    expect(rows.find((r) => r.item === "S7")).toMatchObject({ result: "SKIPPED" });
+    expect(requests.some((r) => r.method === "POST" && r.path === "/api/oauth/authorize")).toBe(false);
     expect(server.state.bookings).toEqual([]);
   });
 

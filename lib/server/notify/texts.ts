@@ -1,3 +1,4 @@
+import { randomInt } from "node:crypto";
 import { alertSubject } from "./email";
 import type { OwnerAlert } from "./notifier";
 
@@ -30,6 +31,16 @@ export function ownerAlertText(alert: OwnerAlert): string {
         ? "the customer declined"
         : `${booking.agent.name} cancelled`;
   return `${alertSubject(alert)}, ${booking.customer.displayName} (${why}). All bookings: ${alert.consoleUrl}`;
+}
+
+/** A new code to text: six random digits, e.g. "042917". */
+export function newTextedCode(): string {
+  return String(randomInt(0, 1_000_000)).padStart(6, "0");
+}
+
+/** The sign-in code text to a person connecting an agent at /signin. */
+export function signinCodeText(code: string, shopName: string): string {
+  return `${code} is your code to sign in to ${shopName} on Front Desk. It works once, for 10 minutes.`;
 }
 
 /** The owner's sign-in code text. */

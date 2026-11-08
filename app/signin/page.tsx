@@ -11,7 +11,7 @@ import { getSigninDeps } from "@/lib/server/oauth/deps";
 // The OAuth authorization endpoint (/api/oauth/authorize) sends them here with the request's parameters.
 // A plain stand-in (server component, an HTML form, no client JS) so sign-in works in production; v0 restyles
 // it. The form posts to /api/oauth/authorize, which answers 303 back to the agent (or here with ?error=…).
-// TODO(ring-2): verify the number with a texted code once texting lands.
+// Where texting is on, that first answer comes back here with a code to enter (view.textedCode).
 
 export const metadata: Metadata = {
   title: "Sign in — Front Desk",
@@ -21,6 +21,9 @@ export const metadata: Metadata = {
 const FORM_ERRORS: Record<SigninFormError, string> = {
   invalid_name: "Enter your name (up to 80 characters).",
   invalid_phone: "That number doesn't look right. Enter your mobile number, e.g. 401 555 0123 or +44 7700 900123.",
+  send_failed: "We couldn't text that number. Check it and try again.",
+  invalid_code: "That code isn't right. Check the text and try again.",
+  code_expired: "That code has run out or was already used. Enter your name and number to get a new one.",
   internal: "Something went wrong on our side. Please try again.",
 };
 
@@ -48,14 +51,24 @@ function Ask({ view }: { view: Extract<SigninView, { kind: "ask" }> }) {
       )}
       <form method="post" action="/api/oauth/authorize" className="flex flex-col gap-3">
         {hidden}
-        <label className="flex flex-col gap-1 text-sm">
-          Your name, as the shop should see it
-          <input type="text" name="name" required maxLength={80} autoComplete="name" className={inputClass} />
-        </label>
-        <label className="flex flex-col gap-1 text-sm">
-          Mobile number
-          <input type="tel" name="phone" required autoComplete="tel" placeholder="401 555 0123" className={inputClass} />
-        </label>
+        {view.textedCode ? (
+          <label className="flex flex-col gap-1 text-sm">
+            The 6-digit code we texted to {view.textedCode.sentTo}
+            <input type="hidden" name="code_id" value={view.textedCode.id} />
+            <input type="text" name="code" required inputMode="numeric" autoComplete="one-time-code" className={inputClass} />
+          </label>
+        ) : (
+          <>
+            <label className="flex flex-col gap-1 text-sm">
+              Your name, as the shop should see it
+              <input type="text" name="name" required maxLength={80} autoComplete="name" className={inputClass} />
+            </label>
+            <label className="flex flex-col gap-1 text-sm">
+              Mobile number
+              <input type="tel" name="phone" required autoComplete="tel" placeholder="401 555 0123" className={inputClass} />
+            </label>
+          </>
+        )}
         <button
           type="submit"
           name="decision"

@@ -104,8 +104,10 @@ export type AuthorizationParams = {
 /**
  * What the /signin page shows (getSigninView in lib/server/oauth/authorize.ts).
  * "ask": who wants access, and the form (name, mobile number, Allow / Deny) that posts to
- * /api/oauth/authorize with `params` as hidden fields. "error": the request can't be answered (unknown
- * client, a redirect URI it didn't declare, a malformed request); show `message` and nothing else.
+ * /api/oauth/authorize with `params` as hidden fields. Where texting is on, Allow texts a code and the page
+ * comes back with `textedCode` set, asking for the code instead of the name and number. "error": the request
+ * can't be answered (unknown client, a redirect URI it didn't declare, a malformed request); show `message`
+ * and nothing else.
  */
 export type SigninView =
   | {
@@ -118,13 +120,31 @@ export type SigninView =
       shop: { slug: string; name: string };
       /** Hidden form fields: post them back unchanged. */
       params: AuthorizationParams;
-      /** Set when the last post was refused: invalid_name or invalid_phone. */
+      /**
+       * Set once a code has been texted (only where texting is on): show one field for it instead of the
+       * name and mobile number, and post it as `code` with `id` as a hidden `code_id`. Otherwise null.
+       */
+      textedCode: {
+        id: string;
+        /** Where it went, masked, e.g. "•••• 0123". */
+        sentTo: string;
+      } | null;
+      /** Set when the last post was refused. */
       error: SigninFormError | null;
     }
   | { kind: "error"; message: string };
 
 /** Why /api/oauth/authorize sent the person back to /signin (?error=…). */
-export type SigninFormError = "invalid_name" | "invalid_phone" | "internal";
+export type SigninFormError =
+  | "invalid_name"
+  | "invalid_phone"
+  /** The text with the code didn't go through. */
+  | "send_failed"
+  /** The code entered isn't the one texted. */
+  | "invalid_code"
+  /** The code has run out or was already used: the page is asking for the name and number again. */
+  | "code_expired"
+  | "internal";
 
 /** The signed-in person, as list_my_bookings shows them. */
 export type CustomerProfile = {

@@ -8,7 +8,7 @@ export type Customer = {
   shopSlug: string;
   /** The latest name they signed in with, 1–80 characters. */
   name: string;
-  /** E.164. Not verified yet. TODO(ring-2): a texted code. */
+  /** E.164. Verified with a texted code where texting is on; as typed where it's off. */
   phone: string;
 };
 
@@ -35,6 +35,19 @@ export type AuthorizationCode = {
   codeChallenge: string;
   scope: string;
   resource: string | null;
+  expiresAt: Date;
+};
+
+/** A code texted at /signin (where texting is on), waiting to be entered: 10 minutes, once. */
+export type SigninCode = {
+  id: string;
+  shopSlug: string;
+  /** Six digits. */
+  code: string;
+  /** The number it was texted to, E.164: the number the person signs in with. */
+  phone: string;
+  /** The name they typed. It reaches the customer only once the code is entered. */
+  name: string;
   expiresAt: Date;
 };
 
@@ -71,6 +84,17 @@ export interface SigninStore {
    * expired at `now`. Otherwise null. Of two concurrent calls, at most one gets the code.
    */
   useCode(code: string, now: Date): Promise<AuthorizationCode | null>;
+
+  /** Store a code about to be texted, and return it with its new id. */
+  createSigninCode(code: Omit<SigninCode, "id">): Promise<SigninCode>;
+  /** A texted code that can still be entered at `now`, or null. Any id is accepted: a malformed one is simply not found. */
+  getSigninCode(id: string, now: Date): Promise<SigninCode | null>;
+  /**
+   * Enter a texted code, once: mark it used and return it, atomically, only if `id` holds exactly `code`,
+   * unused and unexpired at `now`. Otherwise null, and a wrong code doesn't use it up. Of two concurrent
+   * calls, at most one gets it.
+   */
+  useSigninCode(id: string, code: string, now: Date): Promise<SigninCode | null>;
 
   /** Store new tokens. */
   createTokens(tokens: OAuthToken[]): Promise<void>;

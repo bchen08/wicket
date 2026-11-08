@@ -25,6 +25,8 @@ export const ACCESS_TOKEN_SECONDS = 60 * 60;
 export const REFRESH_TOKEN_SECONDS = 30 * 24 * 60 * 60;
 /** How long an authorization code waits to be exchanged. */
 export const CODE_SECONDS = 10 * 60;
+/** How long a code texted at /signin can be entered. */
+export const TEXTED_CODE_SECONDS = 10 * 60;
 
 /** The protected resource metadata for the MCP endpoint on `baseUrl` (served at both well-known paths). */
 export function protectedResourceMetadata(baseUrl: string): ProtectedResourceMetadata {

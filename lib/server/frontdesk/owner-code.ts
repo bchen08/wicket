@@ -1,7 +1,6 @@
-import { randomInt } from "node:crypto";
 import type { OwnerCodeResponse } from "../../types/texting";
 import { maskPhone } from "../notify/texting";
-import { ownerCodeText } from "../notify/texts";
+import { newTextedCode, ownerCodeText } from "../notify/texts";
 import { getFrontDeskDeps } from "./deps";
 import { FrontDeskError } from "./errors";
 import { errorResponse, isFormPost, NO_STORE } from "./http";
@@ -24,11 +23,6 @@ export const OWNER_SHOP_SLUG = "harts";
 export type OwnerCodeFailure = "texting_off" | "no_mobile" | "send_failed";
 
 const ACCESS_CODE_INSTEAD = 'Sign in with the shop\'s access code instead: POST /api/owner/session with { "token": "<OWNER_API_TOKEN>" }.';
-
-/** A new code: six random digits, e.g. "042917". */
-export function newOwnerCode(): string {
-  return String(randomInt(0, 1_000_000)).padStart(6, "0");
-}
 
 /** RFC 3339 in UTC, without milliseconds: "2026-11-08T10:10:00Z". */
 function rfc3339(at: Date): string {
@@ -59,7 +53,7 @@ export async function sendOwnerCode(deps: FrontDeskDeps, shopSlug: string = OWNE
       `Sign in with the shop's access code, then set ownerMobile with PUT /api/shops/${shopSlug}/policies.`,
     );
   }
-  const code = newOwnerCode();
+  const code = newTextedCode();
   const expiresAt = new Date(deps.clock.now().getTime() + OWNER_CODE_MS);
   // Stored first, so a code that arrives always works.
   await deps.store.saveOwnerCode({ shopSlug, code, sentTo: ownerMobile, expiresAt });
