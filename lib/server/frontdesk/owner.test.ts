@@ -839,6 +839,8 @@ describe("GET /api/shops/[shop]/bookings/[id]", () => {
       approval: undefined,
       status: "confirmed",
       customer: customerOf("Pat Owner-Test", true, PHONE_E164),
+      // Deposits are off in memoryDeps: confirmed without collecting the deposit.
+      deposit: { amountCents: 1000, state: "not_collected" },
     });
     expect(body.events.map((e) => [e.type, e.actor, e.data])).toEqual([
       ["booked", "agent", { status: "awaiting_approval", agentName: "test agent" }],

@@ -426,6 +426,7 @@ describe("approval links: the request's origin", () => {
       customer: customerOf("Maya", false),
       agent: { name: "Claude" },
       depositCents: 0,
+      deposit: { amountCents: 0, state: "none" },
       createdAt: "2026-11-09T12:00:00-05:00",
     };
     const held = { ...base, approval: { url: "/approve/tok", expiresAt: "2026-11-09T12:10:00-05:00" } };

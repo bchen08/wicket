@@ -36,7 +36,9 @@ if (!url) {
     const at = (h: number, m = 0) => new Date(day.getTime() + (h * 60 + m) * 60_000);
     /** Every hold createBooking makes in this file lapses here (two days later) unless a test says otherwise. */
     const HELD_UNTIL = at(48);
-    const input = (start: Date, end: Date, serviceId = "haircut"): NewBooking => ({
+    /** When a booking this file inserts as awaiting_deposit lapses. */
+    const PAY_UNTIL = at(49);
+    const input =(start: Date, end: Date, serviceId = "haircut"): NewBooking => ({
       shopSlug: "harts",
       serviceId,
       staffId: "dana",
@@ -341,13 +343,15 @@ if (!url) {
 
     it("getBusyIntervals() returns holds (with their deadline), awaiting_deposit and confirmed bookings and blocked times, not final ones", async () => {
       const statuses = ["awaiting_deposit", "expired", "completed", "no_show", "cancelled"];
-      // 18:00, 18:30, … one per status, inserted directly (the store only creates holds).
+      // 18:00, 18:30, … one per status, inserted directly (the store only creates holds). The one awaiting
+      // its deposit lapses at PAY_UNTIL (bookings_deposit_has_deadline).
       const rows = await sql<{ id: string }[]>`
-        insert into bookings (shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents)
+        insert into bookings (shop_slug, service_id, staff_id, during, status, customer_name, agent_name, deposit_cents, pay_by)
         select ${shop}, 'trim', ${staffId},
                tstzrange(${at(18).toISOString()}::timestamptz + (s.n - 1) * interval '30 minutes',
                          ${at(18, 30).toISOString()}::timestamptz + (s.n - 1) * interval '30 minutes', '[)'),
-               s.status, 'Postgres Test', 'vitest', 0
+               s.status, 'Postgres Test', 'vitest', 0,
+               case when s.status = 'awaiting_deposit' then ${PAY_UNTIL.toISOString()}::timestamptz end
         from unnest(${statuses}::text[]) with ordinality as s (status, n)
         returning id::text as id
       `;
@@ -364,7 +368,7 @@ if (!url) {
 
       const busy = await store.getBusyIntervals(shop, { start: at(17), end: at(22) });
       expect(busy.map((b) => [b.kind, b.start.getTime(), b.end.getTime(), b.heldUntil?.getTime()])).toEqual([
-        ["booking", at(18).getTime(), at(18, 30).getTime(), undefined], // awaiting_deposit
+        ["booking", at(18).getTime(), at(18, 30).getTime(), PAY_UNTIL.getTime()], // awaiting_deposit: until pay_by
         ["block", at(20).getTime(), at(21).getTime(), undefined],
         ["booking", at(21).getTime(), at(21, 30).getTime(), HELD_UNTIL.getTime()], // awaiting_approval: a hold
         ["booking", at(21, 30).getTime(), at(22).getTime(), undefined], // confirmed

@@ -293,7 +293,8 @@ function bookResponse(
     `Held ${booking.serviceName} with ${staffName}, ${booking.display}, for ${name}. It is not confirmed yet. ` +
     `Send ${name} this link right away to approve or decline: ${approval.url}. ` +
     `The hold lapses at ${holdDisplay ?? approval.expiresAt}. ` +
-    `Then GET ${statusUrl} to see what they did: status pending, approved, declined or expired. ` +
+    `Then GET ${statusUrl} to see what they did: status pending, awaiting_deposit (approved, deposit not paid yet: ` +
+    "send the same link again), approved, declined or expired. " +
     "Don't book this time again while the hold is on.";
   return { booking, statusUrl, next_action };
 }
@@ -452,13 +453,16 @@ Book once per booking: booking the same time again while the hold is on gets slo
 Send the person booking.approval.url right away (if you posted a form in a browser, it's the page you
 landed on). The page shows the shop, the service, the time, the price, the deposit, the rules, your name
 and the name booked under. The person approves, not you: opening the link and tapping Approve is their
-consent, and only then is the booking confirmed. They can also decline there.
+consent. If the service has a deposit, approving takes them to a payment page to place it as a hold on
+their card (charged only for a no-show or a late cancellation), and the booking is confirmed once it's
+paid; otherwise it's confirmed when they approve. They can also decline there.
 
 ### Step 4: check what they did
 
 GET statusUrl (${url("/api/approvals/<token>")}, where <token> is the end of the approval link). Its
-status is pending (not answered yet), approved (the booking is confirmed), declined, or expired (the hold
-ran out: book again if they still want it).
+status is pending (not answered yet), awaiting_deposit (approved, but the deposit isn't paid yet: send
+the same link again, its page has the Pay button), approved (the booking is confirmed), declined, or
+expired (the hold ran out, or the deposit wasn't paid in time: book again if they still want it).
 
 ### Errors
 

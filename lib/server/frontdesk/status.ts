@@ -1,5 +1,5 @@
 import type { StatusResponse } from "../../types/frontdesk";
-import { getFrontDeskDeps } from "./deps";
+import { configuredStripeKey, getFrontDeskDeps } from "./deps";
 import { NO_STORE } from "./http";
 import { configuredOwnerToken } from "./owner-auth";
 import { getPostgresClient } from "./postgres-store";
@@ -240,6 +240,11 @@ async function inspectDatabase(
   };
 }
 
+/** Whether deposits are collected: STRIPE_SECRET_KEY is set (its value is never shown). */
+export function depositsMode(env: Env): StatusResponse["deposits"] {
+  return configuredStripeKey(env.STRIPE_SECRET_KEY) === "" ? "off" : "stripe_test";
+}
+
 /** The deployment's StatusResponse. Never throws for a database problem: it becomes one of `problems`. */
 export async function getStatus(env: Env, origin: string, options: StatusOptions = {}): Promise<StatusResponse> {
   const environment = toEnvironment(env.VERCEL_ENV);
@@ -258,6 +263,8 @@ export async function getStatus(env: Env, origin: string, options: StatusOptions
     commit: toCommit(env.VERCEL_GIT_COMMIT_SHA),
     database,
     ownerAccess,
+    // Off is fine: bookings confirm without a deposit. So it's never one of `problems`.
+    deposits: depositsMode(env),
     approvalLinks: { origin },
     alerts: toAlertChannel(env.RESEND_API_KEY),
     problems,
@@ -278,6 +285,7 @@ export async function statusResponse(request: Request, env: Env, options: Status
       commit: toCommit(env.VERCEL_GIT_COMMIT_SHA),
       database: { mode: env.DATABASE_URL?.trim() ? "postgres" : "memory", reachable: false, shopName: null, writesAllowed: false, schema: "unknown", missing: [] },
       ownerAccess: configuredOwnerToken(env.OWNER_API_TOKEN) === "" ? "missing" : "configured",
+      deposits: depositsMode(env),
       approvalLinks: { origin },
       alerts: toAlertChannel(env.RESEND_API_KEY),
       problems: [`The status check itself failed (${describeError(err, env.DATABASE_URL)}): see this deployment's function logs in Vercel.`],

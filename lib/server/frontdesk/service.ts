@@ -37,6 +37,8 @@ import {
   type StartCheckInput,
 } from "../engine/availability";
 import { decide, type LifecycleAction, type ManageAction } from "../engine/lifecycle";
+import { depositCollected, moveDeposit, syncDeposit } from "../deposits/deposits";
+import type { DepositPayments } from "../deposits/payments";
 import type { Notifier, OwnerAlert } from "../notify/notifier";
 import { SlotTakenError, type BookingStore } from "./booking-store";
 import type { BusyInterval, ShopCatalog } from "./catalog";
@@ -53,6 +55,11 @@ export type FrontDeskDeps = {
   clock: Clock;
   store: BookingStore;
   notifier: Notifier;
+  /**
+   * Stripe, for deposits (lib/server/deposits). null when deposits are off (no STRIPE_SECRET_KEY): approving
+   * then confirms at once, and a booking that needed a deposit shows it as not_collected.
+   */
+  payments: DepositPayments | null;
   /**
    * The origin approval links point at, without a trailing slash, e.g. "https://emergent.vercel.app".
    * Each route sets it to the origin of the request it's serving (withRequestOrigin), so links work on
@@ -115,12 +122,13 @@ export function bookingNotFound(bookingId: string): FrontDeskError {
 
 /**
  * The booking if it exists and belongs to `shopSlug`; otherwise booking_not_found. Reading it expires
- * its hold first if that lapsed (store.refreshBooking), so a caller never sees a stale hold.
+ * its hold first if that lapsed (store.refreshBooking), and asks Stripe about a deposit it's waiting for
+ * (syncDeposit: paid → confirmed; unpaid past pay_by → expired), so a caller never sees a stale one.
  */
 export async function requireBooking(deps: FrontDeskDeps, shopSlug: string, bookingId: string): Promise<Booking> {
   const booking = await deps.store.refreshBooking(bookingId, deps.clock.now());
   if (!booking || booking.shopSlug !== shopSlug) throw bookingNotFound(bookingId);
-  return booking;
+  return syncDeposit(deps, booking);
 }
 
 export const EVENT_FOR: Record<LifecycleAction, BookingEventType> = {
@@ -130,6 +138,7 @@ export const EVENT_FOR: Record<LifecycleAction, BookingEventType> = {
   approve: "approved",
   decline: "declined",
   expire: "expired",
+  confirm_deposit: "deposit.paid",
 };
 
 /** How many times transitionBooking re-reads and re-decides after losing a race. */
@@ -141,8 +150,9 @@ const MAX_TRANSITION_ATTEMPTS = 3;
  * store.transition() conditionally on the status it decided from, writing one event.
  * If another transition got there first (transition returns null), re-read the booking and decide
  * again, so the loser gets the right error (e.g. not_cancellable) instead of a stale success.
+ * Then, after the commit, move the deposit in Stripe (moveDeposit: captured → capture the hold, released →
+ * release it). A Stripe failure doesn't undo the change; it shows on booking.deposit.actionFailed.
  * Throws not_found (shop), booking_not_found, or decide()'s FrontDeskError.
- * TODO(ring-1c): move real money. depositEffect is what the policy decides; nothing is collected.
  */
 export async function transitionBooking(
   deps: FrontDeskDeps,
@@ -157,6 +167,7 @@ export async function transitionBooking(
     const booking = await requireBooking(deps, shopSlug, bookingId);
     const decision = decide(booking, { type: action, actor }, deps.clock.now(), policies);
     if (decision instanceof FrontDeskError) throw decision;
+    const collected = depositCollected(booking, decision.depositEffect);
     const updated = await deps.store.transition(booking.id, booking.status, decision.nextStatus, {
       actor,
       type: EVENT_FOR[action],
@@ -164,11 +175,12 @@ export async function transitionBooking(
         from: booking.status,
         to: decision.nextStatus,
         depositEffect: decision.depositEffect,
-        depositCollected: false,
+        depositCollected: collected,
       },
     });
     if (updated) {
-      return { booking: withApprovalOrigin(deps, updated), depositEffect: decision.depositEffect, depositCollected: false };
+      const moved = await moveDeposit(deps, booking, updated, decision.depositEffect);
+      return { booking: withApprovalOrigin(deps, moved), depositEffect: decision.depositEffect, depositCollected: collected };
     }
   }
   throw new Error(`Booking ${bookingId} kept changing status during ${action}; gave up after ${MAX_TRANSITION_ATTEMPTS} attempts.`);
@@ -502,10 +514,11 @@ export function parseBookArgs(raw: unknown): BookInput {
 }
 
 /**
- * What book() hands back: the contract's BookResult, plus the staff name and when the hold lapses in
- * the shop's zone (e.g. "Tue 10 Nov, 11:10 am EST"), for the text summary.
+ * What book() hands back: the contract's BookResult, plus the staff name, when the hold lapses in the
+ * shop's zone (e.g. "Tue 10 Nov, 11:10 am EST") and whether this deployment collects deposits, for the
+ * text summary.
  */
-export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string };
+export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string; depositsOn?: boolean };
 
 /**
  * Hold `input.start` for `input.service_id` until the person approves it. Returns the booking in
@@ -528,11 +541,10 @@ export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string
  *    start, try once more with them. If that fails too, or nobody is free, fail with slot_taken; the
  *    database is the final word even when step 4 passed.
  *
- * The owner is alerted when the person approves or declines (lib/server/consent/approvals.ts), not here:
- * a hold alone is no news.
- *
- * TODO(ring-1c): deposits. Approval confirms the booking; awaiting_deposit and collecting the deposit
- * come with Stripe. Booking.depositCents shows what the service requires; nothing is collected.
+ * The owner is alerted when the booking is confirmed (lib/server/consent/approvals.ts, or
+ * lib/server/deposits/deposits.ts once a deposit is paid) or the person declines, not here: a hold alone
+ * is no news. A booking awaiting its deposit past pay_by is checked with Stripe in step 4 too
+ * (syncDeposit), so an unpaid one never blocks this booking.
  * TODO(ring-2): require a mandate once agents sign in.
  */
 export async function book(
@@ -619,6 +631,8 @@ async function bookOnce(
   // Lazy expiry, just before the insert: a lapsed hold must not block this booking (the no_overlap
   // constraint would still count it) nor hide an alternative. TODO(ring-2): a scheduled job too.
   await deps.store.expireStaleHolds(shop.slug, busyRange(service, start), now);
+  // The same for a booking whose deposit time ran out, after asking Stripe whether it was paid.
+  await syncLapsedDeposits(deps, shop.slug, busyRange(service, start), now);
 
   let engine = await withBusy();
   const check = checkStart(engine, start);
@@ -665,7 +679,18 @@ async function bookOnce(
   const staffId = booking.staffId;
   const staffName = staffHours.find((s) => s.staffId === staffId)?.staffName ?? staffId;
   const holdDisplay = formatDisplay(DateTime.fromJSDate(held.approveBy, { zone: shop.timezone }));
-  return { booking: withApprovalOrigin(deps, booking), staffName, holdDisplay };
+  return { booking: withApprovalOrigin(deps, booking), staffName, holdDisplay, depositsOn: deps.payments !== null };
+}
+
+/**
+ * syncDeposit for every booking of the shop in `range` that is awaiting its deposit past pay_by: paid ones
+ * are confirmed, unpaid ones expire. Stripe failures are logged and leave the booking as it is.
+ */
+async function syncLapsedDeposits(deps: FrontDeskDeps, shopSlug: string, range: { start: Date; end: Date }, now: Date): Promise<void> {
+  const lapsed = (await deps.store.listBookings(shopSlug, range)).filter(
+    (b) => b.status === "awaiting_deposit" && b.deposit.payBy !== undefined && Date.parse(b.deposit.payBy) <= now.getTime(),
+  );
+  for (const b of lapsed) await syncDeposit(deps, b);
 }
 
 /**
@@ -891,13 +916,14 @@ export function parseCancelArgs(raw: unknown): CancelInput {
 }
 
 /**
- * An agent cancels a booking, under the shop's policy (decide(): a hold awaiting approval → cancelled
- * any time; confirmed at least cancelWindowHours ahead → deposit released; later but before the start
- * → captured; after the start or from a final status, a lapsed hold included → not_cancellable). A
- * second cancel of the same booking is not_cancellable (it's already cancelled), so a retry is harmless.
+ * An agent cancels a booking, under the shop's policy (decide(): a hold awaiting approval or a booking
+ * awaiting its deposit → cancelled any time; confirmed at least cancelWindowHours ahead → deposit
+ * released; later but before the start → captured; after the start or from a final status, a lapsed
+ * hold included → not_cancellable). The deposit then moves in Stripe (transitionBooking). A second cancel
+ * of the same booking is not_cancellable (it's already cancelled), so a retry is harmless.
  * Once it's cancelled, the owner is alerted (booking_cancelled): a cancel only succeeds from a status that
- * holds the time, so that's a confirmed booking or a hold awaiting approval. The owner's own cancel
- * (owner.ts) sends no alert.
+ * holds the time, so that's a confirmed booking, a hold awaiting approval or one awaiting its deposit. The
+ * owner's own cancel (owner.ts) sends no alert.
  * TODO(ring-2): get_booking and cancel still trust anyone holding the booking id; agent identity fixes this.
  */
 export async function cancelBooking(
@@ -919,9 +945,11 @@ export const BOOKINGS_FUTURE_DAYS = 30;
 
 /**
  * The shop and its bookings of any status from 7 days ago to 30 days ahead, sorted by start. Lapsed
- * holds in that range are expired first (lazy expiry), so the list never shows a stale hold. A booking
- * awaiting approval includes its approval link, for the owner to copy. An owner route (it shows
- * customers' phone numbers): the HTTP layer checks owner auth first.
+ * holds in that range are expired first (lazy expiry), and each booking awaiting its deposit is checked
+ * with Stripe (syncDeposit), so the list never shows a stale one. A booking awaiting approval (or its
+ * deposit) includes its approval link, for the owner to copy; booking.deposit.actionFailed shows a capture
+ * or release Stripe refused. An owner route (it shows customers' phone numbers): the HTTP layer checks
+ * owner auth first.
  */
 export async function listShopBookings(deps: FrontDeskDeps, shopSlug: string): Promise<BookingsResponse> {
   const shop = await requireShop(deps, shopSlug);
@@ -931,6 +959,7 @@ export async function listShopBookings(deps: FrontDeskDeps, shopSlug: string): P
     end: new Date(now.getTime() + BOOKINGS_FUTURE_DAYS * DAY_MS),
   };
   await deps.store.expireStaleHolds(shopSlug, range, now);
-  const bookings = await deps.store.listBookings(shopSlug, range);
+  const listed = await deps.store.listBookings(shopSlug, range);
+  const bookings = await Promise.all(listed.map((b) => syncDeposit(deps, b)));
   return { shop, bookings: bookings.map((b) => withApprovalOrigin(deps, b)) };
 }

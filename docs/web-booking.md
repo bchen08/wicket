@@ -110,12 +110,12 @@ curl -s -X POST http://localhost:3000/api/shops/harts/book -H "Content-Type: app
     }
   },
   "statusUrl": "http://localhost:3000/api/approvals/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM",
-  "next_action": "Held Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. It is not confirmed yet. Send Maya this link right away to approve or decline: http://localhost:3000/approve/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM. The hold lapses at Tue 10 Nov, 11:10 am EST. Then GET http://localhost:3000/api/approvals/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM to see what they did: status pending, approved, declined or expired. Don't book this time again while the hold is on."
+  "next_action": "Held Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. It is not confirmed yet. Send Maya this link right away to approve or decline: http://localhost:3000/approve/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM. The hold lapses at Tue 10 Nov, 11:10 am EST. Then GET http://localhost:3000/api/approvals/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM to see what they did: status pending, awaiting_deposit (approved, deposit not paid yet: send the same link again), approved, declined or expired. Don't book this time again while the hold is on."
 }
 ```
 
 - `booking` is the same `Booking` MCP `book` returns. `approval.url` is on the origin of this request, so it works on previews and in production.
-- `statusUrl` is the approval link's own API, [`GET /api/approvals/<token>`](frontdesk-api.md#get-apiapprovalstoken--approvalview): its `status` is `pending`, `approved`, `declined` or `expired`. It's how a web agent checks the answer (there's no web `get_booking`).
+- `statusUrl` is the approval link's own API, [`GET /api/approvals/<token>`](frontdesk-api.md#get-apiapprovalstoken--approvalview): its `status` is `pending`, `awaiting_deposit` (approved, but the deposit isn't paid yet; see [deposits.md](deposits.md)), `approved`, `declined` or `expired`. It's how a web agent checks the answer (there's no web `get_booking`).
 - Errors: the `ApiError` envelope with its status, e.g. **409** `slot_taken` (with `details.alternatives`), **422** `outside_hours`, `too_soon`, `too_far`, `outside_mandate`, **409** `paused`, **400** `invalid_request` (including a body that isn't a JSON object: `details.field: "body"`).
 
 ```json

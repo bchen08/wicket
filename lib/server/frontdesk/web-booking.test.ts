@@ -502,7 +502,7 @@ describe("agent guidance", () => {
       "application/x-www-form-urlencoded",
       "The person approves, not you",
       `${ORIGIN}/api/approvals/<token>`,
-      "pending (not answered yet), approved",
+      "pending (not answered yet), awaiting_deposit (approved, but the deposit isn't paid yet",
       "slot_taken (409)",
       "outside_hours (422)",
       "## Rules at Hart's Barbers",

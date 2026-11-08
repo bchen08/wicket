@@ -11,10 +11,13 @@
 //    availability, agents.md and /.well-known/front-desk.json.
 // 3. The booking loop, only where /api/status says writesAllowed (the Preview database, or in-memory
 //    data): book → slot_taken → get_booking → decline → the slot is free again → the owner's alerts list
-//    has booking_cancelled for it; then book another start → approve → the alerts list has
-//    booking_confirmed for it. Then the web booking API: a JSON book gets a link, a form post at that held
-//    start is sent back with ?error=slot_taken, the JSON booking is declined, and a form post lands on
-//    /approve/<token>. Every booking it makes is declined or cancelled at the end, even after a failure.
+//    has booking_cancelled for it; then book a Beard trim (no deposit) → approve → the alerts list has
+//    booking_confirmed for it. Then deposits: book another Haircut and approve it → awaiting_deposit with a
+//    Stripe Checkout URL where /api/status says deposits "stripe_test" (it never pays), or confirmed with
+//    the deposit not_collected where it says "off"; cancel it → the slot is free again. Then the web booking
+//    API: a JSON book gets a link, a form post at that held start is sent back with ?error=slot_taken, the
+//    JSON booking is declined, and a form post lands on /approve/<token>. Every booking it makes is declined
+//    or cancelled at the end, even after a failure.
 //    Its MCP requests and web bookings say they come from "front-desk-smoke", so the bookings show who
 //    made them.
 //
@@ -42,6 +45,8 @@ const MCP_LEGACY = "2025-06-18";
 const REQUEST_TIMEOUT_MS = 15_000;
 /** Haircut takes a deposit, and Hart's books those up to 6 days ahead. */
 const BOOKING_WINDOW_DAYS = 6;
+/** Where Stripe Checkout pages live (booking.deposit.payUrl). */
+const STRIPE_CHECKOUT = "https://checkout.stripe.com/";
 
 const USAGE = "Usage: pnpm smoke <base-url> [--commit <sha>] [--bypass <secret>] [--owner-token <token>]";
 
@@ -469,6 +474,8 @@ export async function runSmoke({
 
   // ---- Booking loop (writes) ----
 
+  const depositsOn = status.deposits === "stripe_test";
+  const depositsLabel = `deposits ${status.deposits ?? "unknown"}`;
   const loop = [
     ["11", "book a Haircut → awaiting_approval, link on this origin"],
     ["11", "book the same start again → slot_taken"],
@@ -476,8 +483,17 @@ export async function runSmoke({
     ["14", "Decline through /api/approvals/<token>/decline → cancelled"],
     ["14", "The declined start is free again"],
     ["14", "The owner's alerts list has booking_cancelled for it"],
-    ["17", "Book another start and approve it → confirmed"],
+    ["17", "Book a Beard trim (no deposit) and approve it → confirmed"],
     ["17", "The owner's alerts list has booking_confirmed for it"],
+    [
+      "19",
+      depositsOn
+        ? `Approve a Haircut (${depositsLabel}) → awaiting_deposit, Stripe Checkout URL`
+        : `Approve a Haircut (${depositsLabel}) → confirmed, deposit not_collected`,
+    ],
+    ["19", depositsOn ? "get_booking: awaiting_deposit, the same approval link" : "get_booking: confirmed, deposit not_collected"],
+    ["19", depositsOn ? "cancel it → cancelled, deposit released" : "cancel it → cancelled"],
+    ["19", "The cancelled start is free again"],
   ];
   const webLoop = [
     ["W4", "Web book (JSON) → 201 awaiting_approval, link on this origin"],
@@ -503,21 +519,21 @@ export async function runSmoke({
       const linkToken = booking?.approval?.url?.split("/approve/")[1];
       made.push({ id: booking.id, token: linkToken ? decodeURIComponent(linkToken) : undefined, done: false, approved: false });
     };
-    /** Book a Haircut at a random open start in the next few days: { slot, booking }, or a failed check. */
-    const bookOne = async () => {
+    /** Book `service` (a Haircut by default) at a random open start in the next few days: { slot, booking }, or a failed check. */
+    const bookOne = async (service = "haircut") => {
       const from = now();
       const avail = await client.callTool("get_availability", {
-        service_id: "haircut",
+        service_id: service,
         from: rfc3339(from),
         to: rfc3339(from + BOOKING_WINDOW_DAYS * 24 * 3600_000),
         limit: 50,
       });
       expect(!avail.error, `get_availability: ${snippet(JSON.stringify(avail.error))}`);
       const slots = avail.value?.slots ?? [];
-      expect(slots.length > 0, `no open Haircut starts in the next ${BOOKING_WINDOW_DAYS} days`);
+      expect(slots.length > 0, `no open ${service} starts in the next ${BOOKING_WINDOW_DAYS} days`);
       // A random start, so two runs at once rarely pick the same one.
       const slot = slots[Math.floor(random() * slots.length)];
-      const booked = await client.callTool("book", { service_id: "haircut", start: slot.start, customer_name: SMOKE_CUSTOMER });
+      const booked = await client.callTool("book", { service_id: service, start: slot.start, customer_name: SMOKE_CUSTOMER });
       expect(!booked.error, `book ${slot.start}: ${snippet(JSON.stringify(booked.error))}`);
       const booking = booked.value?.booking;
       if (booking?.id) remember(booking);
@@ -620,8 +636,9 @@ export async function runSmoke({
         return alertFor(ctx.booking.id, "booking_cancelled");
       });
 
+      // A Beard trim has no deposit, so approving confirms it whether or not this deployment collects deposits.
       await check(...loop[6], async () => {
-        const { booking } = await bookOne();
+        const { booking } = await bookOne("beard-trim");
         expect(booking?.status === "awaiting_approval", `booked: ${booking?.status}`);
         const mine = made.find((b) => b.id === booking.id);
         expect(mine?.token, "the booking has no approval token");
@@ -639,6 +656,80 @@ export async function runSmoke({
       await check(...loop[7], async () => {
         needs("approved");
         return alertFor(ctx.approved.id, "booking_confirmed");
+      });
+
+      // ---- Deposits: approve a Haircut. With Stripe it waits for its deposit (never paid here). ----
+
+      await check(...loop[8], async () => {
+        const { slot, booking: held } = await bookOne();
+        const mine = made.find((b) => b.id === held?.id);
+        expect(mine?.token, "the booking has no approval token");
+        const res = await client.request(`/api/approvals/${encodeURIComponent(mine.token)}/approve`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        expect(res.status === 200, http(res));
+        // Approved: cleanup cancels it rather than declining.
+        mine.approved = true;
+        const approved = res.json?.booking;
+        const deposit = approved?.deposit;
+        const payUrl = typeof deposit?.payUrl === "string" ? deposit.payUrl : "";
+        const evidence =
+          `${approved?.display ?? slot.start}: ${approved?.status}, deposit ${deposit?.state}` +
+          (payUrl ? `, pay at ${payUrl.slice(0, STRIPE_CHECKOUT.length + 14)}…` : "");
+        if (depositsOn) {
+          expect(approved?.status === "awaiting_deposit" && deposit?.state === "awaiting_payment", evidence);
+          expect(payUrl.startsWith(STRIPE_CHECKOUT), `${evidence} (expected deposit.payUrl on ${STRIPE_CHECKOUT})`);
+        } else {
+          expect(approved?.status === "confirmed" && deposit?.state === "not_collected", evidence);
+        }
+        Object.assign(ctx, { depositSlot: slot, depositBooking: approved, depositLink: held.approval?.url });
+        return evidence;
+      });
+
+      await check(...loop[9], async () => {
+        needs("depositBooking");
+        const got = await client.callTool("get_booking", { booking_id: ctx.depositBooking.id });
+        expect(!got.error, `get_booking: ${snippet(JSON.stringify(got.error))}`);
+        const b = got.value?.booking;
+        const evidence = `status ${b?.status}, deposit ${b?.deposit?.state}`;
+        if (depositsOn) {
+          expect(b?.status === "awaiting_deposit" && b?.deposit?.state === "awaiting_payment", evidence);
+          expect(b?.approval?.url === ctx.depositLink, `${evidence}, approval ${snippet(JSON.stringify(b?.approval))}`);
+          return `${evidence}, the same approval link`;
+        }
+        expect(b?.status === "confirmed" && b?.deposit?.state === "not_collected", evidence);
+        return evidence;
+      });
+
+      await check(...loop[10], async () => {
+        needs("depositBooking");
+        const cancelled = await client.callTool("cancel", { booking_id: ctx.depositBooking.id });
+        expect(!cancelled.error, `cancel: ${snippet(JSON.stringify(cancelled.error))}`);
+        const b = cancelled.value?.booking;
+        const failed = b?.deposit?.actionFailed ? ` (Stripe: ${b.deposit.actionFailed.message})` : "";
+        const evidence = `status ${b?.status}, deposit ${b?.deposit?.state}${failed}`;
+        expect(b?.status === "cancelled", evidence);
+        const mine = made.find((x) => x.id === ctx.depositBooking.id);
+        if (mine) mine.done = true;
+        ctx.depositCancelled = true;
+        if (depositsOn) expect(b?.deposit?.state === "released", evidence);
+        return evidence;
+      });
+
+      await check(...loop[11], async () => {
+        needs("depositCancelled");
+        const start = Date.parse(ctx.depositSlot.start);
+        const avail = await client.callTool("get_availability", {
+          service_id: "haircut",
+          from: ctx.depositSlot.start,
+          to: rfc3339(start + 3600_000),
+        });
+        expect(!avail.error, `get_availability: ${snippet(JSON.stringify(avail.error))}`);
+        const free = (avail.value?.slots ?? []).some((s) => Date.parse(s.start) === start);
+        expect(free, `${ctx.depositSlot.start} isn't in get_availability`);
+        return `${ctx.depositBooking.display ?? ctx.depositSlot.start} is back in get_availability`;
       });
 
       // The web booking API (W4, W5): the same engine, over plain HTTP.

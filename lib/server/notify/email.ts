@@ -1,4 +1,5 @@
 import { DateTime } from "luxon";
+import type { DepositState } from "../../types/frontdesk";
 import type { OwnerAlert } from "./notifier";
 
 // The email channel: owner alerts as plain-text email through Resend's HTTP API (no SDK, no dependency).
@@ -33,6 +34,16 @@ export function alertSubject(alert: OwnerAlert): string {
   return alert.kind === "booking_confirmed" ? `New booking: ${what}` : `Cancelled: ${what}`;
 }
 
+/** Where the deposit stands, after "deposit $10 " (see DepositState in lib/types/deposits.ts). */
+const DEPOSIT_WORDS: Record<DepositState, string> = {
+  none: "not paid",
+  awaiting_payment: "not paid yet",
+  held: "held on the card",
+  captured: "charged",
+  released: "released",
+  not_collected: "not collected",
+};
+
 /** The email's plain-text body: about 10 lines. Times are in the shop's zone (Booking.display). */
 export function alertText(alert: OwnerAlert): string {
   const { booking, shop } = alert;
@@ -42,8 +53,7 @@ export function alertText(alert: OwnerAlert): string {
       : alert.cancelledBy === "customer"
         ? `The customer declined a booking at ${shop.name}. The time is free again.`
         : `The agent cancelled a booking at ${shop.name}. The time is free again.`;
-  const deposit =
-    booking.depositCents > 0 ? `deposit ${usd(booking.depositCents)}, not collected yet` : "no deposit";
+  const deposit = booking.depositCents > 0 ? `deposit ${usd(booking.depositCents)} ${DEPOSIT_WORDS[booking.deposit.state]}` : "no deposit";
   return [
     headline,
     "",

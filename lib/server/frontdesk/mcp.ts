@@ -3,6 +3,7 @@ import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import type {
   ApiError,
+  Booking,
   BookInput,
   BookResult,
   CancelInput,
@@ -16,7 +17,7 @@ import type {
 } from "../../types/frontdesk";
 import { DateTime } from "luxon";
 import { DEFAULT_LIMIT, MAX_LIMIT, MAX_WINDOW_DAYS, formatDisplay } from "../engine/availability";
-import { APPROVAL_HOLD_MINUTES } from "../engine/lifecycle";
+import { APPROVAL_HOLD_MINUTES, DEPOSIT_PAY_MINUTES } from "../engine/lifecycle";
 import { toApiError } from "./errors";
 import {
   book,
@@ -55,12 +56,14 @@ export const SERVER_INSTRUCTIONS = [
   "Before booking, tell the person the shop's rules: the deposit, the cancellation window and the no-show rule.",
   `No booking is final until the person approves it themselves: book holds the slot for ${APPROVAL_HOLD_MINUTES} minutes`,
   "and returns an approval link (booking.approval.url). Send the person that link right away; they open it and",
-  "approve or decline. Then call get_booking to check the status: confirmed",
-  "(approved), cancelled (declined) or expired (the hold ran out; book again if they still want it).",
+  "approve or decline. If the service has a deposit, approving takes them to a payment page to place it as a hold",
+  `on their card (awaiting_deposit, for ${DEPOSIT_PAY_MINUTES} minutes); paying confirms the booking. The hold is charged only`,
+  "for a no-show or a late cancellation. Then call get_booking to check the status: confirmed",
+  "(approved and, if needed, paid), awaiting_deposit (approved, deposit not paid yet: send the same link again),",
+  "cancelled (declined) or expired (the hold ran out or the deposit wasn't paid in time; book again if they still want it).",
   "While the hold is on, get_booking returns the same link again, so you never need to book twice to get it.",
   "cancel works on a hold too. On a confirmed booking it follows the shop's cancellation policy (the deposit is",
   "released or kept depending on how close the start is), so tell the person the consequence before cancelling.",
-  "No money is collected yet.",
 ].join(" ");
 
 /** How every tool reports a failure. Each description adds the codes that tool can return. */
@@ -255,7 +258,8 @@ const bookingSchema = z.object({
   status: z
     .enum(["awaiting_approval", "awaiting_deposit", "confirmed", "cancelled", "expired", "completed", "no_show"])
     .describe(
-      "awaiting_approval: held until the person approves with the link. awaiting_approval, awaiting_deposit and confirmed " +
+      "awaiting_approval: held until the person approves with the link. awaiting_deposit: approved, held until the " +
+        "person pays the deposit from the same link. awaiting_approval, awaiting_deposit and confirmed " +
         "hold the time; cancelled, expired, completed and no_show are final.",
     ),
   customer: z.object({
@@ -265,18 +269,40 @@ const bookingSchema = z.object({
     phone: z.string().optional().describe("The phone number the person gave when approving (E.164), if any."),
   }),
   agent: z.object({ name: z.string().describe("Best-effort label for the booking agent: the client's self-reported name.") }),
-  depositCents: z
-    .number()
-    .int()
-    .describe("Deposit the service requires, in integer US cents. Not collected yet. 0 = none."),
+  depositCents: z.number().int().describe("Deposit the service requires, in integer US cents. 0 = none."),
+  deposit: z
+    .object({
+      amountCents: z.number().int().describe("The deposit in integer US cents (the same as depositCents)."),
+      state: z
+        .enum(["none", "awaiting_payment", "held", "captured", "released", "not_collected"])
+        .describe(
+          "none: nothing asked for (no deposit, or not approved yet). awaiting_payment: approved, the person must pay " +
+            "the hold. held: on their card, not charged. captured: charged (no-show or late cancellation). released: " +
+            "dropped, they keep their money. not_collected: confirmed without collecting it.",
+        ),
+      payUrl: z
+        .string()
+        .optional()
+        .describe("The payment page, while awaiting_payment. Send the person the approval link instead: it has the Pay button."),
+      payBy: z.string().optional().describe("While awaiting_payment: when the booking expires unpaid, RFC 3339."),
+      actionFailed: z
+        .object({
+          action: z.enum(["capture", "release"]),
+          message: z.string(),
+          at: z.string(),
+        })
+        .optional()
+        .describe("For the shop: the payment provider refused to capture or release the deposit."),
+    })
+    .describe("Where the deposit stands."),
   createdAt: z.string().describe("RFC 3339."),
   approval: z
     .object({
-      url: z.string().describe("Send this link to the person: they approve or decline there."),
-      expiresAt: z.string().describe("When the hold lapses, RFC 3339."),
+      url: z.string().describe("Send this link to the person: they approve or decline there, and pay the deposit if needed."),
+      expiresAt: z.string().describe("When the hold lapses, RFC 3339 (while awaiting_deposit: when the deposit must be paid by)."),
     })
     .optional()
-    .describe("Present while the booking awaits approval, in book's and get_booking's results."),
+    .describe("Present while the booking awaits approval or its deposit, in book's and get_booking's results."),
 });
 
 const bookOutputSchema = z.object({ booking: bookingSchema });
@@ -288,7 +314,9 @@ const cancelOutputSchema = z.object({
   depositEffect: z
     .enum(["none", "released", "captured"])
     .describe("What the shop's policy does with the deposit: none (no deposit), released, or captured (kept by the shop)."),
-  depositCollected: z.literal(false).describe("Always false for now: no money is held, charged or refunded yet."),
+  depositCollected: z
+    .boolean()
+    .describe("true when a deposit held on the card is captured or released by this change (see booking.deposit.state)."),
 });
 
 // Compile-time guards: the schemas must match the contract types exactly (including optional
@@ -360,7 +388,10 @@ export function policiesText({ shop, policies: p }: GetPoliciesResult): string {
   for (const [label, text] of rules) {
     if (text.trim() !== "") lines.push(`${label}: ${text.trim()}`);
   }
-  lines.push("Read these rules to the person before booking. No money is collected yet: nothing is held, charged or refunded.");
+  lines.push(
+    "Read these rules to the person before booking. A deposit is asked for after they approve the booking, as a hold " +
+      "on their card that is charged only under these rules.",
+  );
   return lines.join("\n");
 }
 
@@ -393,12 +424,16 @@ function displayInstant(rfc3339: string): string {
  * What the agent must do after book: "Hold placed until <time>. Send <name> this link to approve:
  * <url>. Then call get_booking to check the status."
  */
-export function bookText({ booking, staffName, holdDisplay }: BookOutcome): string {
+export function bookText({ booking, staffName, holdDisplay, depositsOn }: BookOutcome): string {
   const name = booking.customer.displayName;
+  const amount = formatUsdShort(booking.depositCents);
   const deposit =
-    booking.depositCents > 0
-      ? `A ${formatUsdShort(booking.depositCents)} deposit will be required once deposits are enabled; nothing was charged.`
-      : "This service needs no deposit.";
+    booking.depositCents === 0
+      ? "This service needs no deposit."
+      : depositsOn
+        ? `After approving, ${name} pays a ${amount} deposit hold on the same page (charged only for a no-show or a late ` +
+          `cancellation); the booking is confirmed once it's paid. Nothing was charged yet.`
+        : `This service has a ${amount} deposit, but the shop isn't collecting deposits yet, so nothing will be charged.`;
   const lines = [`Held ${booking.serviceName} with ${staffName}, ${booking.display}, for ${name}. It is not confirmed yet.`];
   if (booking.approval) {
     lines.push(
@@ -414,8 +449,17 @@ export function bookText({ booking, staffName, holdDisplay }: BookOutcome): stri
   return lines.join("\n");
 }
 
+/** What happened to the money, after cancelText's policy sentence. */
+function moneyNote({ booking, depositEffect, depositCollected }: CancelResult): string {
+  if (depositEffect === "none") return "";
+  if (!depositCollected) return " No deposit was held on the card, so nothing was charged or refunded.";
+  if (booking.deposit.actionFailed) return " The payment provider didn't accept the change yet; the shop will sort it out.";
+  return depositEffect === "captured" ? " The held deposit was charged." : " The hold on the card was released.";
+}
+
 /** E.g. "Cancelled Haircut, Sat 14 Nov, 2:30 pm EST, for Maya. Status: cancelled." plus the deposit effect in words. */
-export function cancelText({ booking, depositEffect }: CancelResult): string {
+export function cancelText(result: CancelResult): string {
+  const { booking, depositEffect } = result;
   const deposit = formatUsdShort(booking.depositCents);
   const effect = {
     none: "This booking has no deposit, so there's nothing to release or keep.",
@@ -424,7 +468,7 @@ export function cancelText({ booking, depositEffect }: CancelResult): string {
   }[depositEffect];
   return [
     `Cancelled ${booking.serviceName}, ${booking.display}, for ${booking.customer.displayName}. Status: ${booking.status}.`,
-    `${effect} No money has been collected yet, so nothing was charged or refunded.`,
+    `${effect}${moneyNote(result)}`,
     `Booking id: ${booking.id}.`,
   ].join("\n");
 }
@@ -440,10 +484,21 @@ function statusNote({ booking, declined }: GetBookingOutcome): string | null {
         : `Waiting for ${name} to approve with the link from book (the hold lasts ${APPROVAL_HOLD_MINUTES} minutes from booking).`;
       return `${link} Remind them if needed, then call get_booking again.`;
     }
+    case "awaiting_deposit": {
+      const amount = formatUsdShort(booking.depositCents);
+      const by = booking.approval ? ` by ${displayInstant(booking.approval.expiresAt)}` : "";
+      const link = booking.approval ? `: ${booking.approval.url}` : "";
+      return (
+        `${name} approved it, but it isn't confirmed until they pay the ${amount} deposit hold${by}. ` +
+        `Send them the same approval link again if needed (its page has the Pay button)${link}. Then call get_booking again.`
+      );
+    }
     case "confirmed":
       return booking.customer.approved ? `${name} approved it. It is confirmed.` : "It is confirmed.";
     case "expired":
-      return `The hold ran out before ${name} approved, so the time is free again. Book again if they still want it.`;
+      return booking.customer.approved
+        ? `${name} approved it but didn't pay the deposit in time, so the time is free again. Book again if they still want it.`
+        : `The hold ran out before ${name} approved, so the time is free again. Book again if they still want it.`;
     case "cancelled":
       return declined ? `${name} declined it, so the time is free again.` : null;
     default:
@@ -451,11 +506,21 @@ function statusNote({ booking, declined }: GetBookingOutcome): string | null {
   }
 }
 
+/** The deposit's state in get_booking's text: "Deposit: $10 (held on the card, not charged)." */
+const DEPOSIT_WORDS: Record<Booking["deposit"]["state"], string> = {
+  none: "not asked for yet",
+  awaiting_payment: "waiting for payment",
+  held: "held on the card, not charged",
+  captured: "charged",
+  released: "released",
+  not_collected: "not collected",
+};
+
 /** E.g. "Haircut, Sat 14 Nov, 2:30 pm EST, for Maya. Status: confirmed." plus what the status means. */
 function bookingText(outcome: GetBookingOutcome): string {
   const { booking } = outcome;
   const deposit =
-    booking.depositCents > 0 ? `Deposit: ${formatUsdShort(booking.depositCents)} (not collected yet).` : "No deposit.";
+    booking.depositCents > 0 ? `Deposit: ${formatUsdShort(booking.depositCents)} (${DEPOSIT_WORDS[booking.deposit.state]}).` : "No deposit.";
   const note = statusNote(outcome);
   return [
     `${booking.serviceName}, ${booking.display}, for ${booking.customer.displayName}. Status: ${booking.status}.`,
@@ -620,7 +685,6 @@ export function registerFrontDeskTools(
     },
   );
 
-  // Deposits are deferred: see the TODOs on book() in service.ts.
   server.registerTool(
     "book",
     {
@@ -629,7 +693,9 @@ export function registerFrontDeskTools(
         `Hold an appointment at Hart's Barbers for ${APPROVAL_HOLD_MINUTES} minutes until the person approves it. ` +
         "Nothing is final until they do: the result has status awaiting_approval and booking.approval.url, a link to " +
         "send the person right away. They open it and approve (→ confirmed) or decline (→ cancelled); if nobody " +
-        "answers in time the hold expires and the time is freed. Then call " +
+        "answers in time the hold expires and the time is freed. If the service has a deposit (depositCents > 0), " +
+        "approving takes them to a payment page for a hold on their card (→ awaiting_deposit until paid, then " +
+        `confirmed; unpaid after ${DEPOSIT_PAY_MINUTES} minutes → expired). Then call ` +
         "get_booking to check the status. Only call book once the person has chosen a time and heard the shop's rules " +
         "(get_policies). start must be one of the starts get_availability just returned for the same service_id " +
         "(RFC 3339 with offset, e.g. 2026-11-14T14:30:00-05:00); any other time is refused. " +
@@ -637,7 +703,7 @@ export function registerFrontDeskTools(
         "mandate (optional): the person's limits (priceCapCents, depositCapCents, window { from, to }); the server " +
         "refuses a booking outside them. " +
         "Call it once per booking: calling again for the same time gets slot_taken while the hold is on. " +
-        "No deposit is collected yet: depositCents says what the service will require once deposits are enabled. " +
+
         `${ERROR_FORMAT} ` +
         `code slot_taken: someone else just booked that time; details.alternatives has up to ${MAX_ALTERNATIVES} nearby ` +
         "open starts to offer the person, or call get_availability again. " +
@@ -684,8 +750,10 @@ export function registerFrontDeskTools(
         "customer name, deposit and status. Call it after sending the approval link to see what the person did: " +
         "awaiting_approval (not answered yet; booking.approval.url is the link to send them again if they lost it), " +
         "confirmed (approved; customer.approved is true, and customer.phone is set if they gave a number), cancelled " +
-        "(declined, or cancelled by you or the shop), expired (the hold ran out; book again if they still want it). " +
-        "Also awaiting_deposit, completed or no_show. " +
+        "(declined, or cancelled by you or the shop), expired (the hold ran out or the deposit wasn't paid in time; book " +
+        "again if they still want it), awaiting_deposit (approved, but the deposit isn't paid yet: send the person the " +
+        "same booking.approval.url again; its page has the Pay button). Also completed or no_show. booking.deposit.state " +
+        "says where the deposit stands. " +
         "Until agents sign in, anyone holding a booking id can read it. Read-only, apart from recording that a hold ran out. " +
         `${ERROR_FORMAT} code booking_not_found: no booking with that id at this shop; check the id. ` +
         "code invalid_request: fix the arguments as next_action says.",
@@ -718,8 +786,9 @@ export function registerFrontDeskTools(
         "cancelling at least cancelWindowHours before the start releases the deposit; cancelling later, but before " +
         "the start, captures it (the shop keeps it as a late fee); after the start the booking is not_cancellable. " +
         "Tell the person the consequence and get their go-ahead before cancelling. " +
-        "Returns the booking (status cancelled), depositEffect (none, released or captured) and depositCollected, " +
-        "which is false because no money is collected yet. " +
+        "A booking still awaiting its deposit can be cancelled any time; its payment page is closed. " +
+        "Returns the booking (status cancelled), depositEffect (none, released or captured) and depositCollected " +
+        "(true when a deposit held on the card was charged or released; booking.deposit.state shows the result). " +
         "Cancelling again is not_cancellable (it's already cancelled), so a retry never cancels twice. " +
         "Until agents sign in, anyone holding a booking id can cancel it. " +
         `${ERROR_FORMAT} code not_cancellable: the booking is already final (details.status), its hold ran out, or it has started; ` +

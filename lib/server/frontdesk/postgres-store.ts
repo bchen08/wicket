@@ -8,6 +8,7 @@ import type {
   BookingActor,
   BookingEventType,
   BookingStatus,
+  DepositState,
   Mandate,
   Policies,
   Service,
@@ -21,6 +22,8 @@ import {
   type AnswerApprovalResult,
   type BookingRecord,
   type BookingStore,
+  type DepositFailure,
+  type DepositPatch,
   type NewBooking,
 } from "./booking-store";
 import {
@@ -35,7 +38,7 @@ import {
 } from "./catalog";
 
 // Postgres ShopCatalog + BookingStore (postgres.js), for the schema in
-// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql and 0004_alerts.sql.
+// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql, 0004_alerts.sql and 0005_deposits.sql.
 
 /** SQLSTATE exclusion_violation: the bookings.no_overlap constraint fired. */
 const EXCLUSION_VIOLATION = "23P01";
@@ -101,6 +104,11 @@ type BookingRow = {
   customer_phone: string | null;
   approval_token: string | null;
   approve_by: Date | null;
+  deposit_state: DepositState;
+  checkout_url: string | null;
+  pay_by: Date | null;
+  /** jsonb: { action, message, at } with `at` an ISO string. */
+  deposit_failure: { action: DepositFailure["action"]; message: string; at: string } | null;
   timezone: string;
 };
 
@@ -122,7 +130,24 @@ function toRecord(r: BookingRow): BookingRecord {
     customerPhone: r.customer_phone,
     approvalToken: r.approval_token,
     approveBy: r.approve_by,
+    depositState: r.deposit_state,
+    checkoutUrl: r.checkout_url,
+    payBy: r.pay_by,
+    depositFailure: r.deposit_failure
+      ? { action: r.deposit_failure.action, message: r.deposit_failure.message, at: new Date(r.deposit_failure.at) }
+      : null,
     timezone: r.timezone,
+  };
+}
+
+/** A DepositPatch's columns as query parameters: null keeps the stored value (coalesce). */
+function patchParams(patch: DepositPatch | undefined) {
+  return {
+    state: patch?.state ?? null,
+    sessionId: patch?.checkoutSessionId ?? null,
+    url: patch?.checkoutUrl ?? null,
+    intentId: patch?.paymentIntentId ?? null,
+    payBy: patch?.payBy?.toISOString() ?? null,
   };
 }
 
@@ -216,7 +241,8 @@ const bookingColumns = (db: Db) => db`
   b.id::text as id, b.shop_slug, b.service_id, sv.name as service_name, b.deposit_cents,
   b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at, b.status,
   b.customer_name, b.agent_name, b.created_at, coalesce(ap.decision = 'approved', false) as customer_approved,
-  b.customer_phone, ap.token as approval_token, b.approve_by, sh.timezone
+  b.customer_phone, ap.token as approval_token, b.approve_by,
+  b.deposit_state, b.checkout_url, b.pay_by, b.deposit_failure, sh.timezone
 `;
 const bookingJoins = (db: Db) => db`
   join services sv on sv.shop_slug = b.shop_slug and sv.id = b.service_id
@@ -396,9 +422,10 @@ function bookingStoreOn(conn: Conn): BookingStore {
       return row?.n ?? 0;
     },
 
-    async transition(id, expectedStatus, nextStatus, event) {
+    async transition(id, expectedStatus, nextStatus, event, deposit) {
       const key = normalizeUuid(id);
       if (key === null) return null;
+      const d = patchParams(deposit);
       // One statement, so the update and its event commit together. Of two concurrent transitions
       // the second waits for the first's row lock, re-checks `status = expectedStatus` against the
       // committed row, matches nothing, and so writes no event and returns no row.
@@ -409,7 +436,12 @@ function bookingStoreOn(conn: Conn): BookingStore {
             cancelled_at = case when ${nextStatus === "cancelled"} then now() else cancelled_at end,
             cancelled_by = case when ${nextStatus === "cancelled"} then ${event.actor} else cancelled_by end,
             completed_at = case when ${nextStatus === "completed"} then now() else completed_at end,
-            no_show_at = case when ${nextStatus === "no_show"} then now() else no_show_at end
+            no_show_at = case when ${nextStatus === "no_show"} then now() else no_show_at end,
+            deposit_state = coalesce(${d.state}::text, deposit_state),
+            checkout_session_id = coalesce(${d.sessionId}::text, checkout_session_id),
+            checkout_url = coalesce(${d.url}::text, checkout_url),
+            payment_intent_id = coalesce(${d.intentId}::text, payment_intent_id),
+            pay_by = coalesce(${d.payBy}::timestamptz, pay_by)
           where id = ${key}::uuid and status = ${expectedStatus}
           returning *
         ), e as (
@@ -470,11 +502,17 @@ function bookingStoreOn(conn: Conn): BookingStore {
         `;
         if (decided.length === 0) throw new AnswerRollback();
         const phone = input.decision === "approved" ? (input.phone ?? null) : null;
+        const d = patchParams(input.decision === "approved" ? input.deposit : undefined);
         const rows = await tx<BookingRow[]>`
           with t as (
             update bookings set
               status = ${input.nextStatus},
               customer_phone = coalesce(${phone}::text, customer_phone),
+              deposit_state = coalesce(${d.state}::text, deposit_state),
+              checkout_session_id = coalesce(${d.sessionId}::text, checkout_session_id),
+              checkout_url = coalesce(${d.url}::text, checkout_url),
+              payment_intent_id = coalesce(${d.intentId}::text, payment_intent_id),
+              pay_by = coalesce(${d.payBy}::timestamptz, pay_by),
               cancelled_at = case when ${input.nextStatus === "cancelled"} then now() else cancelled_at end,
               cancelled_by = case when ${input.nextStatus === "cancelled"} then 'customer' else cancelled_by end
             where id = ${key}::uuid and status = 'awaiting_approval' and approve_by > ${now}::timestamptz
@@ -495,6 +533,51 @@ function bookingStoreOn(conn: Conn): BookingStore {
         if (err instanceof AnswerRollback) return { ok: false, reason: err.reason };
         throw err;
       }
+    },
+
+    // ---- Ring 1c: deposits ----
+
+    async getDeposit(id) {
+      const key = normalizeUuid(id);
+      if (key === null) return null;
+      const rows = await db<
+        { deposit_state: DepositState; checkout_session_id: string | null; payment_intent_id: string | null; pay_by: Date | null }[]
+      >`
+        select deposit_state, checkout_session_id, payment_intent_id, pay_by from bookings where id = ${key}::uuid
+      `;
+      const r = rows[0];
+      if (!r) return null;
+      return {
+        state: r.deposit_state,
+        checkoutSessionId: r.checkout_session_id,
+        paymentIntentId: r.payment_intent_id,
+        payBy: r.pay_by,
+      };
+    },
+
+    async updateDeposit(id, outcome, event) {
+      const key = normalizeUuid(id);
+      if (key === null) return null;
+      const failure =
+        outcome.failure === undefined || outcome.failure === null
+          ? null
+          : db.json({ action: outcome.failure.action, message: outcome.failure.message, at: outcome.failure.at.toISOString() });
+      // One statement, so the outcome and its event commit together.
+      const rows = await db<BookingRow[]>`
+        with t as (
+          update bookings set
+            deposit_state = coalesce(${outcome.state ?? null}::text, deposit_state),
+            deposit_failure = case when ${outcome.failure !== undefined} then ${failure}::jsonb else deposit_failure end
+          where id = ${key}::uuid
+          returning *
+        ), e as (
+          insert into events (booking_id, actor, type, data)
+          select id, ${event?.actor ?? "system"}::text, ${event?.type ?? ""}::text, ${db.json((event?.data ?? {}) as postgres.JSONValue)}::jsonb
+          from t where ${event !== undefined}
+        )
+        select ${bookingColumns(db)} from t b ${bookingJoins(db)}
+      `;
+      return rows[0] ? toBooking(toRecord(rows[0])) : null;
     },
 
     // ---- Owner alerts ----
@@ -581,15 +664,16 @@ function catalogOn(conn: Conn): ShopCatalog {
 
     async getBusyIntervals(slug, range): Promise<BusyInterval[]> {
       // Weekly hours already leave out lunch, so busy time is bookings that hold time (the statuses
-      // in the no_overlap constraint; a hold carries its deadline) plus blocked times. Ordered by
-      // start, then kind, then id.
+      // in the no_overlap constraint; a hold carries its deadline, approve_by or pay_by) plus blocked
+      // times. Ordered by start, then kind, then id.
       const rows = await sql<
         { kind: "booking" | "block"; id: string; staff_id: string; start_at: Date; end_at: Date; held_until: Date | null }[]
       >`
         select busy.kind, busy.id::text as id, busy.staff_id, busy.start_at, busy.end_at, busy.held_until
         from (
           select 'booking' as kind, b.id, b.staff_id, lower(b.during) as start_at, upper(b.during) as end_at,
-                 case when b.status = 'awaiting_approval' then b.approve_by end as held_until
+                 case when b.status = 'awaiting_approval' then b.approve_by
+                      when b.status = 'awaiting_deposit' then b.pay_by end as held_until
           from bookings b
           where b.shop_slug = ${slug}
             and b.status in ('awaiting_approval', 'awaiting_deposit', 'confirmed')

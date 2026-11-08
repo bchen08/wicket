@@ -20,6 +20,7 @@ const booking: Booking = {
   customer: customerOf("Maya Lopez", true, "+14015550123"),
   agent: { name: "claude-ai" },
   depositCents: 1000,
+  deposit: { amountCents: 1000, state: "held" },
   createdAt: "2026-11-09T12:00:00-05:00",
 };
 
@@ -140,7 +141,7 @@ describe("the email", () => {
         "Customer: Maya Lopez",
         "Phone: +14015550123",
         "Booked by: claude-ai",
-        "Price: $35 (deposit $10, not collected yet)",
+        "Price: $35 (deposit $10 held on the card)",
         "",
         "All bookings: https://emergent.vercel.app/console",
       ].join("\n"),

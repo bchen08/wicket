@@ -1,3 +1,4 @@
+import { DateTime } from "luxon";
 import type { Booking, BookingStatus, DepositEffect, Mandate, Policies } from "../../types/frontdesk";
 import { FrontDeskError } from "../frontdesk/errors";
 import { parseRfc3339 } from "../frontdesk/time";
@@ -5,15 +6,16 @@ import { parseRfc3339 } from "../frontdesk/time";
 // Pure booking lifecycle: given a booking, an action, the time and the shop's policies, decide the
 // next status and what happens to the deposit. No I/O, no clock reads.
 //
-// TODO(ring-1c): move real money. Today every caller reports the depositEffect decided here with
-// depositCollected: false.
+// The depositEffect decided here is what lib/server/deposits/deposits.ts does in Stripe after the
+// change is stored: captured → capture the hold, released → release it (see docs/deposits.md).
 
 /**
  * What can be done to an existing booking. Agents may only cancel; owners may cancel, complete and
- * mark a no-show; the person (actor "customer") approves or declines; "system" expires a lapsed hold.
+ * mark a no-show; the person (actor "customer") approves or declines; "system" expires a lapsed hold
+ * or an unpaid deposit, and confirms a booking whose deposit was paid ("confirm_deposit").
  * Placing a booking is the "book" action, decided by the first overload of decide().
  */
-export type LifecycleAction = "cancel" | "complete" | "mark_no_show" | "approve" | "decline" | "expire";
+export type LifecycleAction = "cancel" | "complete" | "mark_no_show" | "approve" | "decline" | "expire" | "confirm_deposit";
 
 /** The actions an agent or the owner takes on a booking (the cancel tool and the owner routes). */
 export type ManageAction = "cancel" | "complete" | "mark_no_show";
@@ -30,10 +32,21 @@ export type Decision = {
 export const APPROVAL_HOLD_MINUTES = 10;
 const APPROVAL_HOLD_MS = APPROVAL_HOLD_MINUTES * 60 * 1000;
 
+/** How long the person has to pay the deposit after approving (pay_by = approve time + this). */
+export const DEPOSIT_PAY_MINUTES = 30;
+const DEPOSIT_PAY_MS = DEPOSIT_PAY_MINUTES * 60 * 1000;
+
 /** What decide() needs to know about a booking it doesn't create. */
 export type DecideBooking = Pick<Booking, "id" | "status" | "start" | "depositCents"> & {
   /** When the hold lapses. Needed for approve, decline and expire on an awaiting_approval booking. */
   approveBy?: Date | null;
+  /** When an unpaid deposit lapses. Needed for expire on an awaiting_deposit booking. */
+  payBy?: Date | null;
+  /**
+   * approve only: the booking must pay its deposit before it's confirmed (needsDeposit() and this
+   * deployment collects deposits). Then approve moves it to awaiting_deposit instead of confirmed.
+   */
+  depositRequired?: boolean;
 };
 
 /** What decide() needs to know about a booking book is about to place. */
@@ -99,6 +112,7 @@ const ACTION_DONE: Record<LifecycleAction, string> = {
   approve: "approved",
   decline: "declined",
   expire: "expired",
+  confirm_deposit: "confirmed",
 };
 
 /** The actions each actor may take. */
@@ -106,12 +120,12 @@ const ACTOR_ACTIONS: Record<LifecycleActor, readonly LifecycleAction[]> = {
   agent: ["cancel"],
   owner: ["cancel", "complete", "mark_no_show"],
   customer: ["approve", "decline"],
-  system: ["expire"],
+  system: ["expire", "confirm_deposit"],
 };
 
 const OWNER_FINAL_NEXT = "Don't retry: this booking is final and can't change any more. Reload it to see its current status and history.";
 const OWNER_LEAVE_AWAITING =
-  "Leave it as it is: a booking awaiting deposit expires on its own if the deposit isn't paid in time.";
+  `Leave it as it is: a booking awaiting deposit expires on its own if the deposit isn't paid within ${DEPOSIT_PAY_MINUTES} minutes.`;
 const OWNER_ONLY_CONFIRMED = "Only a confirmed booking can be marked completed or a no-show.";
 const OWNER_NOT_APPROVED = "The person hasn't approved this booking yet; cancel it if it isn't going ahead.";
 
@@ -122,6 +136,30 @@ export const OUTSIDE_MANDATE_NEXT = "Ask the person to widen their limit, or cho
 
 function isFinal(status: BookingStatus): status is FinalStatus {
   return FINAL_STATUSES.has(status);
+}
+
+/**
+ * Whether a booking must pay its deposit before it's confirmed: the service has a deposit
+ * (depositCents > 0, the booking's snapshot) and the start is within depositHorizonDays of now, counted in
+ * calendar days in the shop's zone like the booking horizon (bookingBounds). book never places a deposit
+ * service further ahead, so this is false only when the owner shortened the horizon after it was booked.
+ */
+export function needsDeposit(
+  booking: Pick<DecideBooking, "depositCents" | "start">,
+  now: Date,
+  policies: Pick<Policies, "depositHorizonDays">,
+  timezone: string,
+): boolean {
+  if (booking.depositCents <= 0) return false;
+  const start = parseRfc3339(booking.start);
+  if (!start) throw new Error(`needsDeposit() was given a start that isn't RFC 3339: "${booking.start}"`);
+  const horizon = DateTime.fromJSDate(now, { zone: timezone }).plus({ days: policies.depositHorizonDays }).toJSDate();
+  return start.getTime() < horizon.getTime();
+}
+
+/** When the person must have paid the deposit by, for an approval at `now`. */
+export function depositPayBy(now: Date): Date {
+  return new Date(now.getTime() + DEPOSIT_PAY_MS);
 }
 
 /** The policy's deposit effect, or "none" when the booking has no deposit. */
@@ -187,6 +225,14 @@ function notYourAction(booking: DecideBooking, type: LifecycleAction, actor: Lif
       "Don't retry. Cancel the booking instead if it isn't going ahead.",
     );
   }
+  if (type === "confirm_deposit") {
+    return invalidAction(
+      booking,
+      type,
+      "A booking awaiting its deposit is confirmed when the person pays it.",
+      "Don't retry. Send the person the approval link: its page has the Pay button.",
+    );
+  }
   return invalidAction(
     booking,
     type,
@@ -222,14 +268,24 @@ function decideAnswer(booking: DecideBooking, type: "approve" | "decline", now: 
       { status: booking.status, booking_id: booking.id },
     );
   }
-  return type === "approve"
-    ? // TODO(ring-1c): go to awaiting_deposit instead when depositCents > 0, and confirm once it's paid.
-      { nextStatus: "confirmed", depositEffect: "none" }
-    : { nextStatus: "cancelled", depositEffect: depositEffect(booking, "released") };
+  if (type === "decline") return { nextStatus: "cancelled", depositEffect: depositEffect(booking, "released") };
+  // A booking that needs a deposit waits for it; the person pays on Stripe Checkout (confirm_deposit).
+  return { nextStatus: booking.depositRequired ? "awaiting_deposit" : "confirmed", depositEffect: "none" };
 }
 
-/** A lapsed hold expiring. The stores' lazy expiry (expireStaleHolds, refreshBooking) applies this same rule in SQL. */
+/**
+ * A lapsed hold, or an unpaid deposit past payBy, expiring. The stores' lazy expiry (expireStaleHolds,
+ * refreshBooking) applies the hold rule in SQL; an unpaid deposit expires only after Stripe says it wasn't
+ * paid (syncDeposit in lib/server/deposits/deposits.ts).
+ */
 function decideExpire(booking: DecideBooking, now: Date): Decision | FrontDeskError {
+  if (booking.status === "awaiting_deposit") {
+    if (!booking.payBy) throw new Error(`Booking ${booking.id} is awaiting its deposit but has no payBy.`);
+    if (now.getTime() < booking.payBy.getTime()) {
+      return invalidAction(booking, "expire", "The time to pay the deposit hasn't run out yet.", "Wait until it runs out.");
+    }
+    return { nextStatus: "expired", depositEffect: depositEffect(booking, "released") };
+  }
   if (booking.status !== "awaiting_approval") {
     return invalidAction(booking, "expire", `${BOOKING_IN[booking.status]} can't be expired.`, "Don't retry: only a hold expires.");
   }
@@ -237,6 +293,19 @@ function decideExpire(booking: DecideBooking, now: Date): Decision | FrontDeskEr
     return invalidAction(booking, "expire", "The hold hasn't run out yet.", "Wait until the hold runs out.");
   }
   return { nextStatus: "expired", depositEffect: depositEffect(booking, "released") };
+}
+
+/** The person paid the deposit: an awaiting_deposit booking is confirmed, even after payBy (Stripe took the hold). */
+function decideConfirmDeposit(booking: DecideBooking): Decision | FrontDeskError {
+  if (booking.status !== "awaiting_deposit") {
+    return invalidAction(
+      booking,
+      "confirm_deposit",
+      `${BOOKING_IN[booking.status]} isn't waiting for a deposit.`,
+      "Don't retry: only a booking awaiting its deposit is confirmed by paying it.",
+    );
+  }
+  return { nextStatus: "confirmed", depositEffect: "none" };
 }
 
 function usd(cents: number): string {
@@ -297,13 +366,18 @@ export function decide(proposal: BookProposal, action: { type: "book"; actor: "a
  *
  * | actor    | action       | from                       | when                                 | → status  | deposit  |
  * |----------|--------------|----------------------------|--------------------------------------|-----------|----------|
- * | customer | approve      | awaiting_approval          | before approveBy                     | confirmed | none     |
+ * | customer | approve      | awaiting_approval          | before approveBy, no deposit required | confirmed | none    |
+ * | customer | approve      | awaiting_approval          | before approveBy, depositRequired    | awaiting_deposit | none |
  * | customer | decline      | awaiting_approval          | before approveBy                     | cancelled | released |
  * | customer | approve / decline | awaiting_approval (approveBy passed) or expired | any time | approval_expired |
  * | customer | approve / decline | any other status      | any time                             | approval_closed      |
  * | system   | expire       | awaiting_approval          | at or after approveBy                | expired   | released |
  * | system   | expire       | awaiting_approval          | before approveBy                     | invalid_request      |
+ * | system   | expire       | awaiting_deposit           | at or after payBy                    | expired   | released |
+ * | system   | expire       | awaiting_deposit           | before payBy                         | invalid_request      |
  * | system   | expire       | any other status           | any time                             | invalid_request      |
+ * | system   | confirm_deposit | awaiting_deposit        | any time (the person paid)           | confirmed | none     |
+ * | system   | confirm_deposit | any other status        | any time                             | invalid_request      |
  * | agent    | cancel       | confirmed                  | start − now >= cancelWindowHours     | cancelled | released |
  * | agent    | cancel       | confirmed                  | before start, inside the window      | cancelled | captured |
  * | agent    | cancel       | confirmed                  | after start                          | not_cancellable      |
@@ -318,11 +392,11 @@ export function decide(proposal: BookProposal, action: { type: "book"; actor: "a
  * | agent    | any          | cancelled/expired/completed/no_show | any time                    | not_cancellable      |
  * | owner    | any          | cancelled/expired/completed/no_show | any time                    | invalid_request      |
  * | any      | an action not in its list (agent: cancel; owner: cancel, complete, mark_no_show;  | invalid_request      |
- * |          | customer: approve, decline; system: expire) | any status | any time               |                      |
+ * |          | customer: approve, decline; system: expire, confirm_deposit) | any status | any time |              |
  *
  * A booking with depositCents 0 always gets depositEffect "none" instead of released/captured. No money
- * moves during a hold (released: the person keeps everything); approve's "none" becomes awaiting_deposit
- * in Ring 1c.
+ * moves during a hold (released: the person keeps everything). depositRequired comes from needsDeposit()
+ * and whether this deployment collects deposits (STRIPE_SECRET_KEY).
  * The last row is checked first: an actor asking for an action that isn't theirs gets invalid_request
  * whatever the status (e.g. an agent asking to complete or mark a no-show).
  *
@@ -360,6 +434,7 @@ export function decide(
 
   if (type === "approve" || type === "decline") return decideAnswer(booking, type, now);
   if (type === "expire") return decideExpire(booking, now);
+  if (type === "confirm_deposit") return decideConfirmDeposit(booking);
 
   if (isFinal(booking.status)) {
     return actor === "agent"

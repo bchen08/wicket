@@ -30,8 +30,9 @@ export type BusyInterval = TimeRange & {
    */
   kind?: "booking" | "block";
   /**
-   * An awaiting_approval booking: its hold lapses at this instant (approve_by). From then on it no
-   * longer counts as busy, even before lazy expiry marks it expired (see activeBusy in service.ts).
+   * An awaiting_approval booking: its hold lapses at this instant (approve_by); an awaiting_deposit one:
+   * its deposit is due by then (pay_by). From then on it no longer counts as busy, even before lazy expiry
+   * marks it expired (see activeBusy in service.ts; book asks Stripe about a lapsed deposit first).
    */
   heldUntil?: Date;
   /** Why it's busy. For debugging only; never shown to agents. */

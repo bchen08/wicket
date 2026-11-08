@@ -2,6 +2,9 @@
 // The UI must import these types instead of describing the shape itself.
 // Money is always an integer number of cents. Instants are RFC 3339 strings with an offset.
 
+import type { BookingDeposit, DepositsMode } from "./deposits";
+
+export type { BookingDeposit, DepositsMode, DepositState } from "./deposits";
 // The web booking API's shapes (plain HTTP booking for agents without MCP, and the booking page).
 export type * from "./web-booking";
 
@@ -208,11 +211,13 @@ export type GetAvailabilityResult = {
  * - `awaiting_approval`: the slot is held; the person hasn't approved yet. book creates every booking in
  *   this status, held for 10 minutes. Approving makes it confirmed; declining cancels it; letting the
  *   hold lapse expires it.
- * - `awaiting_deposit`: holds the slot until the deposit is paid. Not produced until Ring 1c.
- * - `confirmed`: the appointment is on: the person approved it.
+ * - `awaiting_deposit`: the person approved a booking that needs a deposit, and must pay it on Stripe
+ *   Checkout (Booking.deposit.payUrl) within 30 minutes. Holds the slot. Paying confirms it; not paying
+ *   in time expires it.
+ * - `confirmed`: the appointment is on: the person approved it (and paid the deposit, if it needed one).
  * - `cancelled`: cancelled by the agent or the owner, or declined by the person. Frees the slot.
- * - `expired`: the person didn't approve within the 10-minute hold. Frees the slot. (Ring 1c: also a
- *   deposit that wasn't paid in time.)
+ * - `expired`: the person didn't approve within the 10-minute hold, or didn't pay the deposit within 30
+ *   minutes of approving. Frees the slot.
  * - `completed`: the owner marked it done, after the start.
  * - `no_show`: the owner marked that the customer didn't come, after the start.
  * `awaiting_approval`, `awaiting_deposit` and `confirmed` hold the time; the other four are final.
@@ -237,15 +242,27 @@ export type DepositEffect =
 
 /**
  * Who did something to a booking. `customer` is the person approving or declining through the
- * approval link. `system` is for automatic changes (a hold that lapsed; Ring 1c: deposit expiry).
+ * approval link. `system` is for automatic changes (a hold that lapsed, a deposit paid or not paid in
+ * time, a deposit Stripe refused to move).
  */
 export type BookingActor = "agent" | "owner" | "customer" | "system";
 
 /**
  * What happened to a booking. `booked`: the agent placed the hold. `approved` / `declined`: the person
- * answered the approval request. `expired`: the hold lapsed. Ring 1c adds more.
+ * answered the approval request. `expired`: the hold lapsed, or the deposit wasn't paid in time.
+ * `deposit.paid`: the person paid the deposit hold, so the booking is confirmed. `deposit.action_failed`:
+ * Stripe refused to capture or release the deposit (no status change; data { action, message }).
  */
-export type BookingEventType = "booked" | "approved" | "declined" | "expired" | "cancelled" | "completed" | "no_show";
+export type BookingEventType =
+  | "booked"
+  | "approved"
+  | "declined"
+  | "expired"
+  | "cancelled"
+  | "completed"
+  | "no_show"
+  | "deposit.paid"
+  | "deposit.action_failed";
 
 /** One step in a booking's history. Every state change writes exactly one. */
 export type BookingEvent = {
@@ -258,7 +275,8 @@ export type BookingEvent = {
   type: BookingEventType;
   /**
    * Specifics. `booked`: { status, agentName, mandate? }. A transition: { from, to, depositEffect,
-   * depositCollected }.
+   * depositCollected }. `deposit.paid` adds checkoutSessionId and paymentIntentId. `deposit.action_failed`:
+   * { action: "capture" | "release", message, paymentIntentId?, checkoutSessionId? }.
    */
   data: Record<string, unknown>;
 };
@@ -309,14 +327,18 @@ export type Booking = {
     /** Best-effort label for the AI agent that booked: the MCP client's self-reported name. */
     name: string;
   };
-  /** Deposit the service required when this booking was made, in integer cents. NOT collected until Ring 1c. 0 = none. */
+  /** Deposit the service required when this booking was made, in integer cents. 0 = none. See `deposit` for where it stands. */
   depositCents: number;
+  /** The deposit: how much, and where it stands (asked for, held on the card, captured, released). See BookingDeposit. */
+  deposit: BookingDeposit;
   /** When the booking was made, RFC 3339. */
   createdAt: string;
   /**
    * The link the person opens to approve or decline, and when the hold lapses. Present while status is
    * awaiting_approval, in every booking response: book, get_booking, the owner bookings list and booking
    * detail. An agent that lost the link can fetch it again with get_booking; the owner can copy it.
+   * Also present while awaiting_deposit: the same page then has the Pay button, and expiresAt is when the
+   * deposit must be paid by (deposit.payBy).
    */
   approval?: {
     /**
@@ -324,7 +346,10 @@ export type Booking = {
      * on previews and in production). Send it to the person; anyone holding it can approve or decline.
      */
     url: string;
-    /** When the hold lapses (book time + 10 minutes), RFC 3339 with the shop's offset. */
+    /**
+     * When the hold lapses, RFC 3339 with the shop's offset: book time + 10 minutes, or, while awaiting_deposit,
+     * approve time + 30 minutes.
+     */
     expiresAt: string;
   };
 };
@@ -372,8 +397,12 @@ export type BookingTransitionResult = {
   booking: Booking;
   /** What the shop's policy decides for the deposit. */
   depositEffect: DepositEffect;
-  /** Always false until Ring 1c: no money is held, released or captured yet. */
-  depositCollected: false;
+  /**
+   * true when real money moves: the booking had its deposit held on the card (deposit.state `held`), and
+   * this change captures or releases it in Stripe. booking.deposit shows the outcome (`captured`, `released`,
+   * or `actionFailed` if Stripe refused). false when no deposit was held.
+   */
+  depositCollected: boolean;
 };
 
 /** structuredContent of a successful `cancel` call. */
@@ -547,12 +576,14 @@ export type BookingDetailResponse = {
  * GET /api/approvals/[token]. Unknown token → 404 booking_not_found.
  * status:
  * - `pending`: the hold is on and the person can approve or decline.
- * - `approved`: the person approved; the booking was confirmed.
+ * - `awaiting_deposit`: the person approved; they must pay the deposit hold (deposit.payUrl) by deposit.payBy.
+ * - `approved`: the person approved (and paid the deposit, if it needed one); the booking was confirmed.
  * - `declined`: the person declined; the booking was cancelled.
- * - `expired`: the hold lapsed, or the agent or shop cancelled the booking, before the person answered.
+ * - `expired`: the hold lapsed, or the agent or shop cancelled the booking, before the person answered;
+ *   or the person approved but the deposit wasn't paid in time, or the booking was cancelled before it was.
  */
 export type ApprovalView = {
-  status: "pending" | "approved" | "declined" | "expired";
+  status: "pending" | "awaiting_deposit" | "approved" | "declined" | "expired";
   shop: Shop;
   serviceName: string;
   /** Human-readable start in the shop's time zone, e.g. "Sat 14 Nov, 2:30 pm EST". */
@@ -563,8 +594,10 @@ export type ApprovalView = {
   end: string;
   /** The service's price, in integer cents. */
   priceCents: number;
-  /** The deposit the booking requires, in integer cents. 0 = none. Not collected until Ring 1c. */
+  /** The deposit the booking requires, in integer cents. 0 = none. */
   depositCents: number;
+  /** Where the deposit stands; payUrl and payBy while it's awaiting payment. */
+  deposit: Omit<BookingDeposit, "actionFailed">;
   /** The shop's rules to show before the person approves. */
   policies: Pick<Policies, "cancelWindowHours" | "depositRule" | "lateCancelRule" | "noShowRule">;
   /** Who asked for the booking: the agent's self-reported name. */
@@ -589,7 +622,11 @@ export type ApproveRequest = {
   phone?: string;
 };
 
-/** POST /api/approvals/[token]/approve response: the booking, now confirmed (customer.approved true). */
+/**
+ * POST /api/approvals/[token]/approve response: the booking, now confirmed (customer.approved true), or
+ * awaiting_deposit with booking.deposit.payUrl (Stripe Checkout) when it needs a deposit. A form post
+ * answers 303 → that payUrl instead, or → /approve/<token> when the booking is confirmed.
+ */
 export type ApproveResponse = {
   booking: Booking;
 };
@@ -635,6 +672,8 @@ export type StatusResponse = {
   };
   /** Whether OWNER_API_TOKEN is set. Its value is never shown. */
   ownerAccess: "configured" | "missing";
+  /** Whether deposits are collected (STRIPE_SECRET_KEY is set). `off` is not a problem: bookings confirm without one. */
+  deposits: DepositsMode;
   /** Approval links are built on the origin of the request that creates them, like this one's. */
   approvalLinks: { origin: string };
   /**

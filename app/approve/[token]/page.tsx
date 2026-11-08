@@ -176,10 +176,44 @@ function Answer({
   );
 }
 
+/**
+ * awaiting_deposit only: the person approved; they pay the deposit hold on Stripe Checkout to finish.
+ * A plain stand-in; v0 restyles it.
+ */
+function PayDeposit({ view }: { view: ApprovalView }) {
+  const cents = view.deposit.amountCents;
+  const amount = cents % 100 === 0 ? `$${cents / 100}` : usd(cents);
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="font-medium">Pay the {amount} deposit to finish booking</p>
+      {view.deposit.payUrl && (
+        <a
+          href={view.deposit.payUrl}
+          className={buttonVariants({
+            size: "lg",
+            className: "min-h-12 w-full",
+          })}
+        >
+          Pay {amount} deposit
+        </a>
+      )}
+      {view.deposit.payBy && (
+        <p className="text-sm text-muted-foreground">
+          Hold expires at {inShopZone(view.deposit.payBy, view.shop.timezone)}.
+        </p>
+      )}
+    </div>
+  );
+}
+
 const CLOSED: Record<
   Exclude<ApprovalView["status"], "pending">,
   { title: string; body: string }
 > = {
+  awaiting_deposit: {
+    title: "One step left",
+    body: "You approved this booking. The time is held for you until you pay the deposit.",
+  },
   approved: {
     title: "You're booked",
     body: "The shop has your booking. Your agent can see it's confirmed.",
@@ -252,6 +286,7 @@ async function Approval({
           error={code ? (FORM_ERRORS[code] ?? null) : null}
         />
       )}
+      {view.status === "awaiting_deposit" && <PayDeposit view={view} />}
     </section>
   );
 }

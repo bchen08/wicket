@@ -1,4 +1,4 @@
-import type { BlockedTime, BookingStatus, Mandate, Policies, Service, Shop } from "../../types/frontdesk";
+import type { BlockedTime, BookingStatus, DepositState, Mandate, Policies, Service, Shop } from "../../types/frontdesk";
 import type { Clock } from "../clock";
 import {
   ACTIVE_STATUSES,
@@ -11,6 +11,8 @@ import {
   toBookingEvent,
   type BookingRecord,
   type BookingStore,
+  type DepositFailure,
+  type DepositPatch,
   type NewAlert,
   type NewBooking,
   type NewBookingEvent,
@@ -103,6 +105,12 @@ export type InitialBooking = Omit<NewBooking, "depositCents" | "approveBy" | "ap
   /** With it, the booking gets an undecided approval request with this token. */
   approvalToken?: string;
   mandate?: Mandate | null;
+  /** The deposit columns (0005). Defaults: state "none", the rest null. awaiting_deposit needs payBy. */
+  depositState?: DepositState;
+  checkoutSessionId?: string;
+  checkoutUrl?: string;
+  paymentIntentId?: string;
+  payBy?: Date;
 };
 
 export type MemoryStoreOptions = {
@@ -153,7 +161,13 @@ type StoredBooking = Omit<
   BookingRecord,
   "serviceName" | "timezone" | "customerApproved" | "customerPhone" | "approvalToken" | "approveBy"
 > &
-  LifecycleStamps & { approveBy: Date | null; customerPhone: string | null; mandate: Mandate | null };
+  LifecycleStamps & {
+    approveBy: Date | null;
+    customerPhone: string | null;
+    mandate: Mandate | null;
+    checkoutSessionId: string | null;
+    paymentIntentId: string | null;
+  };
 
 type StoredEvent = NewBookingEvent & { seq: number; bookingId: string; at: Date };
 
@@ -178,6 +192,26 @@ function jsonCopy<T>(value: T): T {
 }
 
 const copyDate = (d: Date) => new Date(d.getTime());
+
+const DEPOSIT_STATES: readonly DepositState[] = ["none", "awaiting_payment", "held", "captured", "released", "not_collected"];
+
+/** Write a DepositPatch's fields onto a stored booking (absent fields keep their values). Checks the state first. */
+function applyDepositPatch(b: StoredBooking, patch: DepositPatch | undefined): void {
+  if (!patch) return;
+  if (patch.state !== undefined) b.depositState = patch.state;
+  if (patch.checkoutSessionId !== undefined) b.checkoutSessionId = patch.checkoutSessionId;
+  if (patch.checkoutUrl !== undefined) b.checkoutUrl = patch.checkoutUrl;
+  if (patch.paymentIntentId !== undefined) b.paymentIntentId = patch.paymentIntentId;
+  if (patch.payBy !== undefined) b.payBy = copyDate(patch.payBy);
+}
+
+/** The bookings_deposit_state_check and bookings_deposit_has_deadline checks, for a row about to be written. */
+function checkDepositRow(status: BookingStatus, state: DepositState, payBy: Date | null | undefined): void {
+  if (!DEPOSIT_STATES.includes(state)) throw new Error(`deposit_state must be one of ${DEPOSIT_STATES.join(", ")}.`);
+  if (status === "awaiting_deposit" && !payBy) throw new Error("A booking awaiting its deposit needs pay_by.");
+}
+
+const copyFailure = (f: DepositFailure): DepositFailure => ({ action: f.action, message: f.message, at: copyDate(f.at) });
 
 /** `patch` without its undefined fields, so spreading it never overwrites a value with undefined. */
 function defined<T extends object>(patch: T): Partial<T> {
@@ -275,6 +309,10 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       customerPhone: b.customerPhone,
       approvalToken: approvals.get(b.id)?.token ?? null,
       approveBy: b.approveBy && copyDate(b.approveBy),
+      depositState: b.depositState,
+      checkoutUrl: b.checkoutUrl,
+      payBy: b.payBy && copyDate(b.payBy),
+      depositFailure: b.depositFailure && copyFailure(b.depositFailure),
       timezone: shop.timezone,
     };
   }
@@ -289,6 +327,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
     const status = input.status ?? "confirmed";
     // The bookings_hold_has_deadline check, and approvals.token unique.
     if (status === "awaiting_approval" && !input.approveBy) throw new Error("A booking awaiting approval needs approveBy.");
+    checkDepositRow(status, input.depositState ?? "none", input.payBy);
     if (input.approvalToken && [...approvals.values()].some((a) => a.token === input.approvalToken)) {
       throw new Error("approvals.token must be unique.");
     }
@@ -311,6 +350,12 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       approveBy: input.approveBy ? copyDate(input.approveBy) : null,
       customerPhone: null,
       mandate: input.mandate ? jsonCopy(input.mandate) : null,
+      depositState: input.depositState ?? "none",
+      checkoutSessionId: input.checkoutSessionId ?? null,
+      checkoutUrl: input.checkoutUrl ?? null,
+      paymentIntentId: input.paymentIntentId ?? null,
+      payBy: input.payBy ? copyDate(input.payBy) : null,
+      depositFailure: null,
     };
     bookings.push(stored);
     if (input.approvalToken) {
@@ -377,7 +422,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       type Tagged = { id: string; kind: "booking" | "block"; staffId: string; start: Date; end: Date; heldUntil?: Date };
       const busy: Tagged[] = [
         // Mirrors the no_overlap constraint: awaiting_approval, awaiting_deposit and confirmed bookings
-        // hold time. A hold carries its deadline (lapsed ones included, like Postgres).
+        // hold time. A hold carries its deadline, approve_by or pay_by (lapsed ones included, like Postgres).
         ...bookings
           .filter((b) => b.shopSlug === slug && ACTIVE_STATUSES.includes(b.status) && overlaps(b, range))
           .map((b) => ({
@@ -387,6 +432,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
             end: b.end,
             kind: "booking" as const,
             ...(b.status === "awaiting_approval" && b.approveBy ? { heldUntil: b.approveBy } : {}),
+            ...(b.status === "awaiting_deposit" && b.payBy ? { heldUntil: b.payBy } : {}),
           })),
         ...blocks
           .filter((b) => staffInShop(slug, b.staffId) && overlaps(b, range))
@@ -526,7 +572,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       return expired;
     },
 
-    async transition(id, expectedStatus, nextStatus, event) {
+    async transition(id, expectedStatus, nextStatus, event, deposit) {
       // Check and set in one synchronous step (no await in this method), so of two concurrent
       // transitions from the same status exactly one sees expectedStatus.
       const b = findBooking(id);
@@ -535,8 +581,10 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
         // bookings.cancelled_by allows only 'agent', 'owner' and 'customer'.
         throw new Error('Only an "agent", "owner" or "customer" can cancel a booking.');
       }
+      checkDepositRow(nextStatus, deposit?.state ?? b.depositState, deposit?.payBy ?? b.payBy);
       const at = now();
       b.status = nextStatus;
+      applyDepositPatch(b, deposit);
       if (nextStatus === "cancelled") {
         b.cancelledAt = at;
         b.cancelledBy = event.actor as "agent" | "owner" | "customer";
@@ -597,9 +645,12 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       }
       // The bookings.customer_phone check.
       if (input.phone && !/^\+[1-9][0-9]{7,14}$/.test(input.phone)) throw new Error("customer_phone must be E.164.");
+      const deposit = input.decision === "approved" ? input.deposit : undefined;
+      checkDepositRow(input.nextStatus, deposit?.state ?? b.depositState, deposit?.payBy ?? b.payBy);
       const at = now();
       if (input.decision === "approved" && input.phone) b.customerPhone = input.phone;
       b.status = input.nextStatus;
+      applyDepositPatch(b, deposit);
       if (input.nextStatus === "cancelled") {
         b.cancelledAt = at;
         b.cancelledBy = "customer";
@@ -608,6 +659,30 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       approval.decision = input.decision;
       approval.decidedAt = copyDate(input.now);
       return { ok: true, booking: toBooking(record(b)) };
+    },
+
+    // ---- Ring 1c: deposits ----
+
+    async getDeposit(id) {
+      const b = findBooking(id);
+      if (!b) return null;
+      return {
+        state: b.depositState,
+        checkoutSessionId: b.checkoutSessionId,
+        paymentIntentId: b.paymentIntentId,
+        payBy: b.payBy && copyDate(b.payBy),
+      };
+    },
+
+    async updateDeposit(id, outcome, event) {
+      // One synchronous step, like Postgres' single statement.
+      const b = findBooking(id);
+      if (!b) return null;
+      if (outcome.state !== undefined) checkDepositRow(b.status, outcome.state, b.payBy);
+      if (outcome.state !== undefined) b.depositState = outcome.state;
+      if (outcome.failure !== undefined) b.depositFailure = outcome.failure && copyFailure(outcome.failure);
+      if (event) addEvent(b.id, event, now());
+      return toBooking(record(b));
     },
 
     // ---- Owner alerts ----

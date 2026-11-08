@@ -31,6 +31,7 @@ const readyStatus = (overrides = {}) => ({
   ownerAccess: "configured",
   approvalLinks: { origin: BASE },
   alerts: "log",
+  deposits: "off",
   problems: [],
   ...overrides,
 });
@@ -45,19 +46,35 @@ const toolError = (code) => ({ isError: true, content: [{ type: "text", text: JS
  * A fake deployment. `route(url, init, state)` may answer a request first (return a Response) to change one
  * behavior. `doubleBook: true` lets the same start be booked twice (a broken server). `ownerToken` is the
  * token its owner routes accept. Approving, declining and cancelling record owner alerts, like the real one.
+ * Approving a service with a deposit (anything but a beard-trim) waits for it, with a Stripe URL, when
+ * status.deposits is "stripe_test", and confirms it (deposit not_collected) otherwise.
  */
 function fakeDeployment({ status = readyStatus(), route, doubleBook = false, ownerToken = PREVIEW_OWNER_TOKEN } = {}) {
   const state = { requests: [], bookings: [], mcp: [], alerts: [] };
   const alert = (b, kind) => state.alerts.unshift({ id: String(state.alerts.length + 1), bookingId: b.id, kind, channel: "log", status: "logged", error: null });
   const isOwner = (headers) => headers.get("authorization") === `Bearer ${ownerToken}`;
-  const held = (start) => state.bookings.some((b) => b.start === start && ["awaiting_approval", "confirmed"].includes(b.status));
+  const ACTIVE = ["awaiting_approval", "awaiting_deposit", "confirmed"];
+  const held = (start) => state.bookings.some((b) => b.start === start && ACTIVE.includes(b.status));
+  const newBooking = (start, service, agent) => {
+    const n = state.bookings.length + 1;
+    const b = { id: `booking-${n}`, token: `token-${n}`, start, service, status: "awaiting_approval", deposit: "none", agent };
+    state.bookings.push(b);
+    return b;
+  };
   const view = (b) => ({
     id: b.id,
     status: b.status,
     start: b.start,
     display: `Tue 10 Nov, ${b.start.slice(11, 16)}`,
     agent: { name: b.agent },
-    ...(b.status === "awaiting_approval" ? { approval: { url: `${BASE}/approve/${b.token}`, expiresAt: "x" } } : {}),
+    deposit: {
+      amountCents: b.service === "beard-trim" ? 0 : 1000,
+      state: b.deposit,
+      ...(b.status === "awaiting_deposit" ? { payUrl: `https://checkout.stripe.com/c/pay/cs_test_${b.id}`, payBy: "x" } : {}),
+    },
+    ...(b.status === "awaiting_approval" || b.status === "awaiting_deposit"
+      ? { approval: { url: `${BASE}/approve/${b.token}`, expiresAt: "x" } }
+      : {}),
   });
 
   async function fetch(href, init = {}) {
@@ -108,9 +125,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
         back.searchParams.set("message", "That time is already booked.");
         return new Response(null, { status: 303, headers: { location: back.href } });
       }
-      const n = state.bookings.length + 1;
-      const b = { id: `booking-${n}`, token: `token-${n}`, start: fields.start, status: "awaiting_approval", agent: fields.bookedBy ?? "web" };
-      state.bookings.push(b);
+      const b = newBooking(fields.start, fields.service, fields.bookedBy ?? "web");
       if (form) return new Response(null, { status: 303, headers: { location: `${BASE}/approve/${b.token}` } });
       return json({ booking: view(b), statusUrl: `${BASE}/api/approvals/${b.token}`, next_action: "Send the link." }, 201);
     }
@@ -127,8 +142,16 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
     if (method === "POST" && approve) {
       const b = state.bookings.find((x) => x.token === approve[1]);
       if (!b || b.status !== "awaiting_approval") return apiError(409, "approval_closed");
-      b.status = "confirmed";
-      alert(b, "booking_confirmed");
+      if (b.service === "beard-trim") {
+        b.status = "confirmed";
+      } else if (status.deposits === "stripe_test") {
+        b.status = "awaiting_deposit";
+        b.deposit = "awaiting_payment";
+      } else {
+        b.status = "confirmed";
+        b.deposit = "not_collected";
+      }
+      if (b.status === "confirmed") alert(b, "booking_confirmed");
       return json({ booking: view(b) });
     }
 
@@ -153,9 +176,7 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
       }
       if (name === "book") {
         if (held(args.start) && !doubleBook) return reply(toolError("slot_taken"));
-        const n = state.bookings.length + 1;
-        const b = { id: `booking-${n}`, token: `token-${n}`, start: args.start, status: "awaiting_approval", agent: _meta?.["io.modelcontextprotocol/clientInfo"]?.name ?? "unknown agent" };
-        state.bookings.push(b);
+        const b = newBooking(args.start, args.service_id, _meta?.["io.modelcontextprotocol/clientInfo"]?.name ?? "unknown agent");
         return reply(toolResult({ booking: view(b) }));
       }
       if (name === "get_booking") {
@@ -164,7 +185,8 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
       }
       if (name === "cancel") {
         const b = state.bookings.find((x) => x.id === args.booking_id);
-        if (!b || !["awaiting_approval", "confirmed"].includes(b.status)) return reply(toolError("not_cancellable"));
+        if (!b || !ACTIVE.includes(b.status)) return reply(toolError("not_cancellable"));
+        if (b.status === "awaiting_deposit") b.deposit = "released";
         b.status = "cancelled";
         alert(b, "booking_cancelled");
         return reply(toolResult({ booking: view(b) }));
@@ -199,12 +221,20 @@ describe("pnpm smoke", () => {
 
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(results(run.rows)).toEqual(Array(27).fill("PASS"));
-    expect(run.line).toBe("PASS: 27 passed.");
-    expect(run.output).toMatch(/\nPASS: 27 passed\.$/);
-    // Over MCP: one booking declined, one approved and then cancelled by the cleanup. Over the web: the JSON
-    // booking declined, and the form post's booking declined by the cleanup. All by front-desk-smoke.
-    expect(deployment.state.bookings.map((b) => [b.status, b.agent])).toEqual(Array(4).fill(["cancelled", SMOKE_AGENT]));
+    expect(results(run.rows)).toEqual(Array(31).fill("PASS"));
+    expect(run.line).toBe("PASS: 31 passed.");
+    expect(run.output).toMatch(/\nPASS: 31 passed\.$/);
+    // Over MCP: one booking declined, a Beard trim approved and then cancelled by the cleanup, and the deposit
+    // check's Haircut approved and cancelled. Over the web: the JSON booking declined, and the form post's
+    // booking declined by the cleanup. All by front-desk-smoke.
+    expect(deployment.state.bookings.map((b) => [b.status, b.agent])).toEqual(Array(5).fill(["cancelled", SMOKE_AGENT]));
+    expect(deployment.state.bookings.map((b) => b.service)).toEqual(["haircut", "beard-trim", "haircut", "haircut", "haircut"]);
+    // Deposits off: the approved Haircut was confirmed without collecting its deposit.
+    expect(run.rows.find((r) => r.title.startsWith("Approve a Haircut"))).toMatchObject({
+      item: "19",
+      title: "Approve a Haircut (deposits off) → confirmed, deposit not_collected",
+      evidence: "Tue 10 Nov, 10:30: confirmed, deposit not_collected",
+    });
     expect(run.rows.find((r) => r.title.includes("booking_cancelled"))).toMatchObject({ item: "14", evidence: "booking_cancelled by log, logged" });
     expect(run.rows.find((r) => r.title.includes("booking_confirmed"))).toMatchObject({ item: "17", evidence: "booking_confirmed by log, logged" });
     // The bypass secret went on every request, and the secret itself is never printed.
@@ -233,8 +263,8 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("FAIL");
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.item === "2")).toMatchObject({ result: "FAIL", evidence: "HTTP 500 boom" });
-    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(26);
-    expect(run.line).toBe("FAIL: 1 failed, 26 passed, 0 skipped.");
+    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(30);
+    expect(run.line).toBe("FAIL: 1 failed, 30 passed, 0 skipped.");
   });
 
   it("BLOCKED: not_ready prints the problems, runs nothing else and exits 2", async () => {
@@ -297,11 +327,11 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
     expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual([
-      "5", "5", "11", "11", "12", "14", "14", "14", "17", "17", "W4", "W4", "W4", "W5",
+      "5", "5", "11", "11", "12", "14", "14", "14", "17", "17", "19", "19", "19", "19", "W4", "W4", "W4", "W5",
     ]);
     // The read-only web checks still run; no cleanup row: it made no bookings.
     expect(run.rows.filter((r) => r.item.startsWith("W") && r.result === "PASS").map((r) => r.item)).toEqual(["W1", "W2", "W3"]);
-    expect(run.line).toBe("PASS: 12 passed, 14 skipped (a skipped check is not a pass: verify those by hand).");
+    expect(run.line).toBe("PASS: 12 passed, 18 skipped (a skipped check is not a pass: verify those by hand).");
     expect(deployment.state.mcp.some((c) => c.params?.name === "book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.path === "/api/shops/harts/book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.headers.get("authorization"))).toBe(false);
@@ -348,7 +378,7 @@ describe("pnpm smoke", () => {
       "The owner's alerts list has booking_cancelled for it",
       "The owner's alerts list has booking_confirmed for it",
     ]);
-    expect(run.rows.find((r) => r.item === "17" && r.title.startsWith("Book another"))).toMatchObject({ result: "PASS" });
+    expect(run.rows.find((r) => r.item === "17" && r.title.startsWith("Book a Beard trim"))).toMatchObject({ result: "PASS" });
   });
 
   it("declines every booking it made even when a booking check fails", async () => {
@@ -360,8 +390,8 @@ describe("pnpm smoke", () => {
     expect(run.rows.find((r) => r.title.includes("slot_taken"))).toMatchObject({ result: "FAIL", evidence: "booked again: booking-2" });
     // The web form post at the held start books it again too, and fails.
     expect(run.rows.find((r) => r.title.includes("?error=slot_taken"))).toMatchObject({ result: "FAIL" });
-    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "5 made, 5 declined or cancelled: none left behind" });
-    expect(deployment.state.bookings.map((b) => b.status)).toEqual(Array(5).fill("cancelled"));
+    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "6 made, 6 declined or cancelled: none left behind" });
+    expect(deployment.state.bookings.map((b) => b.status)).toEqual(Array(6).fill("cancelled"));
   });
 
   it("web booking: a form post that doesn't redirect to /approve/ fails W5, and the JSON booking is still declined", async () => {
@@ -385,8 +415,47 @@ describe("pnpm smoke", () => {
       ["W5", "FAIL"],
     ]);
     expect(run.rows.find((r) => r.item === "W5").evidence).toBe("HTTP 200 <html>Booked!</html>");
-    // The MCP loop's approved booking is cancelled; the web JSON booking was declined by W4.
-    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "3 made, 3 declined or cancelled: none left behind" });
+    // The MCP loop's approved booking is cancelled; the deposit check cancelled its own; the web JSON
+    // booking was declined by W4.
+    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "4 made, 4 declined or cancelled: none left behind" });
+  });
+
+  it("deposits stripe_test: approving a Haircut waits for its deposit with a Stripe URL; cancelling releases it and frees the start", async () => {
+    const deployment = fakeDeployment({ status: readyStatus({ deposits: "stripe_test" }) });
+    const run = await smoke(deployment);
+    expect(run.verdict).toBe("PASS");
+    const deposits = run.rows.filter((r) => r.item === "19");
+    expect(deposits.map((r) => [r.title, r.result])).toEqual([
+      ["Approve a Haircut (deposits stripe_test) → awaiting_deposit, Stripe Checkout URL", "PASS"],
+      ["get_booking: awaiting_deposit, the same approval link", "PASS"],
+      ["cancel it → cancelled, deposit released", "PASS"],
+      ["The cancelled start is free again", "PASS"],
+    ]);
+    expect(deposits[0].evidence).toBe("Tue 10 Nov, 10:30: awaiting_deposit, deposit awaiting_payment, pay at https://checkout.stripe.com/c/pay/cs_test_…");
+    // The Beard trim (no deposit) still confirms at once, so item 17's alert check passes.
+    expect(run.rows.find((r) => r.title.includes("booking_confirmed"))).toMatchObject({ result: "PASS" });
+    // It never pays: the deposit check's Haircut ends cancelled with the deposit released.
+    expect(deployment.state.bookings[2]).toMatchObject({ service: "haircut", status: "cancelled", deposit: "released" });
+  });
+
+  it("deposits stripe_test: FAIL when approving confirms at once instead of waiting for the deposit", async () => {
+    const deployment = fakeDeployment({
+      status: readyStatus({ deposits: "stripe_test" }),
+      route: (url, _init, state) => {
+        const m = /^\/api\/approvals\/([^/]+)\/approve$/.exec(url.pathname);
+        if (!m) return undefined;
+        const b = state.bookings.find((x) => x.token === m[1]);
+        b.status = "confirmed";
+        b.deposit = b.service === "beard-trim" ? "none" : "not_collected";
+        return json({ booking: { id: b.id, status: "confirmed", display: `Tue 10 Nov, ${b.start.slice(11, 16)}`, deposit: { amountCents: 1000, state: b.deposit } } });
+      },
+    });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.fail);
+    expect(run.rows.find((r) => r.item === "19")).toMatchObject({ result: "FAIL", evidence: "Tue 10 Nov, 10:30: confirmed, deposit not_collected" });
+    // Still cleaned up.
+    expect(run.rows.at(-1)).toMatchObject({ result: "PASS" });
+    expect(deployment.state.bookings.every((b) => b.status === "cancelled")).toBe(true);
   });
 
   it("fails the cleanup row when a booking can't be declined or cancelled", async () => {
