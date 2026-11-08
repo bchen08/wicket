@@ -40,6 +40,6 @@ export async function AgentsList() {
         </TableBody>
       </Table>
     </div>
-    <p className="text-sm text-muted-foreground">{data.unconfirmedBookings} bookings from agents that didn&apos;t identify themselves</p>
+    <p className="text-center text-sm text-muted-foreground">{data.unconfirmedBookings} bookings from agents that didn&apos;t identify themselves</p>
   </section>;
 }

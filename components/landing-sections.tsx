@@ -53,7 +53,7 @@ export function Hero() {
             id="hero-title"
             className="font-serif text-4xl leading-tight text-balance sm:text-5xl lg:text-6xl"
           >
-            {"Your customers' AI assistants can book your shop now."}
+            {"Let customers' AI assistants book your shop."}
           </h1>
           <p className="max-w-md text-base leading-relaxed text-muted-foreground text-pretty">
             The customer approves every booking by text, and a card deposit
