@@ -6,7 +6,6 @@ import {
   OWNER_SESSION_COOKIE,
   OWNER_SESSION_MAX_AGE_S,
   ownerSessionValue,
-  requestOrigin,
 } from "./owner-auth";
 
 // The stub owner auth: Authorization: Bearer <OWNER_API_TOKEN>, compared in constant time, or the
@@ -158,12 +157,16 @@ describe("checkOwnerAuth: the fd_owner session cookie", () => {
     expect(ownerSessionValue("another-owner-token-0123456789", NOW_S + OWNER_SESSION_MAX_AGE_S)).not.toBe(VALID);
   });
 
-  it.each(["GET", "HEAD"])("accepts a valid cookie on %s, with or without an Origin header", (method) => {
-    expect(check(withCookie(`${OWNER_SESSION_COOKIE}=${VALID}`, { method }))).toEqual({ ok: true });
-    expect(check(withCookie(`${OWNER_SESSION_COOKIE}=${VALID}`, { method, origin: null }))).toEqual({ ok: true });
-    expect(check(withCookie(`${OWNER_SESSION_COOKIE}=${VALID}`, { method, origin: "https://evil.example" }))).toEqual({
-      ok: true,
-    });
+  it.each(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])("accepts a valid cookie on %s, whatever the Origin", (method) => {
+    // MVP: no CSRF check beyond SameSite=Strict, which keeps the browser from sending the cookie cross-site.
+    for (const origin of [ORIGIN, null, "https://evil.example"]) {
+      expect(check(withCookie(`${OWNER_SESSION_COOKIE}=${VALID}`, { method, origin }))).toEqual({ ok: true });
+    }
+  });
+
+  it("accepts a valid cookie even next to a wrong bearer token", () => {
+    const init = { method: "PUT", authorization: "Bearer wrong-token-of-some-length" };
+    expect(check(withCookie(`${OWNER_SESSION_COOKIE}=${VALID}`, init))).toEqual({ ok: true });
   });
 
   it("finds the cookie among others, and accepts it when any fd_owner value is valid", () => {
@@ -217,106 +220,5 @@ describe("checkOwnerAuth: the fd_owner session cookie", () => {
         status: 503,
       });
     }
-  });
-
-  describe("CSRF guard: a cookie-authenticated write must come from this origin", () => {
-    const cookie = `${OWNER_SESSION_COOKIE}=${VALID}`;
-
-    it.each(["POST", "PUT", "PATCH", "DELETE"])("accepts %s from the same origin", (method) => {
-      expect(check(withCookie(cookie, { method }))).toEqual({ ok: true });
-    });
-
-    it.each([
-      ["no Origin header", null],
-      ["another site", "https://evil.example"],
-      ['the opaque origin "null"', "null"],
-      ["the same host over http", "http://front-desk.example"],
-      ["the same host on another port", "https://front-desk.example:8443"],
-      ["a subdomain", "https://www.front-desk.example"],
-      ["the origin with a trailing slash", `${ORIGIN}/`],
-    ])("rejects a write from %s with 403 invalid_request", (_name, origin) => {
-      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
-        expect(check(withCookie(cookie, { method, origin }))).toEqual({
-          ok: false,
-          status: 403,
-          body: {
-            error: {
-              code: "invalid_request",
-              message:
-                "Refused a write signed in with the owner session cookie: the Origin header is missing or isn't this site.",
-              next_action:
-                "Send it from the Front Desk console on this site (the browser adds the matching Origin header), or authenticate with Authorization: Bearer <OWNER_API_TOKEN> instead of the cookie.",
-            },
-          },
-          headers: {},
-        });
-      }
-    });
-
-    it("leaves Bearer requests alone: the right token writes from any origin, or none", () => {
-      for (const origin of [null, "https://evil.example", ORIGIN]) {
-        const request = withCookie(undefined, { method: "PUT", origin, authorization: `Bearer ${TOKEN}` });
-        expect(check(request)).toEqual({ ok: true });
-      }
-    });
-
-    it("checks the Origin of a write that has a valid cookie and a wrong bearer token", () => {
-      const init = { method: "PUT", authorization: "Bearer wrong-token-of-some-length" };
-      expect(check(withCookie(cookie, init))).toEqual({ ok: true });
-      expect(check(withCookie(cookie, { ...init, origin: "https://evil.example" }))).toMatchObject({ status: 403 });
-    });
-
-    it("rejects an invalid cookie with 401, not 403, whatever the Origin", () => {
-      expect(check(withCookie(`${OWNER_SESSION_COOKIE}=${expired}`, { method: "PUT", origin: "https://evil.example" }))).toMatchObject({
-        status: 401,
-      });
-    });
-  });
-});
-
-describe("requestOrigin: the origin the browser used, from the forwarding headers", () => {
-  // Next.js builds request.url from the server's own hostname and port, so a route sees
-  // http://localhost:3000 whatever the browser typed. Next.js and Vercel set these headers.
-  const NEXT_URL = "http://localhost:3000/api/shops/harts/policies";
-  const req = (headers: Record<string, string>, url = NEXT_URL) => new Request(url, { method: "PUT", headers });
-
-  it.each([
-    ["X-Forwarded-Host and -Proto (Vercel)", { "x-forwarded-host": "front-desk.vercel.app", "x-forwarded-proto": "https" }, "https://front-desk.vercel.app"],
-    ["X-Forwarded-Host over http (next start via 127.0.0.1)", { "x-forwarded-host": "127.0.0.1:3000", "x-forwarded-proto": "http" }, "http://127.0.0.1:3000"],
-    ["Host when there's no X-Forwarded-Host", { host: "192.168.1.20:3000" }, "http://192.168.1.20:3000"],
-    ["the first entry of a list", { "x-forwarded-host": "a.example, b.example", "x-forwarded-proto": "https, http" }, "https://a.example"],
-    ["a default port, dropped", { "x-forwarded-host": "front-desk.example:443", "x-forwarded-proto": "https" }, "https://front-desk.example"],
-    ["an uppercase host and scheme, lowercased", { "x-forwarded-host": "Front-Desk.Example", "x-forwarded-proto": "HTTPS" }, "https://front-desk.example"],
-    ["an IPv6 loopback", { "x-forwarded-host": "[::1]:3000" }, "http://[::1]:3000"],
-    ["request.url when there are no headers", {}, "http://localhost:3000"],
-  ])("uses %s", (_name, headers, expected) => {
-    expect(requestOrigin(req(headers))).toBe(expected);
-  });
-
-  it.each([
-    ["a host with a path", { "x-forwarded-host": "evil.example/front-desk.example" }],
-    ["a host with user info", { "x-forwarded-host": "front-desk.example@evil.example" }],
-    ["a non-http scheme", { "x-forwarded-host": "front-desk.example", "x-forwarded-proto": "javascript" }],
-  ])("is null (nothing is same-origin) for %s", (_name, headers) => {
-    expect(requestOrigin(req(headers))).toBeNull();
-  });
-
-  describe("the CSRF guard uses it", () => {
-    const NOW_MS = Date.parse("2026-11-07T22:00:00Z");
-    const cookie = `${OWNER_SESSION_COOKIE}=${ownerSessionValue(TOKEN, NOW_MS / 1000 + 3600)}`;
-    const write = (headers: Record<string, string>) => checkOwnerAuth(req({ cookie, ...headers }), TOKEN, NOW_MS);
-
-    it("accepts a write whose Origin matches the forwarded host, though request.url says localhost", () => {
-      const vercel = { "x-forwarded-host": "front-desk.vercel.app", "x-forwarded-proto": "https" };
-      expect(write({ ...vercel, origin: "https://front-desk.vercel.app" })).toEqual({ ok: true });
-      expect(write({ ...vercel, origin: "http://localhost:3000" })).toMatchObject({ status: 403 });
-      const loopback = { "x-forwarded-host": "127.0.0.1:3000", "x-forwarded-proto": "http" };
-      expect(write({ ...loopback, origin: "http://127.0.0.1:3000" })).toEqual({ ok: true });
-    });
-
-    it("refuses every write when the headers don't make an origin, even an Origin equal to request.url's", () => {
-      expect(write({ "x-forwarded-host": "evil.example/x", origin: "http://localhost:3000" })).toMatchObject({ status: 403 });
-      expect(write({ "x-forwarded-proto": "javascript", origin: "null" })).toMatchObject({ status: 403 });
-    });
   });
 });

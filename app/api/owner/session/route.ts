@@ -2,7 +2,7 @@ import { connection } from "next/server";
 import { ownerSessionDelete, ownerSessionGet, ownerSessionPost } from "@/lib/server/frontdesk/owner-session";
 
 // POST /api/owner/session — trade OWNER_API_TOKEN for the fd_owner session cookie
-//   (OwnerSessionRequest → OwnerSessionResponse). 10 attempts per IP per 15 minutes.
+//   (OwnerSessionRequest → OwnerSessionResponse).
 // GET /api/owner/session — whether this browser holds a valid owner session (OwnerSessionResponse).
 // DELETE /api/owner/session — sign out: clears the cookie (OwnerSessionResponse).
 // Types in lib/types/frontdesk.ts. Errors use the ApiError envelope.

@@ -2,16 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApiError, OwnerSessionRequest, OwnerSessionResponse, PoliciesResponse } from "../../types/frontdesk";
 import { policiesGet, policiesPut, type OwnerOptions } from "./http";
 import { OWNER_SESSION_COOKIE, OWNER_SESSION_MAX_AGE_S, ownerSessionValue } from "./owner-auth";
-import {
-  clientIp,
-  createAttemptLimiter,
-  ownerSessionDelete,
-  ownerSessionGet,
-  ownerSessionPost,
-  SESSION_ATTEMPT_LIMIT,
-  SESSION_ATTEMPT_WINDOW_MS,
-  type OwnerSessionOptions,
-} from "./owner-session";
+import { ownerSessionDelete, ownerSessionGet, ownerSessionPost, type OwnerSessionOptions } from "./owner-session";
 import { memoryDeps } from "./test-support";
 
 // The stub owner session: POST, GET and DELETE /api/owner/session through the handlers the route file
@@ -28,16 +19,15 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-/** Fresh limiter per test, so tests don't share attempt counts. */
 function options(extra: OwnerSessionOptions = {}): OwnerSessionOptions {
-  return { getToken: () => TOKEN, now: () => NOW_MS, limiter: createAttemptLimiter(), ...extra };
+  return { getToken: () => TOKEN, now: () => NOW_MS, ...extra };
 }
 
 function sessionRequest(
   method: "POST" | "GET" | "DELETE",
-  init: { origin?: string; body?: unknown; raw?: string; cookie?: string; ip?: string } = {},
+  init: { origin?: string; body?: unknown; raw?: string; cookie?: string } = {},
 ): Request {
-  const headers: Record<string, string> = { "x-forwarded-for": init.ip ?? "203.0.113.7" };
+  const headers: Record<string, string> = {};
   if (init.cookie !== undefined) headers.cookie = init.cookie;
   let body: string | undefined;
   if (init.raw !== undefined) body = init.raw;
@@ -48,7 +38,7 @@ function sessionRequest(
   return new Request(`${init.origin ?? LOCAL}/api/owner/session`, { method, headers, body });
 }
 
-const signIn = (token: string, opts = options(), init: { origin?: string; ip?: string } = {}) =>
+const signIn = (token: string, opts = options(), init: { origin?: string } = {}) =>
   ownerSessionPost(sessionRequest("POST", { ...init, body: { token } satisfies OwnerSessionRequest }), opts);
 
 /** The Set-Cookie attributes, split on "; ", with the name=value first. */
@@ -97,21 +87,10 @@ describe("POST /api/owner/session", () => {
     expect(await secure("http://[::1]:3000")).toBe(false);
   });
 
-  it("decides Secure from the origin the browser used (forwarding headers), not Next's internal request.url", async () => {
-    // Next.js gives routes http://localhost:<port> as request.url whatever the browser used.
-    const secure = async (headers: Record<string, string>) => {
-      const req = new Request(`${LOCAL}/api/owner/session`, {
-        method: "POST",
-        headers: { "x-forwarded-for": "203.0.113.7", "content-type": "application/json", ...headers },
-        body: JSON.stringify({ token: TOKEN }),
-      });
-      return setCookieParts(await ownerSessionPost(req, options())).includes("Secure");
-    };
-    expect(await secure({ "x-forwarded-host": "front-desk.vercel.app", "x-forwarded-proto": "https" })).toBe(true);
-    expect(await secure({ "x-forwarded-host": "192.168.1.20:3000", "x-forwarded-proto": "http" })).toBe(true);
-    expect(await secure({ "x-forwarded-host": "evil.example/x", "x-forwarded-proto": "http" })).toBe(true);
-    expect(await secure({ "x-forwarded-host": "127.0.0.1:3000", "x-forwarded-proto": "http" })).toBe(false);
-    expect(await secure({ "x-forwarded-host": "localhost:3000", "x-forwarded-proto": "http" })).toBe(false);
+  it("always marks the cookie Secure on Vercel, whatever request.url says", async () => {
+    vi.stubEnv("VERCEL", "1");
+    expect(setCookieParts(await signIn(TOKEN)).includes("Secure")).toBe(true);
+    expect(setCookieParts(ownerSessionDelete(sessionRequest("DELETE"))).includes("Secure")).toBe(true);
   });
 
   it("trims the token, like the bearer check", async () => {
@@ -168,73 +147,11 @@ describe("POST /api/owner/session", () => {
   });
 
   it("reads OWNER_API_TOKEN from the environment by default", async () => {
-    const opts = { now: () => NOW_MS, limiter: createAttemptLimiter() };
+    const opts = { now: () => NOW_MS };
     vi.stubEnv("OWNER_API_TOKEN", TOKEN);
     expect((await signIn(TOKEN, opts)).status).toBe(200);
     vi.stubEnv("OWNER_API_TOKEN", "");
     expect((await signIn(TOKEN, opts)).status).toBe(503);
-  });
-});
-
-describe("POST /api/owner/session: rate limit (10 attempts per IP per 15 minutes)", () => {
-  it(`refuses the ${SESSION_ATTEMPT_LIMIT + 1}th attempt from one IP with 429 and Retry-After, even with the right token`, async () => {
-    let now = NOW_MS;
-    const opts = options({ now: () => now });
-    for (let i = 0; i < SESSION_ATTEMPT_LIMIT; i++) {
-      now = NOW_MS + i * 1000; // one attempt a second
-      expect((await signIn(`wrong-token-number-${i}-padding`, opts)).status).toBe(401);
-    }
-
-    now = NOW_MS + SESSION_ATTEMPT_LIMIT * 1000;
-    const res = await signIn(TOKEN, opts);
-    const body = await json<ApiError>(res, 429);
-    // The first attempt leaves the window 15 minutes after it was made: 890 seconds from now.
-    const retryAfter = SESSION_ATTEMPT_WINDOW_MS / 1000 - SESSION_ATTEMPT_LIMIT;
-    expect(res.headers.get("retry-after")).toBe(String(retryAfter));
-    expect(body.error).toEqual({
-      code: "invalid_request",
-      message: "Too many sign-in attempts from this address: at most 10 per 15 minutes.",
-      next_action: "Wait 15 minute(s) (details.retryAfter seconds), then try again.",
-      details: { retryAfter },
-    });
-    expect(res.headers.get("set-cookie")).toBeNull();
-  });
-
-  it("counts successful attempts too, and per IP: another address can still sign in", async () => {
-    const opts = options();
-    for (let i = 0; i < SESSION_ATTEMPT_LIMIT; i++) expect((await signIn(TOKEN, opts)).status).toBe(200);
-    expect((await signIn(TOKEN, opts)).status).toBe(429);
-    expect((await signIn(TOKEN, opts, { ip: "198.51.100.9" })).status).toBe(200);
-  });
-
-  it("allows attempts again as old ones leave the 15-minute window; refused attempts aren't counted", async () => {
-    let now = NOW_MS;
-    const opts = options({ now: () => now });
-    for (let i = 0; i < SESSION_ATTEMPT_LIMIT; i++) await signIn("wrong-token-of-some-length", opts);
-    // Hammering while blocked doesn't extend the block.
-    for (let i = 0; i < 5; i++) expect((await signIn(TOKEN, opts)).status).toBe(429);
-
-    now = NOW_MS + SESSION_ATTEMPT_WINDOW_MS - 1;
-    expect((await signIn(TOKEN, opts)).status).toBe(429);
-    now = NOW_MS + SESSION_ATTEMPT_WINDOW_MS;
-    expect((await signIn(TOKEN, opts)).status).toBe(200);
-  });
-
-  it("keys on the first X-Forwarded-For address, then X-Real-IP", () => {
-    const req = (headers: Record<string, string>) => new Request(`${LOCAL}/api/owner/session`, { headers });
-    expect(clientIp(req({ "x-forwarded-for": "203.0.113.7, 10.0.0.1" }))).toBe("203.0.113.7");
-    expect(clientIp(req({ "x-real-ip": "198.51.100.9" }))).toBe("198.51.100.9");
-    expect(clientIp(req({}))).toBe("unknown");
-  });
-
-  it("forgets the least recently seen addresses beyond its capacity", () => {
-    const limiter = createAttemptLimiter(1, SESSION_ATTEMPT_WINDOW_MS, 2);
-    expect(limiter.attempt("a", NOW_MS)).toBe(0);
-    expect(limiter.attempt("b", NOW_MS)).toBe(0);
-    expect(limiter.attempt("a", NOW_MS)).toBeGreaterThan(0); // a is now the most recently seen
-    expect(limiter.attempt("c", NOW_MS)).toBe(0); // evicts b
-    expect(limiter.attempt("b", NOW_MS)).toBe(0);
-    expect(limiter.attempt("c", NOW_MS)).toBeGreaterThan(0);
   });
 });
 
@@ -289,10 +206,9 @@ describe("DELETE /api/owner/session", () => {
 describe("the fd_owner cookie on an owner route (policies)", () => {
   const OWNER: OwnerOptions = { getToken: () => TOKEN };
 
-  function policies(method: "GET" | "PUT", init: { cookie?: string; origin?: string | null; bearer?: boolean } = {}) {
+  function policies(method: "GET" | "PUT", init: { cookie?: string; bearer?: boolean } = {}) {
     const headers: Record<string, string> = {};
     if (init.cookie !== undefined) headers.cookie = init.cookie;
-    if (init.origin !== undefined && init.origin !== null) headers.origin = init.origin;
     if (init.bearer) headers.authorization = `Bearer ${TOKEN}`;
     let body: string | undefined;
     if (method === "PUT") {
@@ -307,29 +223,19 @@ describe("the fd_owner cookie on an owner route (policies)", () => {
     return cookieFrom(await signIn(TOKEN, options({ now: Date.now }), { origin: DEPLOYED }));
   }
 
-  it("accepts the cookie on a read (GET), with no Origin header", async () => {
+  it("accepts the cookie on a read (GET)", async () => {
     const body = await json<PoliciesResponse>(await policiesGet(() => memoryDeps(), policies("GET", { cookie: await realCookie() }), "harts", OWNER), 200);
     expect(body.shop.slug).toBe("harts");
   });
 
-  it("accepts a same-origin write (PUT) with the cookie, and applies it", async () => {
+  it("accepts the cookie on a write (PUT), and applies it", async () => {
     const deps = memoryDeps();
-    const res = await policiesPut(() => deps, policies("PUT", { cookie: await realCookie(), origin: DEPLOYED }), "harts", OWNER);
+    const res = await policiesPut(() => deps, policies("PUT", { cookie: await realCookie() }), "harts", OWNER);
     expect((await json<PoliciesResponse>(res, 200)).policies.leadTimeMin).toBe(60);
   });
 
-  it("rejects a cross-origin write, or one with no Origin, with 403 before touching the shop", async () => {
-    const cookie = await realCookie();
-    for (const origin of ["https://evil.example", null]) {
-      const getDeps = vi.fn(() => memoryDeps());
-      const body = await json<ApiError>(await policiesPut(getDeps, policies("PUT", { cookie, origin }), "harts", OWNER), 403);
-      expect(body.error.code).toBe("invalid_request");
-      expect(getDeps).not.toHaveBeenCalled();
-    }
-  });
-
-  it("still accepts Bearer, for writes from any origin", async () => {
-    const res = await policiesPut(() => memoryDeps(), policies("PUT", { bearer: true, origin: "https://evil.example" }), "harts", OWNER);
+  it("still accepts Bearer", async () => {
+    const res = await policiesPut(() => memoryDeps(), policies("PUT", { bearer: true }), "harts", OWNER);
     expect((await json<PoliciesResponse>(res, 200)).policies.leadTimeMin).toBe(60);
   });
 

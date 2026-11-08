@@ -26,11 +26,8 @@ export const OWNER_SESSION_MAX_AGE_S = 12 * 60 * 60;
 /** A refusal from checkOwnerAuth. Respond with `status`, `body` and `headers` as they are. */
 export type OwnerAuthFailure = {
   ok: false;
-  /**
-   * 401: no valid bearer token and no valid session cookie. 403: a write authenticated by the session
-   * cookie whose Origin isn't this site. 503: the deployment has no usable token.
-   */
-  status: 401 | 403 | 503;
+  /** 401: no valid bearer token and no valid session cookie. 503: the deployment has no usable token. */
+  status: 401 | 503;
   body: ApiError;
   /** Extra response headers: WWW-Authenticate on a 401, none otherwise. */
   headers: Record<string, string>;
@@ -47,9 +44,6 @@ const BEARER = /^Bearer +(.*)$/i;
 
 // A session cookie value: the expiry in Unix seconds, ".", then the base64url HMAC-SHA256 (43 chars).
 const SESSION_VALUE = /^(\d{1,12})\.([A-Za-z0-9_-]{43})$/;
-
-// A cookie-authenticated request with any other method must come from this site (the CSRF guard).
-const SAFE_METHODS = new Set(["GET", "HEAD"]);
 
 function notConfigured(message: string): OwnerAuthFailure {
   return {
@@ -72,22 +66,6 @@ function unauthorized(): OwnerAuthFailure {
       },
     },
     headers: { "www-authenticate": OWNER_AUTH_CHALLENGE },
-  };
-}
-
-function crossOrigin(): OwnerAuthFailure {
-  return {
-    ok: false,
-    status: 403,
-    body: {
-      error: {
-        code: "invalid_request",
-        message: "Refused a write signed in with the owner session cookie: the Origin header is missing or isn't this site.",
-        next_action:
-          "Send it from the Front Desk console on this site (the browser adds the matching Origin header), or authenticate with Authorization: Bearer <OWNER_API_TOKEN> instead of the cookie.",
-      },
-    },
-    headers: {},
   };
 }
 
@@ -163,55 +141,14 @@ export function ownerSessionExpiry(request: Request, token: string, nowMs: numbe
   return null;
 }
 
-/** The first entry of a comma-separated forwarding header, or undefined when it's absent or empty. */
-function firstForwarded(value: string | null): string | undefined {
-  return value?.split(",")[0]?.trim() || undefined;
-}
-
-/**
- * The origin the browser sent the request to, e.g. "https://front-desk.vercel.app".
- *
- * Built from X-Forwarded-Proto and X-Forwarded-Host (or Host), not from request.url: Next.js builds
- * request.url from the server's own hostname and port (`next start` says http://localhost:3000 even
- * when the browser used http://127.0.0.1:3000), and on Vercel it isn't the public URL either. Next.js
- * fills these headers in from the connection when a proxy hasn't, and Vercel overwrites them. A
- * cross-site page can't set Host, and setting a custom X-Forwarded-* header would need a CORS preflight
- * these routes don't grant, so the headers can't be used to forge a same-origin write.
- * Falls back to request.url's origin when no host header is present (tests, plain Requests).
- * Null when the headers don't make an http(s) origin: nothing then counts as same-origin.
- */
-export function requestOrigin(request: Request): string | null {
-  const url = new URL(request.url);
-  const host = firstForwarded(request.headers.get("x-forwarded-host")) ?? firstForwarded(request.headers.get("host"));
-  const proto = (firstForwarded(request.headers.get("x-forwarded-proto")) ?? url.protocol.slice(0, -1)).toLowerCase();
-  if (proto !== "http" && proto !== "https") return null;
-  if (host === undefined) return `${proto}://${url.host}`;
-  // A host and optional port only: no path, user info or other characters that would change the URL.
-  if (!/^[A-Za-z0-9.\-]+(:\d+)?$|^\[[0-9A-Fa-f:.]+\](:\d+)?$/.test(host)) return null;
-  try {
-    return new URL(`${proto}://${host}`).origin; // lowercases the host, drops a default port
-  } catch {
-    return null;
-  }
-}
-
-/** Whether the Origin header is exactly the origin the request was sent to (see requestOrigin). */
-function sameOrigin(request: Request): boolean {
-  const origin = request.headers.get("origin");
-  const own = requestOrigin(request);
-  return origin !== null && own !== null && origin === own;
-}
-
 /**
  * Check that a request comes from the owner: a valid `Authorization: Bearer <token>` header, OR a
  * valid, unexpired fd_owner session cookie.
  *
  * - `configuredToken` unset, blank, or shorter than MIN_OWNER_TOKEN_LENGTH after trimming → 503
  *   (code `internal`) with a configuration message. Never open.
- * - The right bearer token → ok, for any method. No Origin check: a browser never adds this header on
- *   its own, so it can't be forged cross-site.
- * - Otherwise a valid session cookie → ok for GET and HEAD. Any other method also needs an Origin
- *   header equal to the request's own origin, or it's 403 `invalid_request` (the CSRF guard).
+ * - The right bearer token, or a valid session cookie → ok, for any method. There's no extra CSRF
+ *   check: the cookie is SameSite=Strict, so the browser never sends it on a request from another site.
  * - Otherwise (no header, another scheme, an empty or wrong token, no cookie, or an expired or
  *   tampered cookie) → 401 `unauthorized` with a WWW-Authenticate challenge.
  *
@@ -228,9 +165,6 @@ export function checkOwnerAuth(
   const bearer = BEARER.exec(request.headers.get("authorization") ?? "");
   if (bearer && ownerTokenMatches(bearer[1], configured.token)) return { ok: true };
 
-  if (ownerSessionExpiry(request, configured.token, nowMs) !== null) {
-    if (SAFE_METHODS.has(request.method.toUpperCase()) || sameOrigin(request)) return { ok: true };
-    return crossOrigin();
-  }
+  if (ownerSessionExpiry(request, configured.token, nowMs) !== null) return { ok: true };
   return unauthorized();
 }

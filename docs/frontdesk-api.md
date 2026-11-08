@@ -684,20 +684,16 @@ So the console never keeps `OWNER_API_TOKEN` in page code: the owner types the t
 | `DELETE /api/owner/session` | | `OwnerSessionResponse` `{ "signedIn": false }`, plus a `Set-Cookie` that clears `fd_owner` | 200 |
 
 **`POST`** checks `token` against `OWNER_API_TOKEN` exactly like the bearer check (trimmed, constant time):
-- The right token → 200 and the cookie `fd_owner=<expiry>.<signature>; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict; Secure`. `Secure` is left off only on `http://localhost` (and `127.0.0.1`, `[::1]`), so `pnpm dev` works in every browser.
+- The right token → 200 and the cookie `fd_owner=<expiry>.<signature>; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict; Secure`. `Secure` is left off only for plain http on `localhost` (and `127.0.0.1`, `[::1]`) off Vercel, so `pnpm dev` works in every browser.
 - The value is the expiry (Unix seconds) and an HMAC-SHA256 of `owner:<expiry>` keyed with `OWNER_API_TOKEN`. The token itself is never in the cookie, and changing the token ends every session. A session lasts 12 hours on the server's wall clock (`FRONTDESK_NOW` doesn't affect it).
 - The wrong token → **401** `unauthorized` (`"Wrong owner token."`), no cookie. A body that isn't `{ "token": "<string>" }` → **400** `invalid_request` with `details.field`. Token not configured → **503**, as on every owner route.
-- **Rate limit:** 10 attempts per IP per 15 minutes, counting every attempt (right or wrong). The 11th → **429** with a `Retry-After` header (seconds), `code: "invalid_request"` and `details.retryAfter`. The counts are in memory, per server instance: on Vercel each instance counts separately and a cold start resets them, so treat it as a speed bump, not a guarantee. The IP is the first `X-Forwarded-For` address, which Vercel sets.
+- No rate limit on attempts (MVP).
 
 **`GET`** tells the console whether to show the unlock screen: `signedIn` is true only for a valid, unexpired cookie signed with the current token. Token not configured → **503**, so the console can say so instead of offering a sign-in that can't work.
 
 **`DELETE`** signs out: it always answers 200 and clears the cookie. It needs no auth.
 
-**Using the cookie on owner routes.** `GET` and `HEAD` need only the cookie. Any other method (`PUT`, `POST`, `PATCH`, `DELETE`) authenticated by the cookie must also carry an `Origin` header equal to the request's own origin (scheme, host and port), which a browser adds on its own to `fetch` from the console. The server takes its own origin from `X-Forwarded-Proto` and `X-Forwarded-Host` (or `Host`), which Next.js fills in and Vercel overwrites, not from `request.url`: Next.js builds that from the server's own hostname and port. A missing or different `Origin` → **403** `invalid_request`, before the request touches the database. This is the CSRF guard, on top of `SameSite=Strict`. Requests with the right bearer token skip it.
-
-```json
-{ "error": { "code": "invalid_request", "message": "Refused a write signed in with the owner session cookie: the Origin header is missing or isn't this site.", "next_action": "Send it from the Front Desk console on this site (the browser adds the matching Origin header), or authenticate with Authorization: Bearer <OWNER_API_TOKEN> instead of the cookie." } }
-```
+**Using the cookie on owner routes.** Every owner route accepts the cookie, for any method, exactly like the bearer token. There's no extra CSRF check (MVP): `SameSite=Strict` already keeps the browser from sending the cookie on a request that starts on another site.
 
 From the console (same origin, so the browser sends and stores the cookie by itself):
 
@@ -708,9 +704,9 @@ const json = { "Content-Type": "application/json" };
 
 // On load: unlocked already?
 const session = (await (await fetch("/api/owner/session")).json()) as OwnerSessionResponse;
-// Unlock: 200 sets the cookie; 401 wrong token; 429 wait Retry-After seconds.
+// Unlock: 200 sets the cookie; 401 wrong token.
 await fetch("/api/owner/session", { method: "POST", headers: json, body: JSON.stringify({ token } satisfies OwnerSessionRequest) });
-// Owner routes: the browser sends the cookie, and the Origin header on writes.
+// Owner routes: the browser sends the cookie.
 await fetch("/api/shops/harts/policies", { method: "PUT", headers: json, body: JSON.stringify({ paused: true }) });
 // Sign out.
 await fetch("/api/owner/session", { method: "DELETE" });
@@ -723,9 +719,8 @@ curl -s -c jar.txt -X POST http://localhost:3000/api/owner/session \
   -H "Content-Type: application/json" -d "{\"token\":\"$OWNER_API_TOKEN\"}"
 curl -s -b jar.txt http://localhost:3000/api/owner/session
 curl -s -b jar.txt http://localhost:3000/api/shops/harts/policies
-# A write with the cookie needs the matching Origin:
 curl -s -b jar.txt -X PUT http://localhost:3000/api/shops/harts/policies \
-  -H "Origin: http://localhost:3000" -H "Content-Type: application/json" -d '{"paused":false}'
+  -H "Content-Type: application/json" -d '{"paused":false}'
 curl -s -b jar.txt -c jar.txt -X DELETE http://localhost:3000/api/owner/session
 ```
 
@@ -747,7 +742,7 @@ curl -s -b jar.txt -c jar.txt -X DELETE http://localhost:3000/api/owner/session
 | `POST /api/shops/[shop]/bookings/[id]/no-show` | no body | `OwnerBookingActionResponse` | 200 |
 | `GET /api/shops/[shop]/bookings/[id]` | | `BookingDetailResponse` | 200 |
 
-Other statuses: **400** `invalid_request`, **401** `unauthorized`, **403** `invalid_request` (a write with the session cookie from another origin), **404** `not_found` (shop, staff member, service, blocked time) or `booking_not_found`, **500** `internal`, **503** not configured.
+Other statuses: **400** `invalid_request`, **401** `unauthorized`, **404** `not_found` (shop, staff member, service, blocked time) or `booking_not_found`, **500** `internal`, **503** not configured.
 
 **Validation.** Request bodies are checked with zod:
 - The body must be a JSON object. An empty body or invalid JSON is 400 with `details.field: "body"`.
