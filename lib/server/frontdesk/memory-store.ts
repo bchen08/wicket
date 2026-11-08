@@ -9,6 +9,7 @@ import {
   toAlert,
   toBooking,
   toBookingEvent,
+  toNightlyRun,
   type BookingRecord,
   type BookingStore,
   type DepositFailure,
@@ -16,6 +17,7 @@ import {
   type NewAlert,
   type NewBooking,
   type NewBookingEvent,
+  type NightlyRunRecord,
   type NewOwnerCode,
 } from "./booking-store";
 import {
@@ -181,6 +183,7 @@ type StoredBlock = NewBlock & { id: string };
 
 type StoredAlert = NewAlert & { seq: number; createdAt: Date };
 
+type StoredNightlyRun = NightlyRunRecord & { seq: number };
 type StoredOwnerCode = NewOwnerCode & { usedAt: Date | null };
 
 /** Longest blocked_times.reason (the column's check constraint). */
@@ -277,9 +280,11 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   const events: StoredEvent[] = [];
   const blocks: StoredBlock[] = [];
   const alerts: StoredAlert[] = [];
+  const nightlyRuns: StoredNightlyRun[] = [];
   const ownerCodes: StoredOwnerCode[] = [];
   let eventSeq = 0;
   let alertSeq = 0;
+  let nightlySeq = 0;
   // Ring 1b approval requests, keyed by booking id.
   const approvals = new Map<string, StoredApproval>();
 
@@ -414,6 +419,10 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   }
 
   const catalog: ShopCatalog = {
+    async listShops() {
+      return shops.map((s) => ({ ...s })).sort((a, b) => compareText(a.slug, b.slug));
+    },
+
     async getShop(slug) {
       const shop = shopOf(slug);
       return shop ? { ...shop } : null;
@@ -556,9 +565,9 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       return toBooking(record(stored));
     },
 
-    async listBookings(shopSlug, range) {
+    async listBookings(shopSlug, range, statuses) {
       return bookings
-        .filter((b) => b.shopSlug === shopSlug && overlaps(b, range))
+        .filter((b) => b.shopSlug === shopSlug && overlaps(b, range) && (!statuses || statuses.includes(b.status)))
         .sort(byStart)
         .map((b) => toBooking(record(b)));
     },
@@ -718,6 +727,26 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
         .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.seq - a.seq)
         .slice(0, limit)
         .map((a) => toAlert({ ...a, id: String(a.seq), createdAt: copyDate(a.createdAt), timezone: shop.timezone }));
+    },
+
+    // ---- The nightly tidy-up ----
+
+    async recordNightlyRun(counts) {
+      const stored: StoredNightlyRun = {
+        ranAt: now(),
+        expired: counts.expired,
+        completed: counts.completed,
+        depositsReleased: counts.depositsReleased,
+        failures: counts.failures,
+        seq: ++nightlySeq,
+      };
+      nightlyRuns.push(stored);
+      return toNightlyRun(stored);
+    },
+
+    async lastNightlyRun() {
+      const newest = [...nightlyRuns].sort((a, b) => b.ranAt.getTime() - a.ranAt.getTime() || b.seq - a.seq)[0];
+      return newest ? toNightlyRun(newest) : null;
     },
 
     // ---- Texting: the owner's sign-in codes ----

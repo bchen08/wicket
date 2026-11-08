@@ -15,7 +15,7 @@ pnpm smoke <PREVIEW_URL> --commit <PR head sha> --bypass <secret>
 - Otherwise it prints PASS, FAIL or SKIPPED for each check, with evidence, then one verdict line. Exit code 0: everything passed (SKIPPED rows aren't failures, but they aren't passes either). 1: a check failed.
 - Previews are behind Vercel Authentication. `--bypass` (or the env var `VERCEL_AUTOMATION_BYPASS_SECRET`) is the team's Protection Bypass for Automation secret; get it from a teammate. Without it, a preview answers with Vercel's login page and the run is `BLOCKED: preview needs the Vercel bypass secret (--bypass)`.
 - The owner checks use `harts-preview` on previews. Elsewhere pass `--owner-token <OWNER_API_TOKEN>`, or the checks that need it (the owner lists, and the alerts in the booking loop) are SKIPPED.
-- The booking loop (items 11–14 and 17, and the web bookings W4–W5) runs only where `/api/status` says `database.writesAllowed: true`, and the run declines (or, once approved, cancels) every booking it made, even after a failure. Its bookings show the agent `front-desk-smoke`.
+- The booking loop (items 11–14, 17 and 19, the web bookings W4–W5, and the nightly tidy-up, 23) runs only where `/api/status` says `database.writesAllowed: true`, and the run declines (or, once approved, cancels) every booking it made, even after a failure. Its bookings show the agent `front-desk-smoke`.
 - On production: `pnpm smoke https://<production domain> --owner-token <production token>`. The booking loop is SKIPPED there: production is never written to.
 
 Items marked **[browser]** need a browser signed in to the team's Vercel account. **[by hand]** items need a person's judgment or a wait.
@@ -92,3 +92,10 @@ Never book on production. These checks run only where `/api/status` shows `"writ
 - **T6 [by hand]** (production, texting on) The next real booking an agent makes with the person's phone: the person gets "<agent> asked Hart's Barbers to book … Approve or decline: <link>", and the agent's result said `texted: true`. Once it's approved (or cancelled), the owner's phone gets "New booking: …" (or "Cancelled: …"), and `/api/shops/harts/alerts` lists a `text` alert `sent` next to the email or log one. Never book on production to test this: wait for a real booking.
 
 Add a line here whenever a feature ships that must never break. Keep each one a quick pass/fail check on a URL, and mark it **[smoke]** (then add it to `scripts/smoke.mjs`), **[browser]** or **[by hand]**.
+
+## Nightly tidy-up
+
+Once a day (Vercel Cron, 08:00 UTC, production only) `GET /api/jobs/nightly` expires holds and unpaid deposits past their deadlines and completes confirmed bookings that ended more than 3 hours ago, releasing their deposit holds. See [docs/nightly.md](docs/nightly.md). It writes, so on previews it runs only where `/api/status` shows `"writesAllowed": true`.
+
+23. **[smoke]** `GET /api/jobs/nightly` → 200 with `ranAt` and four whole counts: `expired`, `completed`, `depositsReleased`, `failures` (what they are depends on what's in the database). Then `/api/status` shows that run (or a later one) as `lastNightlyRun`. Calling it again is safe: a second run right after answers all four counts `0`.
+24. **[by hand]** (production, the morning after a merge that touches the job) `/api/status` shows `lastNightlyRun` from between 08:00 and 09:00 UTC that day. A confirmed booking whose time passed the day before, that the owner didn't mark, shows `completed` in the console, and with `deposits: "stripe_test"` its $10 payment shows **Canceled** in the Stripe dashboard (test mode). Vercel → Settings → Cron Jobs lists `/api/jobs/nightly` at `0 8 * * *`.

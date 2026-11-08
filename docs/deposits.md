@@ -71,7 +71,7 @@ Then, **after the database commit**, `moveDeposit()` in [`deposits.ts`](../lib/s
 | Effect | Comes from | In Stripe | `deposit.state` |
 |---|---|---|---|
 | `captured` | owner no-show; agent `cancel` inside `cancelWindowHours` | capture the PaymentIntent | `captured` |
-| `released` | owner complete; agent `cancel` in time; owner cancel; agent `cancel` of an `awaiting_deposit` booking; an unpaid deposit expiring | cancel the PaymentIntent, or expire the Checkout Session if it's still open (a session paid at the last moment has its hold cancelled) | `released` |
+| `released` | owner complete; the [nightly tidy-up](nightly.md) completing a past booking; agent `cancel` in time; owner cancel; agent `cancel` of an `awaiting_deposit` booking; an unpaid deposit expiring | cancel the PaymentIntent, or expire the Checkout Session if it's still open (a session paid at the last moment has its hold cancelled) | `released` |
 
 Decline only happens before approval, when nothing has been asked for, so it moves no money. The owner cancelling always releases (the shop called it off), as `decide()` already said.
 
@@ -88,7 +88,7 @@ Whenever the server reads a booking that is `awaiting_deposit`, `syncDeposit()` 
 - **Not paid and `pay_by` has passed** → `expired` (one `expired` event, actor `system`), then `moveDeposit` releases: the Checkout Session is expired so it can't be paid any more.
 - **Otherwise, or if Stripe doesn't answer** → unchanged; the next read asks again (a failed retrieve is logged as `deposit.sync_failed`).
 
-The reads that do this: the approval page and `GET /api/approvals/[token]` (Stripe's `success_url` and `cancel_url` both land there), `get_booking`, the owner's bookings list and booking detail, the owner's and agent's actions (before deciding), and `book` (for a lapsed `awaiting_deposit` booking in the way of the time it's booking, so an unpaid one never blocks a new booking). `get_availability` only reads: it stops counting an `awaiting_deposit` booking once its `pay_by` has passed, like a lapsed approval hold. `TODO(ring-2)`: a webhook (and a scheduled job), so a booking confirms without anyone reading it.
+The reads that do this: the approval page and `GET /api/approvals/[token]` (Stripe's `success_url` and `cancel_url` both land there), `get_booking`, the owner's bookings list and booking detail, the owner's and agent's actions (before deciding), and `book` (for a lapsed `awaiting_deposit` booking in the way of the time it's booking, so an unpaid one never blocks a new booking). `get_availability` only reads: it stops counting an `awaiting_deposit` booking once its `pay_by` has passed, like a lapsed approval hold. Once a day the [nightly tidy-up](nightly.md) runs `syncDeposit` on every `awaiting_deposit` booking past `pay_by`, so an unpaid one never stays open even if nobody reads it. `TODO(ring-2)`: a webhook, so a paid booking confirms without anyone reading it.
 
 **Timing.** `pay_by` is approve time + 30 minutes on Front Desk's clock (`FRONTDESK_NOW` freezes it, so a frozen clock never expires an unpaid deposit, like `approve_by`). The Checkout Session's own `expires_at` is 31 minutes on real time: Stripe's minimum is 30 minutes after creation, and the extra minute keeps a slow request above it. Front Desk closes the session itself when `pay_by` passes.
 
@@ -183,7 +183,7 @@ It's additive (nullable columns, one with a default; no new table, so no new RLS
 
 ## Not built yet
 
-- A webhook and a scheduled job (`TODO(ring-2)`): today a booking moves only when something reads it.
+- A webhook (`TODO(ring-2)`): a paid deposit confirms when something reads the booking, or at the next [nightly tidy-up](nightly.md).
 - Retrying a failed capture or release (`TODO(ring-2)`).
 - Stripe Connect, paying each shop (`TODO(ring-3)`).
 - Refunding a captured deposit, and capturing less than the whole deposit.

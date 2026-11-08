@@ -152,8 +152,9 @@ export const EVENT_FOR: Record<LifecycleAction, BookingEventType> = {
 const MAX_TRANSITION_ATTEMPTS = 3;
 
 /**
- * Apply an agent's or owner's lifecycle action (cancel, complete, mark_no_show) to a booking: expire a
- * lapsed hold first (requireBooking), decide() against the shop's policies and the clock, then
+ * Apply an agent's or owner's lifecycle action (cancel, complete, mark_no_show), or the system's complete
+ * (the nightly tidy-up, nightly.ts), to a booking: expire a lapsed hold first (requireBooking), decide()
+ * against the shop's policies and the clock, then
  * store.transition() conditionally on the status it decided from, writing one event.
  * If another transition got there first (transition returns null), re-read the booking and decide
  * again, so the loser gets the right error (e.g. not_cancellable) instead of a stale success.
@@ -166,7 +167,7 @@ export async function transitionBooking(
   shopSlug: string,
   bookingId: string,
   action: ManageAction,
-  actor: "agent" | "owner",
+  actor: "agent" | "owner" | "system",
 ): Promise<BookingTransitionResult> {
   await requireShop(deps, shopSlug);
   const policies = await policiesFor(deps, shopSlug);
@@ -662,7 +663,8 @@ async function bookOnce(
   if (held instanceof FrontDeskError) throw held;
 
   // Lazy expiry, just before the insert: a lapsed hold must not block this booking (the no_overlap
-  // constraint would still count it) nor hide an alternative. TODO(ring-2): a scheduled job too.
+  // constraint would still count it) nor hide an alternative. The nightly tidy-up (nightly.ts) expires
+  // the ones nobody touches.
   await deps.store.expireStaleHolds(shop.slug, busyRange(service, start), now);
   // The same for a booking whose deposit time ran out, after asking Stripe whether it was paid.
   await syncLapsedDeposits(deps, shop.slug, busyRange(service, start), now);

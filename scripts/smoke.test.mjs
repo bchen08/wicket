@@ -32,9 +32,13 @@ const readyStatus = (overrides = {}) => ({
   approvalLinks: { origin: BASE },
   alerts: "log",
   deposits: "off",
+  lastNightlyRun: null,
   problems: [],
   ...overrides,
 });
+
+/** What the fake deployment's GET /api/jobs/nightly answers. */
+const NIGHTLY_RUN = { ranAt: "2026-11-08T12:00:00Z", expired: 1, completed: 2, depositsReleased: 2, failures: 0 };
 
 const json = (body, status = 200, headers = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -47,10 +51,11 @@ const toolError = (code) => ({ isError: true, content: [{ type: "text", text: JS
  * behavior. `doubleBook: true` lets the same start be booked twice (a broken server). `ownerToken` is the
  * token its owner routes accept. Approving, declining and cancelling record owner alerts, like the real one.
  * Approving a service with a deposit (anything but a beard-trim) waits for it, with a Stripe URL, when
- * status.deposits is "stripe_test", and confirms it (deposit not_collected) otherwise.
+ * status.deposits is "stripe_test", and confirms it (deposit not_collected) otherwise. GET /api/jobs/nightly
+ * answers NIGHTLY_RUN, and /api/status shows it as lastNightlyRun from then on.
  */
 function fakeDeployment({ status = readyStatus(), route, doubleBook = false, ownerToken = PREVIEW_OWNER_TOKEN } = {}) {
-  const state = { requests: [], bookings: [], mcp: [], alerts: [] };
+  const state = { requests: [], bookings: [], mcp: [], alerts: [], lastNightlyRun: null };
   const alert = (b, kind) => state.alerts.unshift({ id: String(state.alerts.length + 1), bookingId: b.id, kind, channel: "log", status: "logged", error: null });
   const isOwner = (headers) => headers.get("authorization") === `Bearer ${ownerToken}`;
   const ACTIVE = ["awaiting_approval", "awaiting_deposit", "confirmed"];
@@ -85,7 +90,11 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false, own
     const override = route && (await route(url, init, state));
     if (override) return override;
 
-    if (method === "GET" && url.pathname === "/api/status") return json(status);
+    if (method === "GET" && url.pathname === "/api/status") return json({ ...status, lastNightlyRun: state.lastNightlyRun ?? status.lastNightlyRun ?? null });
+    if (method === "GET" && url.pathname === "/api/jobs/nightly") {
+      state.lastNightlyRun = NIGHTLY_RUN;
+      return json(NIGHTLY_RUN);
+    }
     if (method === "GET" && url.pathname === "/api/health") return json({ status: "ok", service: "emergent" });
     if (method === "GET" && url.pathname === "/api/shops/harts/services") {
       return json({
@@ -215,6 +224,8 @@ async function smoke(deployment, options = {}) {
 }
 
 const results = (rows) => rows.map((r) => r.result);
+/** The cleanup row: every booking the run made is declined or cancelled. */
+const cleanupRow = (run) => run.rows.find((r) => r.item === "—");
 
 describe("pnpm smoke", () => {
   it("PASS: every check passes on a ready preview, exits 0 and leaves no booking behind", async () => {
@@ -223,9 +234,9 @@ describe("pnpm smoke", () => {
 
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(results(run.rows)).toEqual(Array(31).fill("PASS"));
-    expect(run.line).toBe("PASS: 31 passed.");
-    expect(run.output).toMatch(/\nPASS: 31 passed\.$/);
+    expect(results(run.rows)).toEqual(Array(33).fill("PASS"));
+    expect(run.line).toBe("PASS: 33 passed.");
+    expect(run.output).toMatch(/\nPASS: 33 passed\.$/);
     // Over MCP: one booking declined, a Beard trim approved and then cancelled by the cleanup, and the deposit
     // check's Haircut approved and cancelled. Over the web: the JSON booking declined, and the form post's
     // booking declined by the cleanup. All by front-desk-smoke.
@@ -239,6 +250,12 @@ describe("pnpm smoke", () => {
     });
     expect(run.rows.find((r) => r.title.includes("booking_cancelled"))).toMatchObject({ item: "14", evidence: "booking_cancelled by log, logged" });
     expect(run.rows.find((r) => r.title.includes("booking_confirmed"))).toMatchObject({ item: "17", evidence: "booking_confirmed by log, logged" });
+    // The nightly tidy-up ran once, after the cleanup, and /api/status shows that run.
+    expect(run.rows.filter((r) => r.item === "23").map((r) => r.evidence)).toEqual([
+      "ran 2026-11-08T12:00:00Z: expired 1, completed 2, depositsReleased 2, failures 0",
+      "ran 2026-11-08T12:00:00Z: expired 1, completed 2, depositsReleased 2, failures 0",
+    ]);
+    expect(deployment.state.requests.filter((r) => r.path === "/api/jobs/nightly")).toHaveLength(1);
     // The bypass secret went on every request, and the secret itself is never printed.
     expect(deployment.state.requests.every((r) => r.headers.get(BYPASS_HEADER) === "bypass-secret")).toBe(true);
     expect(run.output).not.toContain("bypass-secret");
@@ -265,8 +282,8 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("FAIL");
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.item === "2")).toMatchObject({ result: "FAIL", evidence: "HTTP 500 boom" });
-    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(30);
-    expect(run.line).toBe("FAIL: 1 failed, 30 passed, 0 skipped.");
+    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(32);
+    expect(run.line).toBe("FAIL: 1 failed, 32 passed, 0 skipped.");
   });
 
   it("BLOCKED: not_ready prints the problems, runs nothing else and exits 2", async () => {
@@ -329,11 +346,12 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
     expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual([
-      "5", "5", "11", "11", "12", "14", "14", "14", "17", "17", "19", "19", "19", "19", "W4", "W4", "W4", "W5",
+      "5", "5", "11", "11", "12", "14", "14", "14", "17", "17", "19", "19", "19", "19", "W4", "W4", "W4", "W5", "23", "23",
     ]);
     // The read-only web checks still run; no cleanup row: it made no bookings.
     expect(run.rows.filter((r) => r.item.startsWith("W") && r.result === "PASS").map((r) => r.item)).toEqual(["W1", "W2", "W3"]);
-    expect(run.line).toBe("PASS: 12 passed, 18 skipped (a skipped check is not a pass: verify those by hand).");
+    expect(run.line).toBe("PASS: 12 passed, 20 skipped (a skipped check is not a pass: verify those by hand).");
+    expect(deployment.state.requests.some((r) => r.path === "/api/jobs/nightly")).toBe(false);
     expect(deployment.state.mcp.some((c) => c.params?.name === "book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.path === "/api/shops/harts/book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.headers.get("authorization"))).toBe(false);
@@ -392,7 +410,7 @@ describe("pnpm smoke", () => {
     expect(run.rows.find((r) => r.title.includes("slot_taken"))).toMatchObject({ result: "FAIL", evidence: "booked again: booking-2" });
     // The web form post at the held start books it again too, and fails.
     expect(run.rows.find((r) => r.title.includes("?error=slot_taken"))).toMatchObject({ result: "FAIL" });
-    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "6 made, 6 declined or cancelled: none left behind" });
+    expect(cleanupRow(run)).toMatchObject({ result: "PASS", evidence: "6 made, 6 declined or cancelled: none left behind" });
     expect(deployment.state.bookings.map((b) => b.status)).toEqual(Array(6).fill("cancelled"));
   });
 
@@ -419,7 +437,7 @@ describe("pnpm smoke", () => {
     expect(run.rows.find((r) => r.item === "W5").evidence).toBe("HTTP 200 <html>Booked!</html>");
     // The MCP loop's approved booking is cancelled; the deposit check cancelled its own; the web JSON
     // booking was declined by W4.
-    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "4 made, 4 declined or cancelled: none left behind" });
+    expect(cleanupRow(run)).toMatchObject({ result: "PASS", evidence: "4 made, 4 declined or cancelled: none left behind" });
   });
 
   it("deposits stripe_test: approving a Haircut waits for its deposit with a Stripe URL; cancelling releases it and frees the start", async () => {
@@ -456,8 +474,35 @@ describe("pnpm smoke", () => {
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.item === "19")).toMatchObject({ result: "FAIL", evidence: "Tue 10 Nov, 10:30: confirmed, deposit not_collected" });
     // Still cleaned up.
-    expect(run.rows.at(-1)).toMatchObject({ result: "PASS" });
+    expect(cleanupRow(run)).toMatchObject({ result: "PASS" });
     expect(deployment.state.bookings.every((b) => b.status === "cancelled")).toBe(true);
+  });
+
+  it("nightly: FAIL when GET /api/jobs/nightly doesn't answer its counts, and the lastNightlyRun check isn't run", async () => {
+    const deployment = fakeDeployment({
+      route: (url) => (url.pathname === "/api/jobs/nightly" ? json({ error: { code: "internal", message: "boom", next_action: "x" } }, 500) : undefined),
+    });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.fail);
+    expect(run.rows.filter((r) => r.item === "23").map((r) => [r.result, r.evidence])).toEqual([
+      ["FAIL", expect.stringMatching(/^GET \/api\/jobs\/nightly: HTTP 500 /)],
+      ["FAIL", "not run: GET /api/jobs/nightly failed"],
+    ]);
+  });
+
+  it("nightly: FAIL when /api/status doesn't show the run as lastNightlyRun", async () => {
+    const deployment = fakeDeployment({
+      route: (url, _init, state) => {
+        if (url.pathname !== "/api/status" || !state.lastNightlyRun) return undefined;
+        return json(readyStatus());
+      },
+    });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.fail);
+    expect(run.rows.filter((r) => r.item === "23").map((r) => [r.result, r.evidence])).toEqual([
+      ["PASS", "ran 2026-11-08T12:00:00Z: expired 1, completed 2, depositsReleased 2, failures 0"],
+      ["FAIL", "lastNightlyRun: null"],
+    ]);
   });
 
   it("fails the cleanup row when a booking can't be declined or cancelled", async () => {
@@ -472,7 +517,7 @@ describe("pnpm smoke", () => {
     });
     const run = await smoke(deployment);
     expect(run.exitCode).toBe(EXIT.fail);
-    expect(run.rows.at(-1)).toMatchObject({
+    expect(cleanupRow(run)).toMatchObject({
       result: "FAIL",
       evidence: "still held: booking-1 (internal), booking-2 (internal), booking-3 (internal)",
     });

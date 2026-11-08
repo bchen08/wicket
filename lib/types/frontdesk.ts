@@ -4,8 +4,10 @@
 
 import type { BookingDeposit, DepositsMode } from "./deposits";
 import type { TextingMode } from "./texting";
+import type { NightlyRun } from "./nightly";
 
 export type { BookingDeposit, DepositsMode, DepositState } from "./deposits";
+export type { NightlyCounts, NightlyRun, NightlyRunResponse } from "./nightly";
 // The web booking API's shapes (plain HTTP booking for agents without MCP, and the booking page).
 export type * from "./web-booking";
 // Texting: the text sender's mode and the owner's texted sign-in code (docs/texting.md).
@@ -252,7 +254,7 @@ export type DepositEffect =
 /**
  * Who did something to a booking. `customer` is the person approving or declining through the
  * approval link. `system` is for automatic changes (a hold that lapsed, a deposit paid or not paid in
- * time, a deposit Stripe refused to move).
+ * time, a deposit Stripe refused to move, a past appointment the nightly tidy-up marked completed).
  */
 export type BookingActor = "agent" | "owner" | "customer" | "system";
 
@@ -327,8 +329,6 @@ export type Booking = {
     displayName: string;
     /** true once the person tapped Approve on the approval link. */
     approved: boolean;
-    /** @deprecated use approved; removed once the console reads approved (v0). */
-    verified: boolean;
     /**
      * The person's phone number, E.164, e.g. "+14015550123": the one the agent gave with book (customer_phone),
      * or the one the person gave when approving, which replaces it. Absent if neither gave one. Not checked.
@@ -714,6 +714,12 @@ export type StatusResponse = {
    * still logged), else `log`. Neither is a problem.
    */
   alerts: Exclude<AlertChannel, "text">;
+  /**
+   * The nightly tidy-up's newest run (GET /api/jobs/nightly, by Vercel Cron at 08:00 UTC): when it ran and
+   * what it did. null when it has never run against this database, or it can't be read (the database is
+   * unreachable, or 0006 isn't applied: then `database.missing` names nightly_runs). Never a problem.
+   */
+  lastNightlyRun: NightlyRun | null;
   /**
    * How texts go out: `photon` (iMessage) when PHOTON_* is set, else `twilio` (SMS) when TWILIO_* is set, else
    * `off`. Off is not a problem: approval links are sent by the agent, alerts go by email or log, and the owner

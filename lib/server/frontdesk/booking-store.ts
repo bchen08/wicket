@@ -11,6 +11,8 @@ import type {
   BookingStatus,
   DepositState,
   Mandate,
+  NightlyCounts,
+  NightlyRun,
 } from "../../types/frontdesk";
 import { approvalPath } from "../consent/crypto";
 import { formatDisplay } from "../engine/availability";
@@ -162,8 +164,11 @@ export interface BookingStore {
    * (expireStaleHolds). In Postgres that's the `no_overlap` exclusion constraint (SQLSTATE 23P01).
    */
   createBooking(input: NewBooking): Promise<Booking>;
-  /** Bookings of any status whose [start, end) overlaps `range`, sorted by start. */
-  listBookings(shopSlug: string, range: TimeRange): Promise<Booking[]>;
+  /**
+   * Bookings whose [start, end) overlaps `range`, sorted by start: of any status, or only those in
+   * `statuses` when it's given (the nightly tidy-up asks for awaiting_deposit, then confirmed).
+   */
+  listBookings(shopSlug: string, range: TimeRange, statuses?: readonly BookingStatus[]): Promise<Booking[]>;
   /** One booking by id, or null. Any string is accepted: a malformed id is simply not found. Doesn't expire anything. */
   getBooking(id: string): Promise<Booking | null>;
   /**
@@ -171,13 +176,14 @@ export interface BookingStore {
    * awaiting_approval with approve_by <= now, it becomes expired with an "expired" event (actor
    * "system", data { from, to, depositEffect, depositCollected: false }). Returns the booking as it is
    * afterwards, or null (any string is accepted, like getBooking). The same rule as decide()'s expire row.
-   * TODO(ring-2): a scheduled job expires holds too.
+   * The nightly tidy-up (nightly.ts) expires the holds nobody reads, with expireStaleHolds.
    */
   refreshBooking(id: string, now: Date): Promise<Booking | null>;
   /**
    * Lazy expiry for a time range: every awaiting_approval booking of the shop overlapping `range` with
    * approve_by <= now becomes expired, each with an "expired" event, in one statement. Returns how
-   * many expired. book calls it just before inserting, so a lapsed hold never blocks a new booking.
+   * many expired. book calls it just before inserting, so a lapsed hold never blocks a new booking; the
+   * owner's list before listing; the nightly tidy-up over all time (ALL_TIME).
    */
   expireStaleHolds(shopSlug: string, range: TimeRange, now: Date): Promise<number>;
   /**
@@ -231,6 +237,13 @@ export interface BookingStore {
   /** The shop's newest `limit` alerts, newest first (by created_at, then id). Empty if there are none. */
   listAlerts(shopSlug: string, limit: number): Promise<Alert[]>;
 
+  // ---- The nightly tidy-up (nightly.ts) ----
+
+  /** Store one run's counts (ran_at: Postgres now(), the memory store's clock) and return the run. */
+  recordNightlyRun(counts: NightlyCounts): Promise<NightlyRun>;
+  /** The newest run (by ran_at, then id), or null if it has never run. */
+  lastNightlyRun(): Promise<NightlyRun | null>;
+
   // ---- Texting: the owner's sign-in codes ----
 
   /** Store a code that was just texted to the owner. */
@@ -250,6 +263,15 @@ export class SlotTakenError extends Error {
     this.name = "SlotTakenError";
   }
 }
+
+/**
+ * Every booking there can be: the range the nightly tidy-up reads, so it misses none. Bookings are only
+ * ever placed inside the shop's horizon from the time they were made, far inside this.
+ */
+export const ALL_TIME: TimeRange = {
+  start: new Date("2000-01-01T00:00:00Z"),
+  end: new Date("3000-01-01T00:00:00Z"),
+};
 
 /** Statuses that hold time on the calendar (the no_overlap constraint and busy time). */
 export const ACTIVE_STATUSES: readonly BookingStatus[] = ["awaiting_approval", "awaiting_deposit", "confirmed"];
@@ -349,7 +371,6 @@ export function toBooking(r: BookingRecord): Booking {
     customer: {
       displayName: r.customerName,
       approved: r.customerApproved,
-      verified: r.customerApproved,
       ...(r.customerPhone ? { phone: r.customerPhone } : {}),
     },
     agent: { name: r.agentName },
@@ -379,6 +400,20 @@ export function toBookingEvent(r: EventRecord): BookingEvent {
     actor: r.actor,
     type: r.type,
     data: r.data,
+  };
+}
+
+/** A stored nightly run. Both stores map through this. */
+export type NightlyRunRecord = NightlyCounts & { ranAt: Date };
+
+/** The NightlyRun for a stored run: ranAt in UTC ("…Z"), since a run covers every shop. */
+export function toNightlyRun(r: NightlyRunRecord): NightlyRun {
+  return {
+    ranAt: toRfc3339(r.ranAt, "UTC"),
+    expired: r.expired,
+    completed: r.completed,
+    depositsReleased: r.depositsReleased,
+    failures: r.failures,
   };
 }
 

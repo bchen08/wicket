@@ -19,6 +19,7 @@ import {
   toAlert,
   toBooking,
   toBookingEvent,
+  toNightlyRun,
   type AnswerApprovalResult,
   type BookingRecord,
   type BookingStore,
@@ -38,8 +39,8 @@ import {
 } from "./catalog";
 
 // Postgres ShopCatalog + BookingStore (postgres.js), for the schema in
-// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql, 0004_alerts.sql, 0005_deposits.sql
-// and 0007_texting.sql.
+// supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql, 0004_alerts.sql, 0005_deposits.sql,
+// 0006_nightly.sql and 0007_texting.sql.
 
 /** SQLSTATE exclusion_violation: the bookings.no_overlap constraint fired. */
 const EXCLUSION_VIOLATION = "23P01";
@@ -294,6 +295,17 @@ const toAlertFromRow = (r: AlertRow) =>
     timezone: r.timezone,
   });
 
+type NightlyRunRow = { ran_at: Date; expired: number; completed: number; deposits_released: number; failures: number };
+
+const toNightlyRunFromRow = (r: NightlyRunRow) =>
+  toNightlyRun({
+    ranAt: r.ran_at,
+    expired: r.expired,
+    completed: r.completed,
+    depositsReleased: r.deposits_released,
+    failures: r.failures,
+  });
+
 /** The columns of an Alert. `a` is alerts or a CTE with the same columns, joined to shops as `sh`. */
 const alertColumns = (db: Db) => db`
   a.id::text as id, a.shop_slug, a.booking_id::text as booking_id, a.kind, a.channel, a.recipient,
@@ -368,11 +380,12 @@ function bookingStoreOn(conn: Conn): BookingStore {
       }
     },
 
-    async listBookings(shopSlug, range) {
+    async listBookings(shopSlug, range, statuses) {
       const rows = await db<BookingRow[]>`
         select ${bookingColumns(db)}
         from bookings b ${bookingJoins(db)}
         where b.shop_slug = ${shopSlug} and b.during && ${tstzrange(db, range)}
+          ${statuses ? db`and b.status in ${db([...statuses])}` : db``}
         order by lower(b.during), b.id
       `;
       return rows.map((r) => toBooking(toRecord(r)));
@@ -615,6 +628,28 @@ function bookingStoreOn(conn: Conn): BookingStore {
       return rows.map(toAlertFromRow);
     },
 
+    // ---- The nightly tidy-up ----
+
+    async recordNightlyRun(counts) {
+      const rows = await db<NightlyRunRow[]>`
+        insert into nightly_runs (expired, completed, deposits_released, failures)
+        values (${counts.expired}, ${counts.completed}, ${counts.depositsReleased}, ${counts.failures})
+        returning ran_at, expired, completed, deposits_released, failures
+      `;
+      if (!rows[0]) throw new Error("Insert into nightly_runs returned no row.");
+      return toNightlyRunFromRow(rows[0]);
+    },
+
+    async lastNightlyRun() {
+      const rows = await db<NightlyRunRow[]>`
+        select ran_at, expired, completed, deposits_released, failures
+        from nightly_runs
+        order by ran_at desc, id desc
+        limit 1
+      `;
+      return rows[0] ? toNightlyRunFromRow(rows[0]) : null;
+    },
+
     // ---- Texting: the owner's sign-in codes ----
 
     async saveOwnerCode(code) {
@@ -651,6 +686,13 @@ function bookingStoreOn(conn: Conn): BookingStore {
 function catalogOn(conn: Conn): ShopCatalog {
   const sql: Db = conn.sql;
   return {
+    async listShops() {
+      const rows = await sql<{ slug: string; name: string; timezone: string }[]>`
+        select slug, name, timezone from shops order by slug
+      `;
+      return rows.map((r) => ({ slug: r.slug, name: r.name, timezone: r.timezone }));
+    },
+
     async getShop(slug) {
       const rows = await sql<{ slug: string; name: string; timezone: string }[]>`
         select slug, name, timezone from shops where slug = ${slug}

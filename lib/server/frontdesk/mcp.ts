@@ -272,7 +272,6 @@ const bookingSchema = z.object({
   customer: z.object({
     displayName: z.string(),
     approved: z.boolean().describe("true once the person tapped Approve on the approval link."),
-    verified: z.boolean().describe("Deprecated: the same as approved. Read approved."),
     phone: z
       .string()
       .optional()
