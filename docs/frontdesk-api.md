@@ -660,8 +660,8 @@ Public: no token. Bookings of any status whose time overlaps the range from 7 da
 
 The owner's console (v0) uses these to change the shop's rules and act on bookings.
 
-**Auth (stub).** Every owner route needs the header `Authorization: Bearer <OWNER_API_TOKEN>`. `TODO(ring-2): owner sign-in replaces the token.`
-- No header, another scheme, an empty token or the wrong token → **401** `unauthorized`, with `WWW-Authenticate: Bearer realm="front-desk-owner"`.
+**Auth (stub).** Every owner route needs the header `Authorization: Bearer <OWNER_API_TOKEN>`, or the `fd_owner` cookie from an [owner session](#owner-session-stub) (that's how the console calls them from the browser). `TODO(ring-2): owner sign-in replaces the token.`
+- No header, another scheme, an empty token or the wrong token, and no valid session cookie → **401** `unauthorized`, with `WWW-Authenticate: Bearer realm="front-desk-owner"`.
 - **Never open.** If the deployment's `OWNER_API_TOKEN` is unset, blank, or shorter than 16 characters (after trimming), every owner route answers **503** with `code: "internal"` and a configuration message. Setting it up is in [database.md](database.md#4-set-owner_api_token).
 - The token is checked first, before the request touches the database. It's compared in constant time, read from the environment on every request, and never logged or echoed.
 
@@ -672,6 +672,59 @@ The owner's console (v0) uses these to change the shop's rules and act on bookin
 ```json
 { "error": { "code": "internal", "message": "The owner API is not configured on this deployment: OWNER_API_TOKEN is not set.", "next_action": "Set OWNER_API_TOKEN (at least 16 random characters) in the deployment's environment variables, then redeploy." } }
 ```
+
+### Owner session (stub)
+
+So the console never keeps `OWNER_API_TOKEN` in page code: the owner types the token once, the server checks it and answers with an HttpOnly cookie, and every owner route accepts that cookie. `TODO(ring-2): owner sign-in by texted code replaces this; GET /api/shops/[shop]/bookings moves behind owner auth then.`
+
+| Method and path | Request | Response | Success |
+|---|---|---|---|
+| `POST /api/owner/session` | `OwnerSessionRequest` `{ "token": "…" }` | `OwnerSessionResponse` `{ "signedIn": true, "expiresAt": "…" }`, plus `Set-Cookie: fd_owner=…` | 200 |
+| `GET /api/owner/session` | | `OwnerSessionResponse`: `{ "signedIn": true, "expiresAt": "2026-11-08T10:00:00Z" }` or `{ "signedIn": false }` | 200 |
+| `DELETE /api/owner/session` | | `OwnerSessionResponse` `{ "signedIn": false }`, plus a `Set-Cookie` that clears `fd_owner` | 200 |
+
+**`POST`** checks `token` against `OWNER_API_TOKEN` exactly like the bearer check (trimmed, constant time):
+- The right token → 200 and the cookie `fd_owner=<expiry>.<signature>; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict; Secure`. `Secure` is left off only for plain http on `localhost` (and `127.0.0.1`, `[::1]`) off Vercel, so `pnpm dev` works in every browser.
+- The value is the expiry (Unix seconds) and an HMAC-SHA256 of `owner:<expiry>` keyed with `OWNER_API_TOKEN`. The token itself is never in the cookie, and changing the token ends every session. A session lasts 12 hours on the server's wall clock (`FRONTDESK_NOW` doesn't affect it).
+- The wrong token → **401** `unauthorized` (`"Wrong owner token."`), no cookie. A body that isn't `{ "token": "<string>" }` → **400** `invalid_request` with `details.field`. Token not configured → **503**, as on every owner route.
+- No rate limit on attempts (MVP).
+
+**`GET`** tells the console whether to show the unlock screen: `signedIn` is true only for a valid, unexpired cookie signed with the current token. Token not configured → **503**, so the console can say so instead of offering a sign-in that can't work.
+
+**`DELETE`** signs out: it always answers 200 and clears the cookie. It needs no auth.
+
+**Using the cookie on owner routes.** Every owner route accepts the cookie, for any method, exactly like the bearer token. There's no extra CSRF check (MVP): `SameSite=Strict` already keeps the browser from sending the cookie on a request that starts on another site.
+
+From the console (same origin, so the browser sends and stores the cookie by itself):
+
+```ts
+import type { OwnerSessionRequest, OwnerSessionResponse } from "@/lib/types/frontdesk";
+
+const json = { "Content-Type": "application/json" };
+
+// On load: unlocked already?
+const session = (await (await fetch("/api/owner/session")).json()) as OwnerSessionResponse;
+// Unlock: 200 sets the cookie; 401 wrong token.
+await fetch("/api/owner/session", { method: "POST", headers: json, body: JSON.stringify({ token } satisfies OwnerSessionRequest) });
+// Owner routes: the browser sends the cookie.
+await fetch("/api/shops/harts/policies", { method: "PUT", headers: json, body: JSON.stringify({ paused: true }) });
+// Sign out.
+await fetch("/api/owner/session", { method: "DELETE" });
+```
+
+With curl:
+
+```bash
+curl -s -c jar.txt -X POST http://localhost:3000/api/owner/session \
+  -H "Content-Type: application/json" -d "{\"token\":\"$OWNER_API_TOKEN\"}"
+curl -s -b jar.txt http://localhost:3000/api/owner/session
+curl -s -b jar.txt http://localhost:3000/api/shops/harts/policies
+curl -s -b jar.txt -X PUT http://localhost:3000/api/shops/harts/policies \
+  -H "Content-Type: application/json" -d '{"paused":false}'
+curl -s -b jar.txt -c jar.txt -X DELETE http://localhost:3000/api/owner/session
+```
+
+### Routes
 
 | Method and path | Request | Response | Success |
 |---|---|---|---|

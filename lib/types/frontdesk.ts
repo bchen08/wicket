@@ -327,7 +327,23 @@ export type BookingsResponse = {
   bookings: Booking[];
 };
 
-// ---- Owner routes (Authorization: Bearer <OWNER_API_TOKEN> until owner sign-in in Ring 2) ----
+// ---- Owner session (stub; TODO(ring-2): owner sign-in by texted code replaces it) ----
+
+/** POST /api/owner/session body. On success the answer sets the HttpOnly fd_owner cookie. */
+export type OwnerSessionRequest = {
+  /** The deployment's OWNER_API_TOKEN. Never stored in the cookie or echoed back. */
+  token: string;
+};
+
+/** POST, GET and DELETE /api/owner/session. */
+export type OwnerSessionResponse = {
+  /** Whether this browser now holds a valid, unexpired owner session cookie. */
+  signedIn: boolean;
+  /** When the session ends, RFC 3339 in UTC (e.g. "2026-11-08T10:00:00Z"). Only when signedIn is true. */
+  expiresAt?: string;
+};
+
+// ---- Owner routes (Authorization: Bearer <OWNER_API_TOKEN>, or the owner session cookie, until owner sign-in in Ring 2) ----
 
 /** GET and PUT /api/shops/[shop]/policies. */
 export type PoliciesResponse = GetPoliciesResult;
