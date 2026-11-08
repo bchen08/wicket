@@ -17,17 +17,17 @@ export function ConsoleNavigation() {
       aria-label="Owner console"
       className="border-b border-border bg-background"
     >
-      <div className="mx-auto flex max-w-3xl gap-1 px-4 pt-4 sm:px-8">
+      <div className="mx-auto flex w-full max-w-3xl flex-wrap gap-x-6 px-6 sm:gap-x-8 sm:px-10">
         {links.map(([label, href]) => (
           <Link
             key={href}
             href={href}
             aria-current={pathname === href ? "page" : undefined}
             className={cn(
-              "flex min-h-12 flex-1 items-center justify-center rounded-t-lg border-b-2 px-2 text-sm font-medium transition-colors",
+              "flex min-h-14 items-center text-sm underline-offset-4 transition-colors",
               pathname === href
-                ? "border-primary bg-accent text-primary"
-                : "border-transparent text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:bg-muted focus-visible:text-foreground",
+                ? "text-foreground underline"
+                : "text-muted-foreground hover:text-foreground hover:underline",
             )}
           >
             {label}

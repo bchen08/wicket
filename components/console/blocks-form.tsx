@@ -52,7 +52,7 @@ export function BlockForm({
       onChange={state.clear}
       className="flex flex-col gap-5"
     >
-      <h3 className="font-medium">Add time off</h3>
+      <h3 className="font-serif text-xl">Add time off</h3>
       <p className="text-sm text-muted-foreground">
         Times are in {timezone}, not your device&apos;s timezone. Existing
         bookings are not changed.
@@ -121,8 +121,8 @@ export function BlockRow({
           <p className="font-medium">
             {staffName} · {block.reason || "Time off"}
           </p>
-          <p>{format(block.start)}</p>
-          <p className="text-muted-foreground">to {format(block.end)}</p>
+          <p className="font-mono">{format(block.start)}</p>
+          <p className="text-muted-foreground">to <span className="font-mono">{format(block.end)}</span></p>
         </div>
         <Button
           variant="outline"

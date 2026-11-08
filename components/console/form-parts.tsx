@@ -8,7 +8,7 @@ export function SaveFeedback({ feedback }: { feedback: Feedback | null }) {
   return (
     <div
       role={feedback.saved ? "status" : "alert"}
-      className="flex flex-col gap-1 rounded-lg border border-border bg-accent/40 p-3 text-sm wrap-anywhere"
+      className="flex flex-col gap-1 border-y border-border py-3 text-sm leading-relaxed wrap-anywhere"
     >
       <p>{feedback.message}</p>
       {feedback.nextAction && (
@@ -16,7 +16,7 @@ export function SaveFeedback({ feedback }: { feedback: Feedback | null }) {
       )}
       {feedback.unauthorized && (
         <Link
-          className="w-fit text-primary underline underline-offset-4"
+          className="w-fit underline underline-offset-4"
           href="/console/unlock"
         >
           Unlock the console
@@ -55,13 +55,13 @@ export function SettingsShell({
   children: React.ReactNode;
 }) {
   return (
-    <main className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-5 py-8 sm:px-8 sm:py-12">
-      <header className="flex flex-col gap-2">
-        <p className="text-xs font-medium uppercase tracking-widest text-primary">
+    <main className="mx-auto flex w-full max-w-3xl flex-col gap-10 px-6 py-12 sm:px-10 sm:py-16">
+      <header className="flex flex-col gap-3">
+        <p className="text-sm text-muted-foreground">
           Your shop, your rules
         </p>
-        <h1 className="text-3xl font-medium tracking-tight">{title}</h1>
-        <p className="text-sm leading-relaxed text-muted-foreground">
+        <h1 className="font-serif text-4xl leading-tight text-balance sm:text-5xl">{title}</h1>
+        <p className="max-w-lg text-base leading-relaxed text-muted-foreground text-pretty">
           {description}
         </p>
       </header>

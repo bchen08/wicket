@@ -48,18 +48,18 @@ export function ServiceForm({ service }: { service?: Service }) {
     });
   }
   return (
-    <section className="rounded-xl border border-border bg-card p-5 sm:p-6">
+    <section className="border-t border-border pt-8">
       <form
         onSubmit={submit}
         onChange={state.clear}
         className="flex flex-col gap-5"
       >
         <div>
-          <h2 className="text-lg font-medium">
+          <h2 className="font-serif text-2xl leading-tight">
             {service?.name ?? "Add a service"}
           </h2>
           {service && (
-            <p className="mt-1 text-xs text-muted-foreground">
+            <p className="mt-1 font-mono text-xs text-muted-foreground">
               ID: {service.id}
             </p>
           )}

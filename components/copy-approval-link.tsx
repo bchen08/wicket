@@ -34,7 +34,7 @@ export function CopyApprovalLink({ url }: { url: string }) {
         </Button>
         <a
           href={url}
-          className="text-sm text-primary underline underline-offset-4"
+          className="text-sm underline underline-offset-4"
         >
           Open approval link
         </a>

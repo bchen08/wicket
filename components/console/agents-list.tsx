@@ -7,13 +7,13 @@ import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, Tabl
 
 function SeenTime({ value, zone }: { value: string | null; zone: string }) {
   if (!value) return <span className="text-muted-foreground">Never</span>;
-  return <time dateTime={value}>{DateTime.fromISO(value).setZone(zone).toFormat("d LLL yyyy, h:mm a")}</time>;
+  return <time dateTime={value} className="font-mono">{DateTime.fromISO(value).setZone(zone).toFormat("d LLL yyyy, h:mm a")}</time>;
 }
 
 function AgentRow({ agent, zone }: { agent: AgentSummary; zone: string }) {
   return <TableRow>
     <TableCell className="max-w-48 whitespace-normal wrap-anywhere">{agent.name}</TableCell>
-    <TableCell>{agent.bookings}</TableCell>
+    <TableCell className="font-mono">{agent.bookings}</TableCell>
     <TableCell><SeenTime value={agent.firstSeen} zone={zone} /></TableCell>
     <TableCell><SeenTime value={agent.lastSeen} zone={zone} /></TableCell>
     <TableCell><SeenTime value={agent.lastBookedAt} zone={zone} /></TableCell>
@@ -28,7 +28,7 @@ export async function AgentsList() {
     return <SaveFeedback feedback={errorFeedback(error)} />;
   }
   return <section className="flex min-w-0 flex-col gap-4" aria-label="Agent activity">
-    <div className="rounded-xl border border-border bg-card p-4">
+    <div className="border-t border-border">
       <Table>
         <TableCaption>Verified agents seen by Front Desk · Times in {data.shop.timezone}</TableCaption>
         <TableHeader><TableRow>

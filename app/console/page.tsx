@@ -14,8 +14,8 @@ export const instant = false;
 export default async function ConsolePage() {
   await requireOwner();
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-3xl flex-col gap-8 px-5 py-8 sm:px-8 sm:py-12">
-      <Link href="/" className="w-fit text-sm font-medium text-primary">
+    <main className="mx-auto flex min-h-screen w-full max-w-3xl flex-col gap-10 px-6 py-12 sm:px-10 sm:py-16">
+      <Link href="/" className="w-fit text-sm underline-offset-4 hover:underline">
         ← Front Desk
       </Link>
       <Suspense

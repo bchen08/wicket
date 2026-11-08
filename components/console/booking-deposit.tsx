@@ -23,7 +23,7 @@ export function depositLabel(deposit: BookingDeposit): string {
 export function BookingDepositDisplay({ deposit }: { deposit: BookingDeposit }) {
   return <div className="flex flex-col gap-1 text-sm">
     <p>{depositLabel(deposit)}</p>
-    {deposit.state === "awaiting_payment" && deposit.payBy && <p className="text-muted-foreground">Pay by <time dateTime={deposit.payBy}>{bookingTime(deposit.payBy)}</time></p>}
+    {deposit.state === "awaiting_payment" && deposit.payBy && <p className="text-muted-foreground">Pay by <time dateTime={deposit.payBy} className="font-mono">{bookingTime(deposit.payBy)}</time></p>}
     {deposit.actionFailed && <p role="alert" className="text-destructive">Deposit {deposit.actionFailed.action === "capture" ? "capture" : "release"} failed: {deposit.actionFailed.message}. The booking changed, but the money did not move.</p>}
   </div>;
 }
