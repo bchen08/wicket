@@ -80,6 +80,36 @@ function fakeDeployment({ status = readyStatus(), route, doubleBook = false } = 
     if (url.pathname === "/api/shops/nope/services") return apiError(404, "not_found");
     if (method === "GET" && url.pathname === "/api/mcp") return new Response(null, { status: 405 });
 
+    // The web booking API.
+    if (method === "GET" && url.pathname === "/api/shops/harts/availability") {
+      const free = STARTS.filter((start) => !held(start)).map((start) => ({ start, display: `Tue 10 Nov, ${start.slice(11, 16)}` }));
+      const days = Array.from({ length: 7 }, (_, i) => ({ date: `2026-11-${10 + i}`, display: "x", slots: i === 0 ? free : [] }));
+      return json({ from: "2026-11-10", to: "2026-11-17", days });
+    }
+    if (method === "GET" && url.pathname === "/api/shops/harts/agents.md") {
+      const text = `MCP: ${BASE}/api/mcp\nGET ${BASE}/api/shops/harts/availability\nPOST ${BASE}/api/shops/harts/book\nSend booking.approval.url.`;
+      return new Response(text, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+    }
+    if (method === "GET" && url.pathname === "/.well-known/front-desk.json") {
+      return json({ mcp: `${BASE}/api/mcp`, webApi: `${BASE}/api/shops/harts`, agentsMd: `${BASE}/api/shops/harts/agents.md` });
+    }
+    if (method === "POST" && url.pathname === "/api/shops/harts/book") {
+      const form = (headers.get("content-type") ?? "").startsWith("application/x-www-form-urlencoded");
+      const fields = form ? Object.fromEntries(new URLSearchParams(init.body)) : JSON.parse(init.body);
+      if (held(fields.start) && !doubleBook) {
+        if (!form) return apiError(409, "slot_taken");
+        const back = new URL(headers.get("referer"));
+        back.searchParams.set("error", "slot_taken");
+        back.searchParams.set("message", "That time is already booked.");
+        return new Response(null, { status: 303, headers: { location: back.href } });
+      }
+      const n = state.bookings.length + 1;
+      const b = { id: `booking-${n}`, token: `token-${n}`, start: fields.start, status: "awaiting_approval", agent: fields.bookedBy ?? "web" };
+      state.bookings.push(b);
+      if (form) return new Response(null, { status: 303, headers: { location: `${BASE}/approve/${b.token}` } });
+      return json({ booking: view(b), statusUrl: `${BASE}/api/approvals/${b.token}`, next_action: "Send the link." }, 201);
+    }
+
     const decline = /^\/api\/approvals\/([^/]+)\/decline$/.exec(url.pathname);
     if (method === "POST" && decline) {
       const b = state.bookings.find((x) => x.token === decline[1]);
@@ -154,11 +184,15 @@ describe("pnpm smoke", () => {
 
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(results(run.rows)).toEqual(Array(15).fill("PASS"));
-    expect(run.line).toBe("PASS: 15 passed.");
-    expect(run.output).toMatch(/\nPASS: 15 passed\.$/);
-    // Every booking it made is declined.
-    expect(deployment.state.bookings.map((b) => b.status)).toEqual(["cancelled"]);
+    expect(results(run.rows)).toEqual(Array(22).fill("PASS"));
+    expect(run.line).toBe("PASS: 22 passed.");
+    expect(run.output).toMatch(/\nPASS: 22 passed\.$/);
+    // Every booking it made is declined: one over MCP, one web JSON book, one web form post.
+    expect(deployment.state.bookings.map((b) => [b.status, b.agent])).toEqual([
+      ["cancelled", SMOKE_AGENT],
+      ["cancelled", SMOKE_AGENT],
+      ["cancelled", SMOKE_AGENT],
+    ]);
     // The bypass secret went on every request, and the secret itself is never printed.
     expect(deployment.state.requests.every((r) => r.headers.get(BYPASS_HEADER) === "bypass-secret")).toBe(true);
     expect(run.output).not.toContain("bypass-secret");
@@ -185,8 +219,8 @@ describe("pnpm smoke", () => {
     expect(run.verdict).toBe("FAIL");
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.item === "2")).toMatchObject({ result: "FAIL", evidence: "HTTP 500 boom" });
-    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(14);
-    expect(run.line).toBe("FAIL: 1 failed, 14 passed, 0 skipped.");
+    expect(run.rows.filter((r) => r.result === "PASS")).toHaveLength(21);
+    expect(run.line).toBe("FAIL: 1 failed, 21 passed, 0 skipped.");
   });
 
   it("BLOCKED: not_ready prints the problems, runs nothing else and exits 2", async () => {
@@ -248,10 +282,12 @@ describe("pnpm smoke", () => {
     const run = await smoke(deployment);
     expect(run.verdict).toBe("PASS");
     expect(run.exitCode).toBe(EXIT.pass);
-    expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual(["5", "11", "11", "12", "14", "14"]);
-    // No cleanup row either: it made no bookings.
-    expect(run.line).toBe("PASS: 8 passed, 6 skipped (a skipped check is not a pass: verify those by hand).");
+    expect(run.rows.filter((r) => r.result === "SKIPPED").map((r) => r.item)).toEqual(["5", "11", "11", "12", "14", "14", "W4", "W4", "W4", "W5"]);
+    // The read-only web checks still run; no cleanup row: it made no bookings.
+    expect(run.rows.filter((r) => r.item.startsWith("W") && r.result === "PASS").map((r) => r.item)).toEqual(["W1", "W2", "W3"]);
+    expect(run.line).toBe("PASS: 11 passed, 10 skipped (a skipped check is not a pass: verify those by hand).");
     expect(deployment.state.mcp.some((c) => c.params?.name === "book")).toBe(false);
+    expect(deployment.state.requests.some((r) => r.path === "/api/shops/harts/book")).toBe(false);
     expect(deployment.state.requests.some((r) => r.headers.get("authorization"))).toBe(false);
   });
 
@@ -277,8 +313,34 @@ describe("pnpm smoke", () => {
     const run = await smoke(deployment);
     expect(run.exitCode).toBe(EXIT.fail);
     expect(run.rows.find((r) => r.title.includes("slot_taken"))).toMatchObject({ result: "FAIL", evidence: "booked again: booking-2" });
+    // The web form post at the held start books it again too, and fails.
+    expect(run.rows.find((r) => r.title.includes("?error=slot_taken"))).toMatchObject({ result: "FAIL" });
+    expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "5 made, 5 declined: none left behind" });
+    expect(deployment.state.bookings.map((b) => b.status)).toEqual(Array(5).fill("cancelled"));
+  });
+
+  it("web booking: a form post that doesn't redirect to /approve/ fails W5, and the JSON booking is still declined", async () => {
+    const deployment = fakeDeployment({
+      route: (url, init) => {
+        const form = new Headers(init.headers).get("content-type")?.startsWith("application/x-www-form-urlencoded");
+        if (url.pathname === "/api/shops/harts/book" && form) return new Response("<html>Booked!</html>", { status: 200 });
+        return undefined;
+      },
+    });
+    const run = await smoke(deployment);
+    expect(run.exitCode).toBe(EXIT.fail);
+    const web = run.rows.filter((r) => r.item.startsWith("W")).map((r) => [r.item, r.result]);
+    expect(web).toEqual([
+      ["W1", "PASS"],
+      ["W2", "PASS"],
+      ["W3", "PASS"],
+      ["W4", "PASS"],
+      ["W4", "FAIL"],
+      ["W4", "PASS"],
+      ["W5", "FAIL"],
+    ]);
+    expect(run.rows.find((r) => r.item === "W5").evidence).toBe("HTTP 200 <html>Booked!</html>");
     expect(run.rows.at(-1)).toMatchObject({ result: "PASS", evidence: "2 made, 2 declined: none left behind" });
-    expect(deployment.state.bookings.map((b) => b.status)).toEqual(["cancelled", "cancelled"]);
   });
 
   it("fails the cleanup row when a booking can't be declined or cancelled", async () => {
@@ -293,7 +355,10 @@ describe("pnpm smoke", () => {
     });
     const run = await smoke(deployment);
     expect(run.exitCode).toBe(EXIT.fail);
-    expect(run.rows.at(-1)).toMatchObject({ result: "FAIL", evidence: "still held: booking-1 (internal)" });
+    expect(run.rows.at(-1)).toMatchObject({
+      result: "FAIL",
+      evidence: "still held: booking-1 (internal), booking-2 (internal), link token-… (couldn't decline)",
+    });
   });
 });
 
