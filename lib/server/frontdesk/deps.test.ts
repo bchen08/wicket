@@ -17,7 +17,7 @@ describe("createFrontDeskDeps", () => {
       warn,
     );
     expect(deps.catalog).toBe(deps.store);
-    expect(deps.consent).toEqual({ publicBaseUrl: "https://emergent-abc123.vercel.app", devCodes: false });
+    expect(deps.consent).toEqual({ publicBaseUrl: "https://emergent-abc123.vercel.app" });
     expect(warn).not.toHaveBeenCalled();
   });
 
@@ -83,21 +83,14 @@ describe("consentConfigFromEnv", () => {
     });
   });
 
-  describe("FRONTDESK_DEV_CODES", () => {
-    it.each<[string, Record<string, string>, boolean]>([
-      ["=1 locally", { FRONTDESK_DEV_CODES: "1" }, true],
-      ["=1 on a Vercel preview", { ...VERCEL_ENV_VARS, VERCEL_ENV: "preview", FRONTDESK_DEV_CODES: "1" }, true],
-      ["=1 on Vercel production", { ...VERCEL_ENV_VARS, VERCEL_ENV: "production", FRONTDESK_DEV_CODES: "1" }, false],
-      ["=1 locally with VERCEL_ENV=production", { VERCEL_ENV: "production", FRONTDESK_DEV_CODES: "1" }, false],
-      ["unset", {}, false],
-      ["=0", { FRONTDESK_DEV_CODES: "0" }, false],
-      ["=true", { FRONTDESK_DEV_CODES: "true" }, false],
-    ])("devCodes with FRONTDESK_DEV_CODES%s → %s", (_label, env, expected) => {
-      expect(consentConfigFromEnv({ ...env }).devCodes).toBe(expected);
-    });
-
-    it("unset FRONTDESK_DEV_CODES on a preview → false", () => {
-      expect(consentConfigFromEnv({ ...VERCEL_ENV_VARS, VERCEL_ENV: "preview" }).devCodes).toBe(false);
-    });
+  it("ignores FRONTDESK_DEV_CODES (phone codes are gone until Ring 1c): the config is only the base URL", () => {
+    for (const env of [
+      { FRONTDESK_DEV_CODES: "1" },
+      { ...VERCEL_ENV_VARS, VERCEL_ENV: "preview", FRONTDESK_DEV_CODES: "1" },
+      { ...VERCEL_ENV_VARS, VERCEL_ENV: "production", FRONTDESK_DEV_CODES: "1" },
+    ]) {
+      expect(Object.keys(consentConfigFromEnv(env))).toEqual(["publicBaseUrl"]);
+    }
+    expect(consentConfigFromEnv({ FRONTDESK_DEV_CODES: "1" })).toEqual({ publicBaseUrl: "http://localhost:3000" });
   });
 });

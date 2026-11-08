@@ -1,5 +1,4 @@
 import { systemClock } from "../clock";
-import { createLogCodeSender } from "../consent/code-sender";
 import type { ConsentConfig } from "../consent/config";
 import { createLogNotifier } from "../notify/log-notifier";
 import { createMemoryStore } from "./memory-store";
@@ -16,7 +15,6 @@ import type { FrontDeskDeps } from "./service";
 // Consent (Ring 1b):
 //   PUBLIC_BASE_URL      the approval links' origin. Default: http://localhost:3000 locally,
 //                        https://${VERCEL_URL} on Vercel.
-//   FRONTDESK_DEV_CODES  "1": the code request's response includes the code. Ignored on Vercel production.
 
 /** Front Desk is deployed without the settings it needs. Surfaces as an `internal` error; the log says why. */
 export class ConfigurationError extends Error {
@@ -60,16 +58,13 @@ function publicBaseUrl(env: Env): string {
 
 /** The consent settings from `env`. Throws ConfigurationError for a malformed setting. */
 export function consentConfigFromEnv(env: Env): ConsentConfig {
-  // Never in Vercel production, whatever FRONTDESK_DEV_CODES says.
-  const devCodes = env.FRONTDESK_DEV_CODES?.trim() === "1" && env.VERCEL_ENV !== "production";
-  return { publicBaseUrl: publicBaseUrl(env), devCodes };
+  return { publicBaseUrl: publicBaseUrl(env) };
 }
 
 /** Build deps from `env`, without caching. Exported for tests; the app uses getFrontDeskDeps(). */
 export function createFrontDeskDeps(env: Env, warn: (message: string) => void = console.warn): FrontDeskDeps {
   const clock = systemClock;
   const notifier = createLogNotifier();
-  const codeSender = createLogCodeSender();
   const url = env.DATABASE_URL?.trim();
 
   if (!url && env.VERCEL) {
@@ -81,14 +76,14 @@ export function createFrontDeskDeps(env: Env, warn: (message: string) => void = 
   const consent = consentConfigFromEnv(env);
   if (url) {
     const db = createPostgresStore(url);
-    return { clock, notifier, codeSender, consent, catalog: db, store: db };
+    return { clock, notifier, consent, catalog: db, store: db };
   }
   warn(
     "[frontdesk] DATABASE_URL is not set: using in-memory demo data. Bookings are lost when the server restarts. " +
       "See docs/database.md to use Postgres.",
   );
   const memory = createMemoryStore({ clock });
-  return { clock, notifier, codeSender, consent, catalog: memory, store: memory };
+  return { clock, notifier, consent, catalog: memory, store: memory };
 }
 
 // Cached on globalThis, not in a module variable: Next.js can load this module once per route

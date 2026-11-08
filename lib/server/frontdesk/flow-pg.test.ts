@@ -7,20 +7,21 @@ import { closePostgresClients, createPostgresStore, getPostgresClient } from "./
 import { book, cancelBooking, getAvailability, getBooking, transitionBooking } from "./service";
 import { approveAsCustomer, recordingNotifier, TEST_CONSENT, withConsent } from "./test-support";
 
-// Issue #8's lifecycle and idempotency flow against a real Postgres, through the service layer (what
+// Issue #8's lifecycle flow against a real Postgres, through the service layer (what
 // the MCP tools and owner routes call), when DATABASE_URL_TEST points at a database with 0001, 0002,
 // 0003 and the seed applied (see docs/database.md). Other test files share that database and read
 // Hart's rows, so this file never touches Hart's: it makes a throwaway shop (one staff member working
 // Tue–Sat 09:00–17:00, a 30-minute service with a deposit and a 20-minute one without, and a policies
 // row like Hart's), books only in 2099, and deletes everything it made in afterAll.
-// Ring 1b: book places a hold; a booking is confirmed when the person approves it (approveAsCustomer,
-// through the approval use cases), and the owner is alerted then. Phone numbers carry a 6-digit prefix
-// of this run's own, so its customers never collide with another run's.
+// Ring 1b: book places a hold; a booking is confirmed when the person approves it through the link
+// (approveAsCustomer, through the approval use case), and the owner is alerted then. book and cancel
+// take no idempotency key: a repeated book of a held time is slot_taken, a repeated cancel
+// not_cancellable. Phone numbers carry a 6-digit prefix of this run's own.
 const url = process.env.DATABASE_URL_TEST?.trim();
 
 if (!url) {
   describe("Front Desk flow on Postgres", () => {
-    it.skip("skipped: set DATABASE_URL_TEST to a migrated, seeded Postgres to run the lifecycle and idempotency flow against a real database", () => {});
+    it.skip("skipped: set DATABASE_URL_TEST to a migrated, seeded Postgres to run the lifecycle flow against a real database", () => {});
   });
 } else {
   describe("Front Desk flow on Postgres (DATABASE_URL_TEST)", () => {
@@ -44,17 +45,10 @@ if (!url) {
     });
     /** 6 digits of this run's own, in every phone number this file uses. */
     const PHONE_PREFIX = String(100000 + Math.floor(Math.random() * 900000));
-    /** A different phone for each approval, so no number reaches the 3-codes-an-hour limit. */
+    /** A different phone for each approval. */
     let phones = 0;
-    const approve = (booking: Booking) => approveAsCustomer(deps, booking, `+1${PHONE_PREFIX}${String(1000 + phones++).slice(-4)}`);
-
-    /** Every idempotency key this file uses, deleted in afterAll. */
-    const keys: string[] = [];
-    const newKey = () => {
-      const k = crypto.randomUUID();
-      keys.push(k);
-      return k;
-    };
+    const phoneNumber = () => `+1${PHONE_PREFIX}${String(1000 + phones++).slice(-4)}`;
+    const approve = (booking: Booking) => approveAsCustomer(deps, booking, phoneNumber());
 
     // A random Tuesday in 2099; each test books in its own week after it.
     const firstTuesday = DateTime.fromObject({ year: 2099, month: 1, day: 6 }, { zone })
@@ -72,10 +66,9 @@ if (!url) {
       end: new Date(time(week, dayOffset + 1, 0)),
     });
 
-    const bookTrim = (start: string, idempotencyKey = newKey(), customer = "E2E Flow") =>
-      book(deps, shop, { service_id: "trim", start, customer_name: customer, idempotency_key: idempotencyKey }, "vitest flow");
-    const cancel = (bookingId: string, idempotencyKey = newKey()) =>
-      cancelBooking(deps, shop, { booking_id: bookingId, idempotency_key: idempotencyKey });
+    const bookTrim = (start: string, customer = "E2E Flow") =>
+      book(deps, shop, { service_id: "trim", start, customer_name: customer }, "vitest flow");
+    const cancel = (bookingId: string) => cancelBooking(deps, shop, { booking_id: bookingId });
     const failure = (promise: Promise<unknown>) =>
       promise.then(
         () => {
@@ -108,21 +101,16 @@ if (!url) {
     });
 
     afterAll(async () => {
-      if (keys.length > 0) await sql`delete from idempotency_keys where key = any(${keys}::text[])`;
-      // Customers aren't cascaded from bookings; approvals and codes are.
-      await sql`delete from customers where id in (select customer_id from bookings where shop_slug = ${shop})`;
-      await sql`delete from bookings where shop_slug = ${shop}`; // events cascade
+      await sql`delete from bookings where shop_slug = ${shop}`; // events and approvals cascade
       await sql`delete from shops where slug = ${shop}`; // staff, hours, services and policies cascade
       await closePostgresClients();
     });
 
-    it("book, then a replay with the same key: one hold, one booked event, the same id and link; one owner alert, on approval", async () => {
+    it("book: one hold, one booked event, the link; booking the same time again is slot_taken; one owner alert, on approval", async () => {
       setNow(time(0, 0, 10));
       const alertsBefore = notifier.alerts.length;
-      const k = newKey();
       const start = time(0, 1, 10);
-      const first = await bookTrim(start, k);
-      expect(first.replayed).toBe(false);
+      const first = await bookTrim(start);
       expect(first.booking).toMatchObject({
         shopSlug: shop,
         start,
@@ -131,10 +119,9 @@ if (!url) {
         approval: { url: expect.stringMatching(/^http:\/\/localhost:3000\/approve\/[A-Za-z0-9_-]{43}$/) },
       });
 
-      // The replay returns the saved result, approval link included (it can't be recomputed from the hash).
-      const replay = await bookTrim(start, k);
-      expect(replay.replayed).toBe(true);
-      expect(replay.booking).toEqual(first.booking);
+      // A retry (the same call again) can't double-book: the hold is in the way.
+      const again = await failure(bookTrim(start));
+      expect(again.code).toBe("slot_taken");
 
       const listed = await store.listBookings(shop, dayRange(0, 1));
       expect(listed.map((b) => b.id)).toEqual([first.booking.id]);
@@ -144,25 +131,23 @@ if (!url) {
       delete stored.approval; // reads never show the link
       expect((await getBooking(deps, shop, { booking_id: first.booking.id })).booking).toEqual(stored);
 
-      const approved = await approve(first.booking);
-      expect(approved).toMatchObject({ id: first.booking.id, status: "confirmed", customer: { verified: true } });
+      const phone = phoneNumber();
+      const approved = await approveAsCustomer(deps, first.booking, phone);
+      expect(approved).toMatchObject({ id: first.booking.id, status: "confirmed", customer: { verified: true, phoneLast4: phone.slice(-4) } });
       expect(notifier.alerts.length - alertsBefore).toBe(1);
       expect((await getBooking(deps, shop, { booking_id: first.booking.id })).booking).toEqual(approved);
+      const [row] = await sql<{ customer_phone: string | null }[]>`select customer_phone from bookings where id = ${first.booking.id}::uuid`;
+      expect(row.customer_phone).toBe(phone);
     });
 
-    it("idempotency_conflict: the same key with different arguments, for book and for cancel", async () => {
+    it("approve without a phone: confirmed and verified, no phoneLast4, nothing stored", async () => {
       setNow(time(0, 0, 10));
-      const k = newKey();
-      const first = await bookTrim(time(0, 1, 11), k, "E2E Conflict");
-      const err = await failure(bookTrim(time(0, 1, 11), k, "E2E Someone Else"));
-      expect(err.code).toBe("idempotency_conflict");
-      expect(await store.listBookings(shop, { start: new Date(time(0, 1, 11)), end: new Date(time(0, 1, 11, 30)) })).toHaveLength(1);
-
-      const other = await bookTrim(time(0, 1, 12));
-      const cancelKey = newKey();
-      await cancel(first.booking.id, cancelKey);
-      expect((await failure(cancel(other.booking.id, cancelKey))).code).toBe("idempotency_conflict");
-      expect((await store.getBooking(other.booking.id))?.status).toBe("awaiting_approval");
+      const held = await bookTrim(time(0, 1, 13));
+      const approved = await approveAsCustomer(deps, held.booking, null);
+      expect(approved).toMatchObject({ status: "confirmed", customer: { verified: true } });
+      expect(approved.customer).not.toHaveProperty("phoneLast4");
+      const [row] = await sql<{ customer_phone: string | null }[]>`select customer_phone from bookings where id = ${held.booking.id}::uuid`;
+      expect(row.customer_phone).toBeNull();
     });
 
     it("cancel at least 24 hours ahead → released (the slot is offered again); inside the window → captured; no deposit → none", async () => {
@@ -172,7 +157,7 @@ if (!url) {
       const free = await book(
         deps,
         shop,
-        { service_id: "shave", start: time(1, 1, 12), customer_name: "E2E Shave", idempotency_key: newKey() },
+        { service_id: "shave", start: time(1, 1, 12), customer_name: "E2E Shave" },
         "vitest flow",
       );
       const wednesday = { service_id: "trim", from: time(1, 1, 0), to: time(1, 2, 0), limit: 50 };
@@ -185,7 +170,6 @@ if (!url) {
         booking: { ...earlyOk, status: "cancelled" },
         depositEffect: "released",
         depositCollected: false,
-        replayed: false,
       });
       expect((await getAvailability(deps, shop, wednesday)).slots.map((s) => s.start)).toContain(time(1, 1, 10));
 
@@ -207,13 +191,12 @@ if (!url) {
       expect(row).toMatchObject({ cancelled_by: "agent", cancelled_at: expect.any(Date) });
     });
 
-    it("cancel after the start → not_cancellable, nothing written and the key not kept", async () => {
+    it("cancel after the start → not_cancellable, nothing written", async () => {
       setNow(time(2, 0, 9));
       const booked = await bookTrim(time(2, 0, 13));
       await approve(booked.booking);
       setNow(time(2, 0, 13, 5));
-      const k = newKey();
-      const err = await failure(cancel(booked.booking.id, k));
+      const err = await failure(cancel(booked.booking.id));
       expect(err.code).toBe("not_cancellable");
       expect(err.details).toMatchObject({ status: "confirmed", booking_id: booked.booking.id });
       expect((await store.getBooking(booked.booking.id))?.status).toBe("confirmed");
@@ -221,7 +204,6 @@ if (!url) {
         ["booked", "agent"],
         ["approved", "customer"],
       ]);
-      expect(await sql`select 1 from idempotency_keys where key = ${k}`).toHaveLength(0);
     });
 
     it("owner no-show after the start → no_show, captured, with a no_show event by the owner", async () => {
@@ -250,7 +232,7 @@ if (!url) {
       expect((await failure(cancel(booked.booking.id))).code).toBe("not_cancellable");
     });
 
-    it("two concurrent cancels with different keys: exactly one succeeds, with exactly one cancelled event", async () => {
+    it("two concurrent cancels: exactly one succeeds, with exactly one cancelled event", async () => {
       setNow(time(3, 0, 9));
       const booked = await bookTrim(time(3, 1, 10));
       const results = await Promise.allSettled([cancel(booked.booking.id), cancel(booked.booking.id)]);
@@ -265,29 +247,26 @@ if (!url) {
       ]);
     });
 
-    it("two concurrent book calls with the same key: one hold, both get its id and link, and no owner alert", async () => {
+    it("two concurrent book calls for the same time: one hold, one slot_taken, and no owner alert", async () => {
       setNow(time(3, 0, 9));
       const alertsBefore = notifier.alerts.length;
-      const k = newKey();
       const start = time(3, 1, 14);
-      const [a, b] = await Promise.all([bookTrim(start, k), bookTrim(start, k)]);
-      expect(a.booking.id).toBe(b.booking.id);
-      expect(a.booking).toEqual(b.booking);
-      expect([a.replayed, b.replayed].sort()).toEqual([false, true]);
+      const results = await Promise.allSettled([bookTrim(start, "E2E A"), bookTrim(start, "E2E B")]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+      expect(rejected.map((r) => (r.reason as FrontDeskError).code)).toEqual(["slot_taken"]);
       expect((await store.listBookings(shop, dayRange(3, 1))).filter((x) => x.start === start)).toHaveLength(1);
-      expect(await eventsOf(a.booking.id)).toEqual([["booked", "agent"]]);
       expect(notifier.alerts.length - alertsBefore).toBe(0);
     });
 
-    // Regression: idempotent actions read the catalog through the key's transaction. If they used the
-    // root client instead, 10+ concurrent writes (postgres.js pools 10 connections) would each hold a
-    // connection for their transaction and wait forever for another one to read the catalog.
+    // Regression: more concurrent writes than postgres.js pools connections (10) must all settle, with
+    // no request holding a connection while it waits for another.
     const parallel: string[] = [];
 
-    it("12 concurrent book calls with different keys for 12 free starts all settle", { timeout: 15_000 }, async () => {
+    it("12 concurrent book calls for 12 free starts all settle", { timeout: 15_000 }, async () => {
       setNow(time(4, 0, 12));
       const starts = Array.from({ length: 12 }, (_, i) => time(4, 1, 9 + Math.floor(i / 2), (i % 2) * 30)); // 09:00 … 14:30
-      const results = await Promise.allSettled(starts.map((start, i) => bookTrim(start, newKey(), `E2E Parallel ${i}`)));
+      const results = await Promise.allSettled(starts.map((start, i) => bookTrim(start, `E2E Parallel ${i}`)));
       const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
       expect(failed.map((r) => String(r.reason))).toEqual([]);
       for (const r of results) if (r.status === "fulfilled") parallel.push(r.value.booking.id);

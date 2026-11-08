@@ -3,9 +3,7 @@ import {
   isWellFormedToken,
   last4,
   newApprovalToken,
-  newCode,
   normalizePhone,
-  sameDigest,
   sha256Hex,
 } from "./crypto";
 
@@ -52,24 +50,5 @@ describe("phone numbers", () => {
 
   it("last4 is the last four digits", () => {
     expect(last4("+14015550123")).toBe("0123");
-  });
-});
-
-describe("codes", () => {
-  it("are 6 digits, leading zeros kept, and vary", () => {
-    const codes = new Set<string>();
-    for (let i = 0; i < 500; i++) {
-      const code = newCode();
-      expect(code).toMatch(/^\d{6}$/);
-      codes.add(code);
-    }
-    expect(codes.size).toBeGreaterThan(450);
-  });
-
-  it("are compared by digest in constant time; malformed digests never match", () => {
-    expect(sameDigest(sha256Hex("123456"), sha256Hex("123456"))).toBe(true);
-    expect(sameDigest(sha256Hex("123456"), sha256Hex("123457"))).toBe(false);
-    expect(sameDigest("abc", "abc")).toBe(false);
-    expect(sameDigest(sha256Hex("1").toUpperCase(), sha256Hex("1"))).toBe(false);
   });
 });

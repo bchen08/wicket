@@ -1,8 +1,7 @@
 // Shared fixtures for Front Desk tests. Not imported by app code.
 import type { Booking, Policies } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
-import { approveBooking, sendApprovalCode } from "../consent/approvals";
-import type { CodeMessage, CodeSender } from "../consent/code-sender";
+import { approveBooking } from "../consent/approvals";
 import type { ConsentConfig } from "../consent/config";
 import { newApprovalToken, sha256Hex } from "../consent/crypto";
 import type { Notifier } from "../notify/notifier";
@@ -44,35 +43,16 @@ export const EXAMPLE_BOOKINGS: InitialBooking[] = [
   },
 ];
 
-/** The consent settings tests use: localhost links, no dev codes. */
-export const TEST_CONSENT: ConsentConfig = Object.freeze({
-  publicBaseUrl: "http://localhost:3000",
-  devCodes: false,
-});
-
-/** The Origin the approval POSTs must carry with TEST_CONSENT. */
-export const TEST_ORIGIN = "http://localhost:3000";
+/** The consent settings tests use: localhost links. */
+export const TEST_CONSENT: ConsentConfig = Object.freeze({ publicBaseUrl: "http://localhost:3000" });
 
 /** A test phone number (E.164) and another one. */
 export const PHONE_E164 = "+14015550123";
 export const OTHER_PHONE_E164 = "+14015550199";
 
-/** A code sender that remembers every code it was asked to send. */
-export function recordingCodeSender(): CodeSender & { sent: CodeMessage[] } {
-  const sent: CodeMessage[] = [];
-  return {
-    sent,
-    async send(message) {
-      sent.push({ ...message });
-    },
-  };
-}
-
-/** `base` with the Ring 1b consent deps (TEST_CONSENT and a recording code sender) unless it has them. */
-export function withConsent(
-  base: Omit<FrontDeskDeps, "consent" | "codeSender"> & Partial<Pick<FrontDeskDeps, "consent" | "codeSender">>,
-): FrontDeskDeps {
-  return { consent: TEST_CONSENT, codeSender: recordingCodeSender(), ...base };
+/** `base` with the Ring 1b consent deps (TEST_CONSENT) unless it has them. */
+export function withConsent(base: Omit<FrontDeskDeps, "consent"> & Partial<Pick<FrontDeskDeps, "consent">>): FrontDeskDeps {
+  return { consent: TEST_CONSENT, ...base };
 }
 
 /** The consent fields createBooking needs, for tests that call the store directly. */
@@ -87,23 +67,13 @@ export function approvalToken(booking: Booking): string {
   return url.slice(url.lastIndexOf("/") + 1);
 }
 
-/** The last code `deps.codeSender` was asked to send (it must be a recordingCodeSender). */
-export function lastSentCode(deps: FrontDeskDeps): string {
-  const sent = (deps.codeSender as Partial<ReturnType<typeof recordingCodeSender>>).sent;
-  const last = sent?.at(-1);
-  if (!last) throw new Error("No code was sent (or deps.codeSender doesn't record).");
-  return last.code;
-}
-
 /**
- * Approve a booking the way the person would, through the approval API's use cases: send a code to
- * `phone`, then approve with it. `booking` must be book's result (it carries the link). Returns the
- * confirmed booking.
+ * Approve a booking the way the person would, through the approval use case: open the link and
+ * approve, giving `phone` (none when null). `booking` must be book's result (it carries the link).
+ * Returns the confirmed booking.
  */
-export async function approveAsCustomer(deps: FrontDeskDeps, booking: Booking, phone = PHONE_E164): Promise<Booking> {
-  const token = approvalToken(booking);
-  await sendApprovalCode(deps, token, { phone });
-  return (await approveBooking(deps, token, { code: lastSentCode(deps) })).booking;
+export async function approveAsCustomer(deps: FrontDeskDeps, booking: Booking, phone: string | null = PHONE_E164): Promise<Booking> {
+  return (await approveBooking(deps, approvalToken(booking), phone === null ? {} : { phone })).booking;
 }
 
 /** A notifier that remembers what it was told. */
@@ -118,10 +88,8 @@ export function recordingNotifier(): Notifier & { alerts: Booking[] } {
 }
 
 /**
- * `deps` with some catalog methods replaced, both where use cases read deps.catalog and inside
- * idempotent actions (book, cancel), which read the catalog through the store they're given.
- * `overrides` gets the catalog it replaces methods on; close over shared state (e.g. a counter)
- * outside it.
+ * `deps` with some catalog methods replaced where use cases read deps.catalog. `overrides` gets the
+ * catalog it replaces methods on; close over shared state (e.g. a counter) outside it.
  */
 export function withCatalog(
   deps: FrontDeskDeps,
@@ -130,17 +98,13 @@ export function withCatalog(
   return {
     ...deps,
     catalog: { ...deps.catalog, ...overrides(deps.catalog) },
-    store: {
-      ...deps.store,
-      idempotent: (scope, action) => deps.store.idempotent(scope, (tx) => action({ ...tx, ...overrides(tx) })),
-    },
   };
 }
 
 /**
  * Deps backed by a fresh in-memory store and a fixed clock. `policies` is merged over Hart's seeded
  * policies; `initialBookings` and `initialBlocks` exist before the first call. Consent: TEST_CONSENT
- * (merged with `consent`) and a recording code sender.
+ * (merged with `consent`).
  */
 export function memoryDeps(
   options: {
@@ -150,7 +114,6 @@ export function memoryDeps(
     policies?: Partial<Policies>;
     initialBlocks?: NewBlock[];
     consent?: Partial<ConsentConfig>;
-    codeSender?: CodeSender;
   } = {},
 ): FrontDeskDeps {
   const clock = options.clock ?? fixedClock(NOW);
@@ -166,6 +129,5 @@ export function memoryDeps(
     store,
     notifier: options.notifier ?? recordingNotifier(),
     consent: { ...TEST_CONSENT, ...options.consent },
-    codeSender: options.codeSender ?? recordingCodeSender(),
   };
 }

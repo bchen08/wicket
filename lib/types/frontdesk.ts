@@ -50,16 +50,11 @@ export type Slot = {
  * - `paused`: the owner paused bookings. details.phone is the shop's phone number (or null).
  * - `booking_not_found`: no booking with that id at this shop.
  * - `not_cancellable`: the booking is already final, or its start has passed. details.status.
- * - `idempotency_conflict`: the idempotency_key was already used with different arguments.
  * - `unauthorized`: an owner route without a valid `Authorization: Bearer` token.
  * - `outside_mandate`: book refused a booking outside the person's mandate. details.field is
  *   "price_cap", "deposit_cap" or "window".
  * - `approval_expired`: the 10-minute hold lapsed before the person approved; the slot is free again.
  * - `approval_closed`: the approval request was already answered, or the booking was cancelled.
- * - `code_invalid`: the phone code is wrong (details.attemptsLeft), already used, or none was sent yet.
- * - `code_expired`: the phone code is more than 10 minutes old. Request a new one.
- * - `too_many_attempts`: 5 wrong codes for one code request. Request a new code.
- * - `rate_limited`: too many code requests. details.retryAfter is in seconds.
  * - `internal`: our fault; retry once.
  */
 export type ApiErrorCode =
@@ -72,15 +67,10 @@ export type ApiErrorCode =
   | "paused"
   | "booking_not_found"
   | "not_cancellable"
-  | "idempotency_conflict"
   | "unauthorized"
   | "outside_mandate"
   | "approval_expired"
   | "approval_closed"
-  | "code_invalid"
-  | "code_expired"
-  | "too_many_attempts"
-  | "rate_limited"
   | "internal";
 
 /** Error envelope returned by every Front Desk API surface. */
@@ -252,7 +242,7 @@ export type BookingEvent = {
   type: BookingEventType;
   /**
    * Specifics. `booked`: { status, agentName, mandate? }. A transition: { from, to, depositEffect,
-   * depositCollected }; `approved` adds phoneLast4.
+   * depositCollected }; `approved` adds phoneLast4 when the person gave a phone number.
    */
   data: Record<string, unknown>;
 };
@@ -292,9 +282,9 @@ export type Booking = {
   customer: {
     /** The name the agent gave for the customer. */
     displayName: string;
-    /** true once the person approved the booking with a code sent to their phone. */
+    /** true once the person approved the booking through the approval link. */
     verified: boolean;
-    /** Last 4 digits of the verified phone number, e.g. "0123". Present only when verified. */
+    /** Last 4 digits of the phone number the person gave when approving, e.g. "0123". Absent if they gave none. */
     phoneLast4?: string;
   };
   agent: {
@@ -312,7 +302,7 @@ export type Booking = {
    * never include it.
    */
   approval?: {
-    /** `${PUBLIC_BASE_URL}/approve/<token>`. Send it to the person; anyone holding it can answer. */
+    /** `${PUBLIC_BASE_URL}/approve/<token>`. Send it to the person; anyone holding it can approve or decline. */
     url: string;
     /** When the hold lapses (book time + 10 minutes), RFC 3339 with the shop's offset. */
     expiresAt: string;
@@ -327,11 +317,6 @@ export type BookInput = {
   start: string;
   /** Who the booking is for, 1–80 characters after trimming. */
   customer_name: string;
-  /**
-   * 8–128 visible ASCII characters, no spaces. A fresh UUID per intended booking. Retrying with the same key
-   * and the same arguments returns the first result instead of booking twice.
-   */
-  idempotency_key: string;
   /** The person's limits. The server refuses a booking outside them (outside_mandate). Optional for now. */
   mandate?: Mandate;
 };
@@ -356,8 +341,6 @@ export type GetBookingResult = {
 export type CancelInput = {
   /** A Booking.id (UUID) from book. */
   booking_id: string;
-  /** Like BookInput.idempotency_key: a fresh UUID per intended cancellation. */
-  idempotency_key: string;
 };
 
 /**
@@ -466,9 +449,9 @@ export type BookingDetailResponse = {
 };
 
 // ---- Approval page (public; the token in the path is the credential) ----
-// The page at /approve/[token] reads ApprovalView, asks for the person's phone number, sends a code
-// (SendCodeRequest), then approves (ApproveRequest) or declines. Every POST must carry an Origin header
-// equal to PUBLIC_BASE_URL's origin (the page's own origin), or it gets 403 invalid_request.
+// The page at /approve/[token] reads ApprovalView, then approves (ApproveRequest, optionally with the
+// person's phone number) or declines. Opening the link and tapping Approve is the consent.
+// TODO(ring-1c): a code texted to the person's phone comes back once real texting ships.
 
 /**
  * GET /api/approvals/[token]. Unknown token → 404 booking_not_found.
@@ -502,42 +485,22 @@ export type ApprovalView = {
   mandate?: Mandate;
   /** When the hold lapses, RFC 3339 with the shop's offset. */
   expiresAt: string;
-  /**
-   * Last 4 digits of the phone the latest code went to, while that code can still be used (unexpired,
-   * unused, attempts left). Absent otherwise.
-   */
-  codeSentTo?: string;
 };
 
 /**
- * POST /api/approvals/[token]/code body. Only while the approval is pending. Spaces, dashes, dots and
- * parentheses are ignored. Limits: 3 codes per phone number per hour, 10 per link per hour
- * (rate_limited, details.retryAfter in seconds). A new code replaces the previous one.
- */
-export type SendCodeRequest = {
-  /** E.164, e.g. "+14015550123". */
-  phone: string;
-};
-
-/** POST /api/approvals/[token]/code response. */
-export type SendCodeResponse = {
-  /** Last 4 digits of the phone the code went to, e.g. "0123". */
-  sentTo: string;
-  /** When the code stops working (10 minutes after sending), RFC 3339 with the shop's offset. */
-  expiresAt: string;
-  /** The code itself, only on local demos (FRONTDESK_DEV_CODES=1 outside Vercel production). Never in production. */
-  devCode?: string;
-};
-
-/**
- * POST /api/approvals/[token]/approve body. The 6 digits of the latest code. 5 attempts per code
- * (then too_many_attempts: request a new one); a code works once and for 10 minutes.
+ * POST /api/approvals/[token]/approve body. Optional: an empty body (or none) approves too. Only while
+ * the approval is pending.
  */
 export type ApproveRequest = {
-  code: string;
+  /**
+   * The person's phone number, E.164, e.g. "+14015550123" (spaces, dashes, dots and parentheses are
+   * ignored). Stored with the booking for the shop; not verified. Booking.customer.phoneLast4 shows its
+   * last 4 digits.
+   */
+  phone?: string;
 };
 
-/** POST /api/approvals/[token]/approve response: the booking, now confirmed with a verified customer. */
+/** POST /api/approvals/[token]/approve response: the booking, now confirmed (customer.verified true). */
 export type ApproveResponse = {
   booking: Booking;
 };

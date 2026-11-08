@@ -1,10 +1,8 @@
-import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
-// The secrets of the consent flow and how they're stored.
-//   approval token: 32 random bytes, base64url, in the link; stored as SHA-256 hex.
-//   code:           6 random digits, texted to the phone; stored as SHA-256 hex.
-//   phone number:   E.164, stored as it is (an MVP decision; no hashing).
-// None of them is ever logged.
+// The approval link's token and the person's phone number.
+//   approval token: 32 random bytes, base64url, in the link; stored as SHA-256 hex. Never logged.
+//   phone number:   optional, given on approve; E.164, stored as it is (an MVP decision; no hashing).
 
 /** SHA-256 of `value` (UTF-8), hex. */
 export function sha256Hex(value: string): string {
@@ -21,18 +19,6 @@ const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 
 export function isWellFormedToken(token: string): boolean {
   return TOKEN.test(token);
-}
-
-/** A new 6-digit code, uniformly random (leading zeros kept), from crypto.randomInt. */
-export function newCode(): string {
-  return randomInt(0, 1_000_000).toString().padStart(6, "0");
-}
-
-/** Two SHA-256 hex digests compared in constant time. False if either isn't 64 hex characters. */
-export function sameDigest(aHex: string, bHex: string): boolean {
-  const HEX64 = /^[0-9a-f]{64}$/;
-  if (!HEX64.test(aHex) || !HEX64.test(bHex)) return false;
-  return timingSafeEqual(Buffer.from(aHex, "hex"), Buffer.from(bHex, "hex"));
 }
 
 /** Characters people type in phone numbers that E.164 doesn't have. */

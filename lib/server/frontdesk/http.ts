@@ -41,33 +41,23 @@ export const STATUS: Record<ApiErrorCode, number> = {
   slot_taken: 409,
   paused: 409,
   not_cancellable: 409,
-  idempotency_conflict: 409,
   outside_hours: 422,
   too_soon: 422,
   too_far: 422,
   outside_mandate: 422,
   approval_closed: 409,
   approval_expired: 410,
-  code_invalid: 422,
-  code_expired: 410,
-  too_many_attempts: 429,
-  rate_limited: 429,
   internal: 500,
 };
 
 // Live data that may include customer names: never cache it anywhere.
 export const NO_STORE = { "cache-control": "no-store" };
 
-/**
- * Any thrown value as an ApiError response with a matching status. Unexpected errors are logged.
- * rate_limited also carries a Retry-After header (details.retryAfter, in seconds).
- */
+/** Any thrown value as an ApiError response with a matching status. Unexpected errors are logged. */
 export function errorResponse(err: unknown): Response {
   const body = toApiError(err);
   if (body.error.code === "internal") console.error("[frontdesk/http] internal error", err);
-  const retryAfter = body.error.code === "rate_limited" ? body.error.details?.retryAfter : undefined;
-  const headers = typeof retryAfter === "number" ? { ...NO_STORE, "retry-after": String(retryAfter) } : NO_STORE;
-  return Response.json(body, { status: STATUS[body.error.code], headers });
+  return Response.json(body, { status: STATUS[body.error.code], headers: NO_STORE });
 }
 
 /** Run a use case and answer JSON (`status` on success), or the ApiError envelope. */

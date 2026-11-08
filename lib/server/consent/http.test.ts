@@ -1,97 +1,60 @@
 import { describe, expect, it } from "vitest";
-import type { ApiError, ApprovalView, ApproveResponse, DeclineResponse, SendCodeResponse } from "../../types/frontdesk";
+import type { ApiError, ApprovalView, ApproveResponse, DeclineResponse } from "../../types/frontdesk";
 import { book, type FrontDeskDeps } from "../frontdesk/service";
-import { approvalToken, lastSentCode, memoryDeps, PHONE_E164, TEST_ORIGIN } from "../frontdesk/test-support";
-import { approvalApprovePost, approvalCodePost, approvalDeclinePost, approvalGet } from "./http";
+import { approvalToken, memoryDeps, PHONE_E164, recordingNotifier } from "../frontdesk/test-support";
+import { approvalApprovePost, approvalDeclinePost, approvalGet } from "./http";
 
 // The approval routes' HTTP handlers (what app/api/approvals/[token]/* call), on in-memory deps.
 
 const SAT_1400 = "2026-11-14T14:00:00-05:00";
+const BASE = "http://localhost:3000";
 
-async function setup(consent: Partial<FrontDeskDeps["consent"]> = {}) {
-  const deps = memoryDeps({ consent });
-  const { booking } = await book(
-    deps,
-    "harts",
-    { service_id: "haircut", start: SAT_1400, customer_name: "Maya", idempotency_key: crypto.randomUUID() },
-    "Claude",
-  );
-  return { deps, getDeps: () => deps, token: approvalToken(booking), booking };
+async function setup() {
+  const notifier = recordingNotifier();
+  const deps = memoryDeps({ notifier });
+  const { booking } = await book(deps, "harts", { service_id: "haircut", start: SAT_1400, customer_name: "Maya" }, "Claude");
+  return { deps, getDeps: () => deps, token: approvalToken(booking), booking, notifier };
 }
 
-function post(token: string, path: "code" | "approve" | "decline", body?: unknown, origin: string | null = TEST_ORIGIN): Request {
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (origin !== null) headers.origin = origin;
-  return new Request(`${TEST_ORIGIN}/api/approvals/${token}/${path}`, {
+/** A POST to an approval route. `body` undefined sends no body; a string is sent as is. */
+function post(token: string, path: "approve" | "decline", body?: unknown, headers: Record<string, string> = {}): Request {
+  return new Request(`${BASE}/api/approvals/${token}/${path}`, {
     method: "POST",
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
+    headers: body === undefined ? headers : { "content-type": "application/json", ...headers },
+    body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
   });
 }
-
-describe("approval routes: Origin check (CSRF)", () => {
-  it.each([
-    ["no Origin header", null],
-    ["another site", "https://evil.example"],
-    ["another port", "http://localhost:3001"],
-    ["https instead of http", "https://localhost:3000"],
-    ["the string null", "null"],
-  ])("refuses a POST with %s: 403 invalid_request, and changes nothing", async (_label, origin) => {
-    const { getDeps, token, deps } = await setup();
-    for (const [path, body] of [
-      ["code", { phone: PHONE_E164 }],
-      ["approve", { code: "123456" }],
-      ["decline", undefined],
-    ] as const) {
-      const res = await (path === "code" ? approvalCodePost : path === "approve" ? approvalApprovePost : approvalDeclinePost)(
-        getDeps,
-        post(token, path, body, origin),
-        token,
-      );
-      expect(res.status, path).toBe(403);
-      expect(res.headers.get("cache-control")).toBe("no-store");
-      const json = (await res.json()) as ApiError;
-      expect(json.error).toMatchObject({ code: "invalid_request", details: { field: "origin" } });
-      expect(json.error.next_action).toMatch(/approval link/);
-    }
-    expect(((await (await approvalGet(getDeps, token)).json()) as ApprovalView).status).toBe("pending");
-    expect((deps.codeSender as unknown as { sent: unknown[] }).sent).toHaveLength(0);
-  });
-
-  it("accepts PUBLIC_BASE_URL's origin, even when the base URL has a path", async () => {
-    const { getDeps, token } = await setup({ publicBaseUrl: "https://frontdesk.example.com/app" });
-    const res = await approvalCodePost(getDeps, post(token, "code", { phone: PHONE_E164 }, "https://frontdesk.example.com"), token);
-    expect(res.status).toBe(200);
-  });
-
-  it("GET needs no Origin", async () => {
-    const { getDeps, token } = await setup();
-    const res = await approvalGet(getDeps, token);
-    expect(res.status).toBe(200);
-    expect(res.headers.get("cache-control")).toBe("no-store");
-  });
-});
 
 describe("approval routes: the flow over HTTP", () => {
-  it("GET view → POST code (devCode with dev codes on) → POST approve → 200 confirmed", async () => {
-    const { getDeps, token, booking } = await setup({ devCodes: true });
-    expect(((await (await approvalGet(getDeps, token)).json()) as ApprovalView).status).toBe("pending");
+  it("GET view → POST approve with no body → 200 confirmed, verified, no phone; the owner is alerted once", async () => {
+    const { getDeps, token, booking, notifier } = await setup();
+    const view = await approvalGet(getDeps, token);
+    expect(view.status).toBe(200);
+    expect(view.headers.get("cache-control")).toBe("no-store");
+    const viewBody = (await view.json()) as ApprovalView;
+    expect(viewBody.status).toBe("pending");
+    expect(viewBody).not.toHaveProperty("codeSentTo");
 
-    const sent = await approvalCodePost(getDeps, post(token, "code", { phone: PHONE_E164 }), token);
-    expect(sent.status).toBe(200);
-    const sentBody = (await sent.json()) as SendCodeResponse;
-    expect(sentBody).toEqual({ sentTo: "0123", expiresAt: "2026-11-09T12:10:00-05:00", devCode: expect.stringMatching(/^\d{6}$/) });
-
-    const approved = await approvalApprovePost(getDeps, post(token, "approve", { code: sentBody.devCode }), token);
-    expect(approved.status).toBe(200);
-    const body = (await approved.json()) as ApproveResponse;
-    expect(body.booking).toMatchObject({ id: booking.id, status: "confirmed", customer: { verified: true, phoneLast4: "0123" } });
+    const res = await approvalApprovePost(getDeps, post(token, "approve"), token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const { booking: approved } = (await res.json()) as ApproveResponse;
+    expect(approved).toMatchObject({ id: booking.id, status: "confirmed", customer: { displayName: "Maya", verified: true } });
+    expect(approved.customer).not.toHaveProperty("phoneLast4");
+    expect(notifier.alerts).toHaveLength(1);
+    expect(((await (await approvalGet(getDeps, token)).json()) as ApprovalView).status).toBe("approved");
   });
 
-  it("no devCode without dev codes", async () => {
-    const { getDeps, token } = await setup();
-    const body = (await (await approvalCodePost(getDeps, post(token, "code", { phone: PHONE_E164 }), token)).json()) as SendCodeResponse;
-    expect(body).not.toHaveProperty("devCode");
+  it("POST approve with {} or a phone (separators ignored) → 200; phoneLast4 only with a phone", async () => {
+    const empty = await setup();
+    const res = await approvalApprovePost(empty.getDeps, post(empty.token, "approve", {}), empty.token);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as ApproveResponse).booking.customer).toEqual({ displayName: "Maya", verified: true });
+
+    const withPhone = await setup();
+    const res2 = await approvalApprovePost(withPhone.getDeps, post(withPhone.token, "approve", { phone: "+1 (401) 555-0123" }), withPhone.token);
+    expect(res2.status).toBe(200);
+    expect(((await res2.json()) as ApproveResponse).booking.customer).toEqual({ displayName: "Maya", verified: true, phoneLast4: "0123" });
   });
 
   it("POST decline → 200 cancelled; again → 409 approval_closed", async () => {
@@ -103,59 +66,89 @@ describe("approval routes: the flow over HTTP", () => {
     expect(again.status).toBe(409);
     expect(((await again.json()) as ApiError).error.code).toBe("approval_closed");
   });
+
+  it("accepts POSTs whatever the Origin header says, or without one (there is no Origin check)", async () => {
+    for (const origin of [undefined, "https://evil.example", "null", "http://localhost:3001"]) {
+      const { getDeps, token } = await setup();
+      const headers: Record<string, string> = origin === undefined ? {} : { origin };
+      const res = await approvalApprovePost(getDeps, post(token, "approve", { phone: PHONE_E164 }, headers), token);
+      expect(res.status, String(origin)).toBe(200);
+    }
+    const { getDeps, token } = await setup();
+    expect((await approvalDeclinePost(getDeps, post(token, "decline", undefined, { origin: "https://evil.example" }), token)).status).toBe(200);
+  });
 });
 
 describe("approval routes: errors and status codes", () => {
-  it("unknown token → 404 booking_not_found", async () => {
+  it("unknown token → 404 booking_not_found, on GET and both POSTs", async () => {
     const { getDeps } = await setup();
-    const res = await approvalGet(getDeps, "A".repeat(43));
-    expect(res.status).toBe(404);
-    expect(((await res.json()) as ApiError).error.code).toBe("booking_not_found");
+    const token = "A".repeat(43);
+    for (const res of [
+      await approvalGet(getDeps, token),
+      await approvalApprovePost(getDeps, post(token, "approve"), token),
+      await approvalDeclinePost(getDeps, post(token, "decline"), token),
+    ]) {
+      expect(res.status).toBe(404);
+      expect(((await res.json()) as ApiError).error.code).toBe("booking_not_found");
+    }
   });
 
-  it("an empty or non-JSON body → 400 invalid_request", async () => {
+  it("approve: a body that isn't JSON or isn't an object → 400 invalid_request (field body); a bad phone → 400 (field phone, not echoed)", async () => {
     const { getDeps, token } = await setup();
-    const empty = await approvalCodePost(getDeps, post(token, "code"), token);
-    expect(empty.status).toBe(400);
-    const broken = new Request(`${TEST_ORIGIN}/x`, { method: "POST", headers: { origin: TEST_ORIGIN }, body: "{" });
-    expect((await approvalApprovePost(getDeps, broken, token)).status).toBe(400);
+    const broken = await approvalApprovePost(getDeps, post(token, "approve", "{"), token);
+    expect(broken.status).toBe(400);
+    expect(((await broken.json()) as ApiError).error).toMatchObject({ code: "invalid_request", details: { field: "body" } });
+
+    const notObject = await approvalApprovePost(getDeps, post(token, "approve", "[1]"), token);
+    expect(notObject.status).toBe(400);
+    expect(((await notObject.json()) as ApiError).error).toMatchObject({ code: "invalid_request", details: { field: "body" } });
+
+    const badPhone = await approvalApprovePost(getDeps, post(token, "approve", { phone: "6175559876" }), token);
+    expect(badPhone.status).toBe(400);
+    const body = (await badPhone.json()) as ApiError;
+    expect(body.error).toMatchObject({ code: "invalid_request", details: { field: "phone" } });
+    expect(JSON.stringify(body)).not.toContain("6175559876");
+
+    // Nothing was approved by the failed attempts.
+    expect(((await (await approvalGet(getDeps, token)).json()) as ApprovalView).status).toBe("pending");
   });
 
-  it("a wrong code → 422 code_invalid; the 5th → 429 too_many_attempts", async () => {
-    const { getDeps, token, deps } = await setup();
-    await approvalCodePost(getDeps, post(token, "code", { phone: PHONE_E164 }), token);
-    const wrong = lastSentCode(deps) === "000000" ? "111111" : "000000";
-    const statuses: number[] = [];
-    for (let i = 0; i < 5; i++) statuses.push((await approvalApprovePost(getDeps, post(token, "approve", { code: wrong }), token)).status);
-    expect(statuses).toEqual([422, 422, 422, 422, 429]);
-  });
-
-  it("rate_limited → 429 with a Retry-After header matching details.retryAfter", async () => {
+  it("decline ignores its body, even malformed", async () => {
     const { getDeps, token } = await setup();
-    for (let i = 0; i < 3; i++) await approvalCodePost(getDeps, post(token, "code", { phone: PHONE_E164 }), token);
-    const res = await approvalCodePost(getDeps, post(token, "code", { phone: PHONE_E164 }), token);
-    expect(res.status).toBe(429);
-    const body = (await res.json()) as ApiError;
-    expect(body.error.code).toBe("rate_limited");
-    expect(res.headers.get("retry-after")).toBe(String(body.error.details?.retryAfter));
-    expect(body.error.details?.retryAfter).toBe(3600);
+    expect((await approvalDeclinePost(getDeps, post(token, "decline", "{not json"), token)).status).toBe(200);
+  });
+
+  it("approved, then approve or decline again → 409 approval_closed", async () => {
+    const { getDeps, token } = await setup();
+    expect((await approvalApprovePost(getDeps, post(token, "approve"), token)).status).toBe(200);
+    for (const res of [
+      await approvalApprovePost(getDeps, post(token, "approve"), token),
+      await approvalDeclinePost(getDeps, post(token, "decline"), token),
+    ]) {
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as ApiError).error.code).toBe("approval_closed");
+    }
   });
 
   it("a lapsed hold → 410 approval_expired", async () => {
     const { token, deps } = await setup();
     // The same store, with the clock 10 minutes on.
     const moved: FrontDeskDeps = { ...deps, clock: { now: () => new Date(deps.clock.now().getTime() + 10 * 60_000) } };
-    const res = await approvalCodePost(() => moved, post(token, "code", { phone: PHONE_E164 }), token);
-    expect(res.status).toBe(410);
-    expect(((await res.json()) as ApiError).error.code).toBe("approval_expired");
+    for (const res of [
+      await approvalApprovePost(() => moved, post(token, "approve"), token),
+      await approvalDeclinePost(() => moved, post(token, "decline"), token),
+    ]) {
+      expect(res.status).toBe(410);
+      expect(((await res.json()) as ApiError).error.code).toBe("approval_expired");
+    }
   });
 
-  it("a configuration error → 500 internal, before the Origin is checked", async () => {
-    const res = await approvalCodePost(
+  it("a configuration error → 500 internal, without leaking it", async () => {
+    const res = await approvalApprovePost(
       () => {
         throw new Error("DATABASE_URL is not set");
       },
-      post("x".repeat(43), "code", { phone: PHONE_E164 }, null),
+      post("x".repeat(43), "approve"),
       "x".repeat(43),
     );
     expect(res.status).toBe(500);

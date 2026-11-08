@@ -8,7 +8,7 @@ import type {
   Mandate,
 } from "../../types/frontdesk";
 import { formatDisplay } from "../engine/availability";
-import type { ShopCatalog, TimeRange } from "./catalog";
+import type { TimeRange } from "./catalog";
 import { toRfc3339 } from "./time";
 
 // Data access for bookings. Implementations: postgres-store.ts and memory-store.ts.
@@ -47,46 +47,6 @@ export type ApprovalRecord = {
   mandate: Mandate | null;
 };
 
-/** A 6-digit code sent to a phone for an approval. Times come from Front Desk's clock. */
-export type ChallengeRecord = {
-  /** Increasing: the latest code for a booking has the highest id. */
-  id: string;
-  bookingId: string;
-  /** The number the code was sent to, E.164. */
-  phone: string;
-  /** SHA-256 of the code, hex. */
-  codeHash: string;
-  expiresAt: Date;
-  /** Approve attempts made against this code so far. */
-  attempts: number;
-  consumedAt: Date | null;
-  createdAt: Date;
-};
-
-/** What createChallenge stores, and the send limits it enforces. */
-export type NewChallenge = {
-  bookingId: string;
-  /** E.164. */
-  phone: string;
-  codeHash: string;
-  expiresAt: Date;
-  /** Front Desk's clock: the new row's created_at, and the end of the limit window. */
-  now: Date;
-  limits: {
-    /** Most codes per phone number in the window, across all bookings. */
-    perPhone: number;
-    /** Most codes per booking (i.e. per approval link) in the window. */
-    perBooking: number;
-    /** The sliding window, in milliseconds. */
-    windowMs: number;
-  };
-};
-
-export type CreateChallengeResult =
-  | { ok: true; challenge: ChallengeRecord }
-  /** A limit is reached: nothing was stored. retryAfterMs: until the oldest send in the window ages out. */
-  | { ok: false; limit: "phone" | "booking"; retryAfterMs: number };
-
 /** What answerApproval writes. */
 export type ApprovalAnswer = {
   bookingId: string;
@@ -97,20 +57,17 @@ export type ApprovalAnswer = {
   now: Date;
   /** The event to write (actor "customer"). */
   event: NewBookingEvent;
-  /** approved only: the code that proved the phone. It's consumed in the same transaction. */
-  challengeId?: string;
-  /** approved only: who the person is, upserted by phone (E.164) and linked to the booking. */
-  customer?: { phone: string; displayName: string };
+  /** approved only: the phone number the person gave (E.164), stored on the booking. null: none given. */
+  phone?: string | null;
 };
 
 export type AnswerApprovalResult =
   | { ok: true; booking: Booking }
   /**
-   * Nothing was written. Checked in this order: `not_pending` if the approval was already decided;
-   * `code_used` if the challenge was already consumed (or isn't this booking's); `not_pending` if the
-   * booking is no longer awaiting_approval or its hold lapsed.
+   * Nothing was written: the approval was already decided, or the booking is no longer
+   * awaiting_approval, or its hold lapsed.
    */
-  | { ok: false; reason: "code_used" | "not_pending" };
+  | { ok: false; reason: "not_pending" };
 
 /** The event a transition writes. The store stamps `at` (Postgres now(), the memory store's clock). */
 export type NewBookingEvent = {
@@ -118,28 +75,6 @@ export type NewBookingEvent = {
   type: BookingEventType;
   data: Record<string, unknown>;
 };
-
-/** The write tools that take an idempotency key. Keys are scoped per tool. */
-export type IdempotentTool = "book" | "cancel";
-
-export type IdempotencyScope = {
-  /** The caller's idempotency_key, already validated (8–128 visible ASCII characters). */
-  key: string;
-  tool: IdempotentTool;
-  /** sha256 hex of the normalized arguments (see lib/server/frontdesk/idempotency.ts). */
-  requestHash: string;
-};
-
-/** How long a key is remembered. After this it may be reused. TODO(ring-2): a job that deletes old keys. */
-export const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
-
-/**
- * What an idempotent action works with: the bookings AND the shop catalog, both bound to the
- * idempotency transaction in Postgres. The action must read through it (not deps.catalog): reads on
- * the root client would each need a second pooled connection while the transaction holds one, so
- * as many concurrent writes as the pool has connections could wait on each other forever.
- */
-export type IdempotentStore = BookingStore & ShopCatalog;
 
 export interface BookingStore {
   /**
@@ -167,8 +102,7 @@ export interface BookingStore {
   /**
    * Lazy expiry for a time range: every awaiting_approval booking of the shop overlapping `range` with
    * approve_by <= now becomes expired, each with an "expired" event, in one statement. Returns how
-   * many expired. book calls it inside its transaction before inserting, so a lapsed hold never blocks
-   * a new booking.
+   * many expired. book calls it just before inserting, so a lapsed hold never blocks a new booking.
    */
   expireStaleHolds(shopSlug: string, range: TimeRange, now: Date): Promise<number>;
   /**
@@ -189,50 +123,15 @@ export interface BookingStore {
   ): Promise<Booking | null>;
   /** A booking's events, oldest first (by at, then id). Empty if there are none. */
   listEvents(bookingId: string): Promise<BookingEvent[]>;
-  /**
-   * Run `action` at most once per (scope.key, scope.tool) within IDEMPOTENCY_TTL_MS.
-   * - New key (or one older than the TTL): runs `action(store)`. If it resolves, its result is saved
-   *   with requestHash and returned with replayed: false. If it throws, nothing is saved and the
-   *   error propagates, so a retry runs the action again.
-   * - Same key, same requestHash: returns a JSON copy of the saved result with replayed: true, without
-   *   running `action`.
-   * - Same key, different requestHash: throws FrontDeskError("idempotency_conflict").
-   * Concurrent calls with the same key are serialized: the second waits for the first to finish,
-   * then replays (or, if the first threw, runs). `T` must survive a JSON round trip.
-   * Postgres: one transaction; `action` gets a store (bookings and catalog) bound to it, so the
-   * action's writes commit or roll back together with the key, and its reads use the connection the
-   * transaction already holds (see IdempotentStore).
-   */
-  idempotent<T>(
-    scope: IdempotencyScope,
-    action: (store: IdempotentStore) => Promise<T>,
-  ): Promise<{ result: T; replayed: boolean }>;
-
-  // ---- Ring 1b: consent (approvals, codes, customers) ----
+  // ---- Ring 1b: consent (approvals) ----
 
   /** The approval request whose token hashes to `tokenHash`, or null. Doesn't expire anything. */
   findApproval(tokenHash: string): Promise<ApprovalRecord | null>;
-  /** The booking's latest code (highest id), or null if none was sent. */
-  latestChallenge(bookingId: string): Promise<ChallengeRecord | null>;
   /**
-   * Store a new code, unless a send limit is reached: at most limits.perPhone codes for this
-   * phone and limits.perBooking for this booking with created_at in (now − windowMs, now]. The
-   * count and the insert are atomic per booking and per phone (Postgres: the approval row is locked,
-   * plus an advisory lock on the phone), so concurrent sends can't exceed a limit.
-   */
-  createChallenge(input: NewChallenge): Promise<CreateChallengeResult>;
-  /**
-   * Count one approve attempt against a code, atomically, only while it's usable: not consumed,
-   * expires_at > now, and attempts < maxAttempts. Returns the attempts after counting this one, or null
-   * (nothing counted) if it wasn't usable.
-   */
-  recordCodeAttempt(challengeId: string, now: Date, maxAttempts: number): Promise<number | null>;
-  /**
-   * The person's answer, in one transaction: (approved) consume the challenge if it's still unconsumed,
-   * upsert the customer by phone (display_name updated) and link it to the booking;
-   * move the booking from awaiting_approval to nextStatus only if approve_by > now (cancelled stamps
-   * cancelled_at and cancelled_by "customer"); write `event`; and mark the approval decided (decision,
-   * decided_at = now) only if it wasn't. Anything that doesn't match rolls everything back.
+   * The person's answer, in one transaction: move the booking from awaiting_approval to nextStatus only
+   * if approve_by > now (approved stores `phone` as customer_phone; cancelled stamps cancelled_at and
+   * cancelled_by "customer"); write `event`; and mark the approval decided (decision, decided_at = now)
+   * only if it wasn't. Anything that doesn't match rolls everything back.
    */
   answerApproval(input: ApprovalAnswer): Promise<AnswerApprovalResult>;
 }
@@ -275,8 +174,10 @@ export type BookingRecord = {
   customerName: string;
   agentName: string;
   createdAt: Date;
-  /** The last 4 digits of the verified customer's phone, or null if nobody has approved the booking. */
-  customerPhoneLast4: string | null;
+  /** true once the person approved the booking through the approval link (approvals.decision = approved). */
+  customerVerified: boolean;
+  /** The phone number the person gave when approving (E.164), or null. */
+  customerPhone: string | null;
   /** The shop's IANA zone; times are shown in it. */
   timezone: string;
 };
@@ -292,10 +193,11 @@ export function toBooking(r: BookingRecord): Booking {
     end: toRfc3339(r.end, r.timezone),
     display: formatDisplay(DateTime.fromJSDate(r.start, { zone: r.timezone })),
     status: r.status,
-    customer:
-      r.customerPhoneLast4 === null
-        ? { displayName: r.customerName, verified: false }
-        : { displayName: r.customerName, verified: true, phoneLast4: r.customerPhoneLast4 },
+    customer: {
+      displayName: r.customerName,
+      verified: r.customerVerified,
+      ...(r.customerPhone ? { phoneLast4: r.customerPhone.slice(-4) } : {}),
+    },
     agent: { name: r.agentName },
     depositCents: r.depositCents,
     createdAt: toRfc3339(r.createdAt, r.timezone),
@@ -327,4 +229,15 @@ export function toBookingEvent(r: EventRecord): BookingEvent {
 /** Sort by start, then id, so equal starts (two staff members) come back in a stable order. */
 export function byStart(a: { start: Date; id: string }, b: { start: Date; id: string }): number {
   return a.start.getTime() - b.start.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+/** A canonical (hyphenated) UUID, in either case. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The id lowercased if it's a canonical UUID, else null. Both stores look booking and block ids up
+ * through this, so a malformed id is simply not found (Postgres would otherwise raise 22P02).
+ */
+export function normalizeUuid(id: string): string | null {
+  return UUID.test(id) ? id.toLowerCase() : null;
 }

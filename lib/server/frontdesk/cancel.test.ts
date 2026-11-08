@@ -20,7 +20,6 @@ import { approvalToken, approveAsCustomer, memoryDeps, NOW, SAT, withCatalog } f
 // approved it (confirmedAt), while a hold can be cancelled any time.
 
 const at = (hhmm: string) => `2026-11-14T${hhmm}:00-05:00`;
-const key = () => crypto.randomUUID();
 const HOUR_MS = 60 * 60 * 1000;
 
 /** A clock tests can move. */
@@ -49,7 +48,7 @@ async function holdAt(deps: FrontDeskDeps, start: string, service_id = "haircut"
   const { booking } = await book(
     deps,
     "harts",
-    { service_id, start, customer_name: "Maya", idempotency_key: key() },
+    { service_id, start, customer_name: "Maya" },
     "test-agent",
   );
   return booking;
@@ -68,7 +67,7 @@ async function bookAt(deps: FrontDeskDeps, start: string, service_id = "haircut"
 }
 
 let phoneSeq = 0;
-/** A fresh phone number per approval, so the 3-codes-per-phone-per-hour limit never gets in the way. */
+/** A different phone number for each approval. */
 const nextPhone = () => `+1401555${String(1000 + (phoneSeq++ % 9000))}`;
 
 /** A booking the person approved: confirmed, with a verified customer. */
@@ -76,8 +75,7 @@ async function confirmedAt(deps: FrontDeskDeps, start: string, service_id = "hai
   return approveAsCustomer(deps, await holdAt(deps, start, service_id), nextPhone());
 }
 
-const cancel = (deps: FrontDeskDeps, booking_id: string, idempotency_key = key()) =>
-  cancelBooking(deps, "harts", { booking_id, idempotency_key });
+const cancel = (deps: FrontDeskDeps, booking_id: string) => cancelBooking(deps, "harts", { booking_id });
 
 /** Deps that also know a second shop, "elsewhere", with no bookings of its own. */
 function withSecondShop(deps: FrontDeskDeps): FrontDeskDeps {
@@ -103,7 +101,6 @@ describe("cancelBooking", () => {
       booking: { ...booking, status: "cancelled" },
       depositEffect: "released",
       depositCollected: false,
-      replayed: false,
     });
     expect(await starts()).toContain(at("14:30"));
     expect((await getBooking(deps, "harts", { booking_id: booking.id })).booking.status).toBe("cancelled");
@@ -158,7 +155,6 @@ describe("cancelBooking", () => {
       booking: { ...soon, status: "cancelled" },
       depositEffect: "released",
       depositCollected: false,
-      replayed: false,
     });
     const trim = await bookAt(deps, at("14:30"), "beard-trim");
     expect((await cancel(deps, trim.id)).depositEffect).toBe("none");
@@ -220,7 +216,7 @@ describe("cancelBooking", () => {
   it("is booking_not_found for another shop's booking", async () => {
     const deps = withSecondShop(memoryDeps());
     const booking = await bookAt(deps, at("14:30"));
-    const viaCancel = await rejection(cancelBooking(deps, "elsewhere", { booking_id: booking.id, idempotency_key: key() }));
+    const viaCancel = await rejection(cancelBooking(deps, "elsewhere", { booking_id: booking.id }));
     const viaGet = await rejection(getBooking(deps, "elsewhere", { booking_id: booking.id }));
     expect(viaCancel.code).toBe("booking_not_found");
     expect(viaGet.code).toBe("booking_not_found");
@@ -230,62 +226,42 @@ describe("cancelBooking", () => {
   it("is not_found for an unknown shop", async () => {
     const deps = memoryDeps();
     const booking = await bookAt(deps, at("14:30"));
-    expect((await rejection(cancelBooking(deps, "nope", { booking_id: booking.id, idempotency_key: key() }))).code).toBe(
+    expect((await rejection(cancelBooking(deps, "nope", { booking_id: booking.id }))).code).toBe(
       "not_found",
     );
     expect((await rejection(getBooking(deps, "nope", { booking_id: booking.id }))).code).toBe("not_found");
   });
 
   it.each<[string, Record<string, unknown>, string]>([
-    ["a missing booking_id", { idempotency_key: "cancel-key-0001" }, "booking_id"],
-    ["an empty booking_id", { booking_id: "  ", idempotency_key: "cancel-key-0001" }, "booking_id"],
-    ["a numeric booking_id", { booking_id: 7, idempotency_key: "cancel-key-0001" }, "booking_id"],
-    ["a missing idempotency_key", { booking_id: "6f1c2a4e-9b0d-4c3e-8a7f-1d2e3f4a5b6c" }, "idempotency_key"],
-    ["a short idempotency_key", { booking_id: "6f1c2a4e-9b0d-4c3e-8a7f-1d2e3f4a5b6c", idempotency_key: "short" }, "idempotency_key"],
+    ["a missing booking_id", {}, "booking_id"],
+    ["an empty booking_id", { booking_id: "  " }, "booking_id"],
+    ["a numeric booking_id", { booking_id: 7 }, "booking_id"],
   ])("is invalid_request for %s", async (_label, args, field) => {
     const err = await rejection(cancelBooking(memoryDeps(), "harts", args as unknown as CancelInput));
     expect(err.code).toBe("invalid_request");
     expect(err.details).toMatchObject({ field });
   });
 
-  it("replays the same key: the same result, replayed true, still exactly one cancelled event", async () => {
+  it("cancelling twice is harmless: the second is not_cancellable, with still exactly one cancelled event", async () => {
     const deps = memoryDeps();
     const booking = await bookAt(deps, at("14:30"));
-    const k = key();
-    const first = await cancel(deps, booking.id, k);
-    const again = await cancel(deps, booking.id, k);
-    // The same booking id in upper case is the same request.
-    const upper = await cancel(deps, booking.id.toUpperCase(), k);
-
-    expect(first.replayed).toBe(false);
-    for (const replay of [again, upper]) {
-      expect(replay).toEqual({ ...first, replayed: true });
+    const first = await cancel(deps, booking.id);
+    expect(first.booking.status).toBe("cancelled");
+    // The same booking id in upper case is the same booking.
+    for (const id of [booking.id, booking.id.toUpperCase()]) {
+      const err = await rejection(cancel(deps, id));
+      expect(err.code).toBe("not_cancellable");
+      expect(err.details).toMatchObject({ status: "cancelled" });
     }
     const types = (await deps.store.listEvents(booking.id)).map((e) => e.type);
     expect(types).toEqual(["booked", "cancelled"]);
   });
 
-  it("is idempotency_conflict for the same key on a different booking", async () => {
+  it("ignores an idempotency_key an older agent still sends", async () => {
     const deps = memoryDeps();
-    const one = await bookAt(deps, at("14:30"));
-    const two = await bookAt(deps, at("16:00"));
-    await cancel(deps, one.id, "cancel-key-0001");
-    const err = await rejection(cancel(deps, two.id, "cancel-key-0001"));
-    expect(err.code).toBe("idempotency_conflict");
-    expect(err.details).toEqual({ idempotency_key: "cancel-key-0001", tool: "cancel" });
-    expect((await getBooking(deps, "harts", { booking_id: two.id })).booking.status).toBe("awaiting_approval");
-  });
-
-  it("keeps book and cancel keys apart: the same key can book and then cancel", async () => {
-    const deps = memoryDeps();
-    const k = key();
-    const { booking } = await book(
-      deps,
-      "harts",
-      { service_id: "haircut", start: at("14:30"), customer_name: "Maya", idempotency_key: k },
-      "agent",
-    );
-    expect((await cancel(deps, booking.id, k)).replayed).toBe(false);
+    const booking = await bookAt(deps, at("14:30"));
+    const args = { booking_id: booking.id, idempotency_key: "cancel-key-0001" } as unknown as CancelInput;
+    expect((await cancelBooking(deps, "harts", args)).booking.status).toBe("cancelled");
   });
 
   it("lets exactly one of two concurrent cancels win; the other is not_cancellable", async () => {

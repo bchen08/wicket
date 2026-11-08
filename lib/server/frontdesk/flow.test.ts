@@ -14,16 +14,15 @@ import type {
   GetPoliciesResult,
   OwnerBookingActionResponse,
   PoliciesResponse,
-  SendCodeResponse,
   Slot,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
-import { approvalApprovePost, approvalCodePost, approvalDeclinePost, approvalGet } from "../consent/http";
+import { approvalApprovePost, approvalDeclinePost, approvalGet } from "../consent/http";
 import { bookingActionPost, bookingDetailGet, bookingsResponse, policiesGet, policiesPut, type OwnerOptions } from "./http";
 import { createFrontDeskMcpHandler } from "./mcp";
 import { SEED } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
-import { approvalToken, lastSentCode, memoryDeps, PHONE_E164, recordingNotifier, TEST_ORIGIN } from "./test-support";
+import { approvalToken, memoryDeps, PHONE_E164, recordingNotifier } from "./test-support";
 
 // Issue #8's "Done when" list, end to end: the real MCP handler (what /api/mcp mounts) and the real
 // owner HTTP handlers (what the /api/shops/* route files call) over ONE deps object, the way
@@ -119,16 +118,13 @@ async function fails(name: string, args: Record<string, unknown>): Promise<ApiEr
   return (JSON.parse(result.content[0].text) as ApiError).error;
 }
 
-const key = () => crypto.randomUUID();
-
 const availability = async (window: { from: string; to: string }, serviceId = "haircut") =>
   ok<GetAvailabilityResult>("get_availability", { service_id: serviceId, ...window, limit: 50 });
 
-const bookArgs = (start: string, idempotencyKey = key(), customer = "E2E Maya") => ({
+const bookArgs = (start: string, customer = "E2E Maya") => ({
   service_id: "haircut",
   start,
   customer_name: customer,
-  idempotency_key: idempotencyKey,
 });
 
 // ---- Owner routes ----
@@ -164,9 +160,9 @@ const markNoShow = (id: string) =>
 
 // ---- The approval page's API (Ring 1b) ----
 
-/** A POST from the approval page, with its Origin (PUBLIC_BASE_URL's: localhost in tests). */
+/** A POST from the approval page. No Origin header is needed. */
 function pageRequest(path: string, body?: unknown): Request {
-  const headers: Record<string, string> = { origin: TEST_ORIGIN };
+  const headers: Record<string, string> = {};
   if (body !== undefined) headers["content-type"] = "application/json";
   return new Request(`http://localhost:3000/api/approvals${path}`, {
     method: "POST",
@@ -176,16 +172,12 @@ function pageRequest(path: string, body?: unknown): Request {
 }
 
 const approvalView = (token: string) => json<ApprovalView>(approvalGet(getDeps, token));
-const requestCode = (token: string, phone = PHONE_E164, status = 200) =>
-  json<SendCodeResponse>(approvalCodePost(getDeps, pageRequest(`/${token}/code`, { phone }), token), status);
-const approveWith = (token: string, code: string) =>
-  json<ApproveResponse>(approvalApprovePost(getDeps, pageRequest(`/${token}/approve`, { code }), token));
+const approveWith = (token: string, body?: unknown, status = 200) =>
+  json<ApproveResponse>(approvalApprovePost(getDeps, pageRequest(`/${token}/approve`, body), token), status);
 
-/** The person approves `booking` (book's result) on the page: a code to their phone, then approve. */
+/** The person approves `booking` (book's result) on the page, giving their phone number. */
 async function approveOnPage(booking: Booking, phone = PHONE_E164): Promise<Booking> {
-  const token = approvalToken(booking);
-  await requestCode(token, phone);
-  return (await approveWith(token, lastSentCode(deps))).booking;
+  return (await approveWith(approvalToken(booking), { phone })).booking;
 }
 
 /** book's result without the approval link, as every later read shows it. */
@@ -251,7 +243,7 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect(err.details?.earliest).toBe("2026-11-10T12:30:00-05:00");
   });
 
-  it("3. MCP book with an idempotency key, and replaying it returns the same booking", async () => {
+  it("3. MCP book places one hold; booking the same time again is slot_taken (no double booking on a retry)", async () => {
     const args = bookArgs(THU_1000);
     const first = await ok<BookResult>("book", args);
     // Ring 1b: a hold awaiting the person's approval, with the link to send them.
@@ -262,9 +254,8 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
       approval: { url: expect.stringMatching(/^http:\/\/localhost:3000\/approve\//), expiresAt: "2026-11-10T10:30:00-05:00" },
     });
 
-    const replay = await ok<BookResult>("book", args);
-    expect(replay.data.booking).toEqual(first.data.booking);
-    expect(replay.text).toMatch(/replayed/);
+    const again = await fails("book", args);
+    expect(again.code).toBe("slot_taken");
 
     const stored = await deps.store.listBookings("harts", { start: new Date(THURSDAY.from), end: new Date(THURSDAY.to) });
     expect(stored.map((b) => b.id)).toEqual([first.data.booking.id]);
@@ -273,10 +264,6 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect(detail.booking).toEqual(withoutLink(first.data.booking));
     expect(detail.events.map((e) => [e.type, e.actor])).toEqual([["booked", "agent"]]);
     expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
-
-    // The same key with other arguments is refused.
-    const conflict = await fails("book", { ...args, customer_name: "E2E Someone Else" });
-    expect(conflict.code).toBe("idempotency_conflict");
   });
 
   it("4. MCP cancel more than 24 hours ahead → cancelled, depositEffect released, and the slot is offered again", async () => {
@@ -286,7 +273,7 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect(approved.status).toBe("confirmed");
 
     // 10:20 Tue → 10:00 Thu is 47 h 40 min ahead.
-    const cancelArgs = { booking_id: data.booking.id, idempotency_key: key() };
+    const cancelArgs = { booking_id: data.booking.id };
     const cancelled = await ok<CancelResult>("cancel", cancelArgs);
     expect(cancelled.data).toEqual({
       booking: { ...approved, status: "cancelled" },
@@ -295,8 +282,10 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     });
     expect(cancelled.text).toMatch(/released/);
 
-    // A retry with the same key replays; get_booking agrees.
-    expect((await ok<CancelResult>("cancel", cancelArgs)).data).toEqual(cancelled.data);
+    // A retry can't cancel twice: it's not_cancellable now. get_booking agrees.
+    const retry = await fails("cancel", cancelArgs);
+    expect(retry.code).toBe("not_cancellable");
+    expect(retry.details).toMatchObject({ status: "cancelled" });
     expect((await ok<{ booking: { status: string } }>("get_booking", { booking_id: data.booking.id })).data.booking.status).toBe(
       "cancelled",
     );
@@ -340,9 +329,9 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
 
   it("7. GET /api/shops/harts/bookings/[id] shows the events for each step", async () => {
     // book → approve (the person) → cancel (agent, > 24 h ahead)
-    const a = (await ok<BookResult>("book", bookArgs(THU_1000, key(), "E2E Cancel"))).data.booking;
+    const a = (await ok<BookResult>("book", bookArgs(THU_1000, "E2E Cancel"))).data.booking;
     await approveOnPage(a);
-    await ok<CancelResult>("cancel", { booking_id: a.id, idempotency_key: key() });
+    await ok<CancelResult>("cancel", { booking_id: a.id });
     const cancelled = await bookingDetail(a.id);
     expect(cancelled.booking.status).toBe("cancelled");
     expect(cancelled.events.map((e) => [e.type, e.actor])).toEqual([
@@ -361,7 +350,7 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect(cancelled.events[2].data).toEqual({ from: "confirmed", to: "cancelled", depositEffect: "released", depositCollected: false });
 
     // book → approve → (after the start) owner no-show
-    const b = (await ok<BookResult>("book", bookArgs(TUE_1300, key(), "E2E No-show"))).data.booking;
+    const b = (await ok<BookResult>("book", bookArgs(TUE_1300, "E2E No-show"))).data.booking;
     await approveOnPage(b);
     clock.set("2026-11-10T14:00:00-05:00");
     await markNoShow(b.id);
@@ -415,24 +404,20 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
 });
 
 // Issue #15's "Done when" list for Ring 1b, end to end over the same shared deps: the MCP book tool, the
-// approval page's API (what /approve/[token] calls, with the page's Origin), MCP get_booking and the
-// owner's bookings list. FRONTDESK_DEV_CODES is on, as in the local demo, so the code comes back in the
-// response. "Now" is Tue 10 Nov 2026, 10:20 in New York; the hold lasts until 10:30.
+// approval page's API (what /approve/[token] calls), MCP get_booking and the owner's bookings list.
+// Opening the link and approving is the consent (no phone code until Ring 1c). "Now" is Tue 10 Nov 2026,
+// 10:20 in New York; the hold lasts until 10:30.
 describe("Done when (issue #15): consent, through MCP, the approval API and the owner routes over shared deps", () => {
-  beforeEach(() => {
-    deps = memoryDeps({ clock, consent: { devCodes: true } });
-  });
-
   const bookingsList = () => json<BookingsResponse>(bookingsResponse(getDeps, "harts"));
 
-  it("book → link → code (devCode) → approve → get_booking confirmed and verified → the owner's list shows the verified customer", async () => {
-    const { data, text } = await ok<BookResult>("book", bookArgs(THU_1000, key(), "Maya Lopez"));
+  it("book → link → approve (with a phone) → get_booking confirmed and verified → the owner's list shows the customer", async () => {
+    const { data, text } = await ok<BookResult>("book", bookArgs(THU_1000, "Maya Lopez"));
     const booking = data.booking;
     expect(booking.status).toBe("awaiting_approval");
-    expect(text).toContain(`Send Maya Lopez this link to approve with a code texted to their phone: ${booking.approval!.url}.`);
+    expect(text).toContain(`Send Maya Lopez this link to approve: ${booking.approval!.url}. Then call get_booking to check the status.`);
     const token = approvalToken(booking);
 
-    // The page loads: pending, with the shop's rules; no code sent yet.
+    // The page loads: pending, with the shop's rules.
     const view = await approvalView(token);
     expect(view).toMatchObject({
       status: "pending",
@@ -448,12 +433,8 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
     });
     expect(view).not.toHaveProperty("codeSentTo");
 
-    // The person asks for a code: the dev code comes back, and the page now shows where it went.
-    const sent = await requestCode(token, "+1 (401) 555-0123");
-    expect(sent).toEqual({ sentTo: "0123", expiresAt: "2026-11-10T10:30:00-05:00", devCode: expect.stringMatching(/^\d{6}$/) });
-    expect((await approvalView(token)).codeSentTo).toBe("0123");
-
-    const approved = await approveWith(token, sent.devCode!);
+    // The person approves on the page, typing their number with separators.
+    const approved = await approveWith(token, { phone: "+1 (401) 555-0123" });
     expect(approved.booking).toMatchObject({
       id: booking.id,
       status: "confirmed",
@@ -464,7 +445,7 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
 
     const fetched = await ok<GetBookingResult>("get_booking", { booking_id: booking.id });
     expect(fetched.data.booking).toEqual(approved.booking);
-    expect(fetched.text).toContain("Maya Lopez approved it with a code sent to the phone ending 0123.");
+    expect(fetched.text).toContain("Maya Lopez approved it (phone ending 0123). It is confirmed.");
 
     const list = await bookingsList();
     expect(list.bookings.find((b) => b.id === booking.id)).toEqual(approved.booking);
@@ -479,8 +460,8 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
   });
 
   it("a second agent booking the same slot while it's on hold gets slot_taken", async () => {
-    await ok<BookResult>("book", bookArgs(THU_1000, key(), "First Agent's Person"));
-    const err = await fails("book", bookArgs(THU_1000, key(), "Second Agent's Person"));
+    await ok<BookResult>("book", bookArgs(THU_1000, "First Agent's Person"));
+    const err = await fails("book", bookArgs(THU_1000, "Second Agent's Person"));
     expect(err.code).toBe("slot_taken");
     expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).not.toContain(THU_1000);
   });
@@ -491,12 +472,12 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
     clock.set("2026-11-10T10:30:00-05:00");
 
     expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).toContain(THU_1000);
-    const again = await ok<BookResult>("book", bookArgs(THU_1000, key(), "E2E Next"));
+    const again = await ok<BookResult>("book", bookArgs(THU_1000, "E2E Next"));
     expect(again.data.booking).toMatchObject({ start: THU_1000, status: "awaiting_approval" });
 
     expect((await ok<GetBookingResult>("get_booking", { booking_id: held.id })).data.booking.status).toBe("expired");
     expect((await approvalView(token)).status).toBe("expired");
-    const err = await json<ApiError>(approvalCodePost(getDeps, pageRequest(`/${token}/code`, { phone: PHONE_E164 }), token), 410);
+    const err = await approveWith(token, { phone: PHONE_E164 }, 410) as unknown as ApiError;
     expect(err.error.code).toBe("approval_expired");
     expect(err.error.next_action).toBe("Ask your agent to book again.");
     expect((await bookingDetail(held.id)).events.map((e) => [e.type, e.actor])).toEqual([
@@ -515,25 +496,33 @@ describe("Done when (issue #15): consent, through MCP, the approval API and the 
     expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
   });
 
-  it("refuses the approval POSTs without the page's Origin (403), changing nothing", async () => {
+  it("approving with no body (no phone): confirmed and verified, no phoneLast4", async () => {
+    const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
+    const approved = await approveWith(approvalToken(held));
+    expect(approved.booking).toMatchObject({ id: held.id, status: "confirmed", customer: { verified: true } });
+    expect(approved.booking.customer).not.toHaveProperty("phoneLast4");
+    const fetched = await ok<GetBookingResult>("get_booking", { booking_id: held.id });
+    expect(fetched.text).toContain("E2E Maya approved it. It is confirmed.");
+  });
+
+  it("the approval POSTs need no Origin header: any origin (or none) works", async () => {
+    for (const origin of [null, "https://elsewhere.example"]) {
+      const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
+      const token = approvalToken(held);
+      const request = new Request(`http://localhost:3000/api/approvals/${token}/decline`, {
+        method: "POST",
+        headers: origin ? { origin } : {},
+      });
+      const declined = await json<DeclineResponse>(approvalDeclinePost(getDeps, request, token));
+      expect(declined.booking.status, `decline from ${origin}`).toBe("cancelled");
+    }
     const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
     const token = approvalToken(held);
-    for (const origin of [null, "https://evil.example", "http://localhost:3001"]) {
-      for (const [path, post, body] of [
-        ["code", approvalCodePost, { phone: PHONE_E164 }],
-        ["approve", approvalApprovePost, { code: "123456" }],
-        ["decline", approvalDeclinePost, undefined],
-      ] as const) {
-        const request = new Request(`http://localhost:3000/api/approvals/${token}/${path}`, {
-          method: "POST",
-          headers: { "content-type": "application/json", ...(origin ? { origin } : {}) },
-          body: body === undefined ? undefined : JSON.stringify(body),
-        });
-        const err = await json<ApiError>(post(getDeps, request, token), 403);
-        expect(err.error.code, `${path} from ${origin}`).toBe("invalid_request");
-      }
-    }
-    expect((await approvalView(token)).status).toBe("pending");
-    expect((await approvalView(token))).not.toHaveProperty("codeSentTo");
+    const request = new Request(`http://localhost:3000/api/approvals/${token}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://elsewhere.example" },
+      body: JSON.stringify({}),
+    });
+    expect((await json<ApproveResponse>(approvalApprovePost(getDeps, request, token))).booking.status).toBe("confirmed");
   });
 });

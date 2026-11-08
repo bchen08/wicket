@@ -2,7 +2,7 @@
 
 Front Desk lets AI agents (Claude, ChatGPT, personal agents) ask a small business what it offers, what its rules are and when it's free, then book or cancel an appointment. Agents connect over the [Model Context Protocol](https://modelcontextprotocol.io). The UI reads the same data over plain JSON routes, and the owner's console changes it over owner routes.
 
-**No booking is final until a real person approves it.** `book` holds the slot for 10 minutes and returns an approval link; the person opens it, proves their phone number with a texted code, and approves or declines. This works with any MCP client, with no OAuth. See [Consent flow](#consent-flow).
+**No booking is final until a real person approves it.** `book` holds the slot for 10 minutes and returns an approval link; the person opens it and approves or declines. Opening the link and tapping Approve is the consent. This works with any MCP client, with no OAuth. See [Consent flow](#consent-flow).
 
 | | |
 |---|---|
@@ -12,7 +12,7 @@ Front Desk lets AI agents (Claude, ChatGPT, personal agents) ask a small busines
 | Shop | One shop for now: Hart's Barbers (`harts`), `America/New_York` |
 | Tools | `list_services`, `get_policies`, `get_availability`, `get_booking` (read-only), `book` and `cancel` |
 | Public routes | `GET /api/shops/[shop]/services`, `GET /api/shops/[shop]/bookings` |
-| Approval routes | `GET /api/approvals/[token]`, `POST /api/approvals/[token]/code`, `/approve`, `/decline` (for the approval page) |
+| Approval routes | `GET /api/approvals/[token]`, `POST /api/approvals/[token]/approve`, `/decline` (for the approval page) |
 | Owner routes | policies, hours, blocked time, services, booking actions and booking history under `/api/shops/[shop]/` |
 | Data | Postgres (Supabase). See [database.md](database.md). |
 
@@ -20,7 +20,7 @@ Request and response shapes are exported from [`lib/types/frontdesk.ts`](../lib/
 - Shared: `Shop`, `Service`, `Slot`, `Policies`, `Booking`, `BookingStatus`, `DepositEffect`, `BookingEvent`, `BookingActor`, `BookingEventType`, `Mandate`, `ApiError`, `ApiErrorCode`.
 - Tools: `ListServicesResult`, `GetPoliciesResult`, `GetAvailabilityInput`, `GetAvailabilityResult`, `BookInput`, `BookResult`, `GetBookingInput`, `GetBookingResult`, `CancelInput`, `CancelResult` (= `BookingTransitionResult`).
 - Public routes: `ServicesResponse`, `BookingsResponse`.
-- Approval routes: `ApprovalView`, `SendCodeRequest`, `SendCodeResponse`, `ApproveRequest`, `ApproveResponse`, `DeclineResponse`.
+- Approval routes: `ApprovalView`, `ApproveRequest`, `ApproveResponse`, `DeclineResponse`.
 - Owner routes: `PoliciesResponse`, `UpdatePoliciesRequest`, `HoursResponse`, `UpdateHoursRequest`, `WeeklyHours`, `StaffWeeklyHours`, `BlocksResponse`, `CreateBlockRequest`, `BlockResponse`, `BlockedTime`, `CreateServiceRequest`, `UpdateServiceRequest`, `ServiceResponse`, `OwnerBookingActionResponse`, `BookingDetailResponse`.
 
 ## Conventions
@@ -44,7 +44,7 @@ The HTTP status applies to the `/api/shops/*` and `/api/approvals/*` routes. Too
 
 | `code` | HTTP | When | `details` | `next_action` |
 |---|---|---|---|---|
-| `invalid_request` | 400 (403: approval POST from the wrong origin) | Bad arguments or body. `book` with an unknown `service_id` or a malformed `mandate`. An owner action the booking's status or time doesn't allow. An approval `POST` without `Origin: <PUBLIC_BASE_URL's origin>` is **403**. | Tools: `field`, `value`. Owner bodies: `field`, `issues`. Owner actions: `status`, `action`, `booking_id`. Approval routes: `field` (`phone`, `code`, `body`, `origin`), never the value. | Says what to send instead. |
+| `invalid_request` | 400 | Bad arguments or body. `book` with an unknown `service_id` or a malformed `mandate`. An owner action the booking's status or time doesn't allow. `approve` with a phone number that isn't E.164. | Tools: `field`, `value`. Owner bodies: `field`, `issues`. Owner actions: `status`, `action`, `booking_id`. Approval routes: `field` (`phone` or `body`), never the value. | Says what to send instead. |
 | `not_found` | 404 | No such shop, service (`get_availability`, `PATCH` service), staff member or blocked time. | What was asked for, plus the valid ids where useful (`valid_service_ids`, `valid_staff_ids`). | Check the slug or id; use one of the valid ids. |
 | `slot_taken` | 409 | `book`: a booking is in the way, or another agent won the race for that time and no other staff member is free then. | `start`, `service_id`, `alternatives` (up to 3 nearby `Slot`s, possibly empty) | "Someone just took that time. Call get_availability again and choose another start." When there are alternatives it adds "Nearby open starts you can offer instead are in details.alternatives." |
 | `outside_hours` | 422 | `book`: not a bookable start for that service: closed, lunch, blocked time, off the 15-minute grid, or the service would run past closing. | `field: "start"`, `value`, `service_id` | "Call get_availability and choose one of the returned starts." |
@@ -53,15 +53,10 @@ The HTTP status applies to the `/api/shops/*` and `/api/approvals/*` routes. Too
 | `paused` | 409 | `book`: the owner paused bookings. | `phone` (or `null`) | "Tell the person to call the shop at +1 212-555-0142." (without the number if there's none) |
 | `booking_not_found` | 404 | `get_booking`, `cancel`, owner booking routes: no booking with that id at this shop. A malformed id or another shop's booking is also not found. Approval routes: an unknown or malformed token. | `booking_id` (none for a token) | "Check the booking id. It is the booking.id (a UUID) that book returned." (token: "Check that the whole link was copied. …") |
 | `not_cancellable` | 409 | `cancel`: the booking is already final (cancelled, expired, completed, no-show; a hold whose time ran out has expired), or its start has passed. | `status`, `booking_id`, and `start` when it has started | "Don't retry. If the person still needs to change it, tell them to call the shop at +1 212-555-0142." |
-| `idempotency_conflict` | 409 | `book` or `cancel`: the `idempotency_key` was already used, within 24 hours, with different arguments. | `idempotency_key`, `tool` | "Use a new idempotency_key (a fresh UUID) for a different request." |
 | `unauthorized` | 401 | An owner route without the right bearer token. | none | "Send the header Authorization: Bearer <OWNER_API_TOKEN>." |
 | `outside_mandate` | 422 | `book`: the service or time breaks the person's [mandate](#mandate). | `field`: `price_cap` (+ `priceCents`, `priceCapCents`), `deposit_cap` (+ `depositCents`, `depositCapCents`) or `window` (+ `window`, `start`, `end`) | "Ask the person to widen their limit, or choose a different service or time." |
 | `approval_expired` | 410 | Approval routes: the 10-minute hold ran out before the person approved (the booking is `expired`). | `status`, `booking_id` | "Ask your agent to book again." |
 | `approval_closed` | 409 | Approval routes: the request was already approved or declined, or the agent or shop cancelled the booking. | `status`, plus `decision` when it was answered | "Nothing more to do with this link. Ask your agent if you need a new booking." |
-| `code_invalid` | 422 | `approve`: the code is wrong, already used, or no code was sent yet. | `attemptsLeft` for a wrong code | "Check the code and try again (N attempts left), or request a new code." / "Enter your phone number to get a code first." |
-| `code_expired` | 410 | `approve`: the code is more than 10 minutes old. | none | "Request a new code and enter that one." |
-| `too_many_attempts` | 429 | `approve`: 5 wrong codes for one code request (the 5th wrong try already answers this). | `maxAttempts` | "Request a new code and enter that one." |
-| `rate_limited` | 429 | `code`: 3 codes to this phone number, or 10 with this link, in the last hour. The response has a `Retry-After` header. | `retryAfter` (seconds), `limit` (`phone` or `link`) | "Use the last code you received, or try again in N minutes. …" |
 | `internal` | 500 (503: owner token not configured) | Our fault: the database is unreachable, `DATABASE_URL` is missing on Vercel, `PUBLIC_BASE_URL` or `FRONTDESK_NOW` is invalid. An owner route on a deployment without a usable `OWNER_API_TOKEN` answers 503 with this code. | none | "Retry the same call once. If it fails again, tell the user Front Desk is unavailable right now." (503: set `OWNER_API_TOKEN` and redeploy) |
 
 ## `list_services`
@@ -261,22 +256,21 @@ Other `invalid_request` cases:
 
 **Holds** an appointment for 10 minutes until the person approves it, and returns an approval link. Nothing is final until they do: see [Consent flow](#consent-flow). Call it only once the person has picked a time and heard the shop's rules (`get_policies`).
 
-- The result's booking has `status: "awaiting_approval"` and `approval: { url, expiresAt }`. **Send the person `approval.url` right away**, then call `get_booking` to see what they did. The link appears only here (and in a replay): the server keeps just the token's hash, so `get_booking`, the bookings list and the owner API never show it.
+- The result's booking has `status: "awaiting_approval"` and `approval: { url, expiresAt }`. **Send the person `approval.url` right away**, then call `get_booking` to see what they did. The link appears only here: the server keeps just the token's hash, so `get_booking`, the bookings list and the owner API never show it.
 - The held slot is busy: `get_availability` stops offering it and another `book` for it gets `slot_taken`. If the person declines, or the hold runs out (`approval.expiresAt`), the slot is free again.
 - `start` must be one of the starts `get_availability` just returned for the same service. Any other time is refused with the most specific code (see Errors).
-- **`idempotency_key` is required.** Send a fresh UUID per intended booking. Reuse it only to retry the same call, e.g. after a timeout. A replay returns the same approval link. See [Idempotency](#idempotency).
+- **Call it once per booking.** There's no idempotency key: calling it again for the same time gets `slot_taken` while the first hold is on (the database's `no_overlap` constraint), so a retry can't double-book. If a call timed out, call `get_availability` or check with the person before booking again.
 - **`mandate` is optional:** the person's limits. The server refuses a booking outside them (`outside_mandate`) and shows them on the approval page. See [Mandate](#mandate). `TODO(ring-2)`: required once agents sign in.
 - **No deposit is collected yet.** `depositCents` is the deposit the service required when it was booked; it will be collected once deposits are enabled.
 - **The owner isn't told about a hold**, only about a booking the person approved.
 - `agent.name` is a best-effort, unverified label: the MCP client's self-reported name, with control characters removed and cut to 80 characters. Clients on the 2026-07-28 protocol send it with every request. Stateless 2025-era requests don't, so those bookings show `"unknown agent"`. MCP Inspector is one of these.
-- Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true` (the same arguments, key included, have no additional effect), `openWorldHint: false`.
+- Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` (each call places a new hold or is refused), `openWorldHint: false`.
 
 | Field | Type | Notes |
 |---|---|---|
 | `service_id` | string | Required. An `id` from `list_services`. |
 | `start` | string | Required. A slot `start` from `get_availability`, RFC 3339 with offset. Any offset is accepted if it's the same instant. |
 | `customer_name` | string | Required. 1–80 characters after trimming, without the NUL character (U+0000). The name the booking is under. |
-| `idempotency_key` | string | Required. 8–128 visible ASCII characters, no spaces. A UUID. |
 | `mandate` | object | Optional. `{ priceCapCents?, depositCapCents?, window?: { from, to } }`. See [Mandate](#mandate). |
 
 **Input**
@@ -286,7 +280,6 @@ Other `invalid_request` cases:
   "service_id": "haircut",
   "start": "2026-11-14T14:30:00-05:00",
   "customer_name": "Maya",
-  "idempotency_key": "4b1f6f0e-2a59-4a8e-9a3c-6d2f1b7c9e01",
   "mandate": { "priceCapCents": 5000, "window": { "from": "2026-11-14T12:00:00-05:00", "to": "2026-11-14T18:00:00-05:00" } }
 }
 ```
@@ -295,12 +288,10 @@ Other `invalid_request` cases:
 
 ```
 Held Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. It is not confirmed yet.
-Hold placed until Tue 10 Nov, 11:10 am EST. Send Maya this link to approve with a code texted to their phone: http://localhost:3000/approve/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM. Then call get_booking to check the status.
+Hold placed until Tue 10 Nov, 11:10 am EST. Send Maya this link to approve: http://localhost:3000/approve/rnIpjP-nfqeF8V1kZsQTh2C4wX5uit8mcySiGndv3OM. Then call get_booking to check the status.
 A $10 deposit will be required once deposits are enabled; nothing was charged.
 Booking id: bd3db26a-83b1-403c-b923-357982915d3c. Don't book this time again while the hold is on. If Maya declines or the hold runs out, the time is freed.
 ```
-
-A replay (same key, same arguments) returns the same result, link included, and adds `(replayed: this is the booking from your earlier call with the same idempotency_key, as it was then; call get_booking for its status now)` after the second line.
 
 **`structuredContent`** (`BookResult`)
 
@@ -332,24 +323,10 @@ This example ran with the clock frozen at Tue 10 Nov, 11:00 am. With Postgres, `
 
 **How it decides:**
 1. It checks the arguments, the mandate included (`invalid_request`).
-2. It looks up the `idempotency_key`. The same key with the same arguments returns the stored result (the same approval link) without doing anything else; the same key with other arguments is `idempotency_conflict`.
-3. It checks `start` against the shop's rules, using the current clock, in this order: `paused`, then `too_soon` (lead time), then `too_far` (horizon). These don't read any bookings, so a start in year 1 or year 9999 is simply `too_soon` or `too_far`.
-4. `decide()` checks the [mandate](#mandate) (`outside_mandate`: price, then deposit, then window) and sets the hold's deadline, now + 10 minutes.
-5. It expires lapsed holds around that time, in the same transaction (lazy expiry), so a hold nobody answered never blocks the booking. Then it checks hours and busy time: if a booking or a live hold is in the way it's `slot_taken`, otherwise `outside_hours` (closed, lunch, blocked time, off the grid, or running past closing). The staff member comes from the free slot.
-6. It stores the hold, its approval request (the SHA-256 of a new 32-byte token) and its `booked` event in one transaction (in Postgres, the same transaction as the idempotency key). The database's `no_overlap` constraint, which covers holds, has the final word, so two agents racing for the same staff member and time can't both win. The loser reads busy time again: if another staff member is free at exactly that start, it books them instead (once). Otherwise, or if that insert loses too, it gets `slot_taken` with alternatives.
-
-### Idempotency
-
-`book` and `cancel` take a required `idempotency_key`: 8–128 visible ASCII characters with no spaces. Send a fresh UUID per intended action.
-
-- **Same key, same arguments** (within 24 hours): you get the first call's result again, with `(replayed: …)` in the text. Nothing is booked or cancelled twice and no second event is written. For `book` that includes the same approval link: the saved result holds it, because the token can't be recomputed from its stored hash.
-  - "Same arguments" is normalized. For `book`: the same `service_id`, the same instant for `start` (any offset), the same `customer_name` after trimming, and the same mandate (window ends compared as instants; a request without a mandate hashes as it did before Ring 1b). For `cancel`: the same `booking_id` (a UUID in either case).
-  - A replay is the first response as it was. It doesn't re-check the rules or show later changes; call `get_booking` for the current status.
-- **Same key, different arguments** (within 24 hours): `idempotency_conflict`.
-- **A call that fails isn't remembered.** Retrying with the same key runs it again.
-- Keys are per tool: the same key can be used once for `book` and once for `cancel`.
-- Two concurrent calls with the same key run one after the other. The second gets the first's result, or runs itself if the first failed.
-- After 24 hours a key counts as new and may be reused. With Postgres the age is measured on the database's clock, even when `FRONTDESK_NOW` freezes Front Desk's clock (see [database.md](database.md)). Old keys aren't deleted yet: `TODO(ring-2)`.
+2. It checks `start` against the shop's rules, using the current clock, in this order: `paused`, then `too_soon` (lead time), then `too_far` (horizon). These don't read any bookings, so a start in year 1 or year 9999 is simply `too_soon` or `too_far`.
+3. `decide()` checks the [mandate](#mandate) (`outside_mandate`: price, then deposit, then window) and sets the hold's deadline, now + 10 minutes.
+4. It expires lapsed holds around that time, just before inserting (lazy expiry), so a hold nobody answered never blocks the booking. Then it checks hours and busy time: if a booking or a live hold is in the way it's `slot_taken`, otherwise `outside_hours` (closed, lunch, blocked time, off the grid, or running past closing). The staff member comes from the free slot.
+5. It stores the hold, its approval request (the SHA-256 of a new 32-byte token) and its `booked` event in one statement. The database's `no_overlap` constraint, which covers holds, has the final word, so two agents racing for the same staff member and time can't both win. The loser reads busy time again: if another staff member is free at exactly that start, it books them instead (once). Otherwise, or if that insert loses too, it gets `slot_taken` with alternatives.
 
 **Errors**
 
@@ -361,9 +338,8 @@ This example ran with the clock frozen at Tue 10 Nov, 11:00 am. With Postgres, `
 | `outside_hours` | `start` isn't a bookable time for that service: off the 15-minute grid, outside opening hours (including lunch, 12:00–12:30), on a closed day, on blocked time, or the service would run past closing. | `field: "start"`, `value`, `service_id` | "Call get_availability and choose one of the returned starts." |
 | `paused` | The owner paused bookings. | `phone` | "Tell the person to call the shop at +1 212-555-0142." |
 | `outside_mandate` | The service's price or deposit is over the person's cap, or the appointment isn't inside their window. | `field` (`price_cap`, `deposit_cap` or `window`) and the numbers or times compared | "Ask the person to widen their limit, or choose a different service or time." |
-| `idempotency_conflict` | The key was already used with different arguments (a different mandate counts). | `idempotency_key`, `tool: "book"` | "Use a new idempotency_key (a fresh UUID) for a different request." |
 | `invalid_request` | Unknown `service_id`. | `field`, `value`, `valid_service_ids` | Call `list_services`, then `get_availability`. |
-| `invalid_request` | `start` isn't RFC 3339 with an offset; `customer_name` is missing, blank, over 80 characters or contains the NUL character (U+0000); `idempotency_key` is missing, too short, too long or has spaces; `mandate` isn't an object, has an unknown field, a cap that isn't a whole number of cents from 0 to 100,000,000, or a window that isn't `{ from, to }` RFC 3339 with `from` before `to`; a field is missing or the wrong JSON type. | `field` (e.g. `mandate.window.to`), `value` | Says what to send instead. |
+| `invalid_request` | `start` isn't RFC 3339 with an offset; `customer_name` is missing, blank, over 80 characters or contains the NUL character (U+0000); `mandate` isn't an object, has an unknown field, a cap that isn't a whole number of cents from 0 to 100,000,000, or a window that isn't `{ from, to }` RFC 3339 with `from` before `to`; a field is missing or the wrong JSON type. | `field` (e.g. `mandate.window.to`), `value` | Says what to send instead. |
 
 ```json
 {
@@ -430,7 +406,7 @@ This example ran with the clock frozen at Tue 10 Nov, 11:00 am. With Postgres, `
 
 ## `get_booking`
 
-Reads one booking by its id. Call it after sending the approval link to see what the person did: `awaiting_approval` (not answered yet), `confirmed` (approved: `customer.verified` is `true` and `customer.phoneLast4` is set), `cancelled` (declined, or cancelled by the agent or the shop) or `expired` (the hold ran out). Read-only, except that reading a hold whose time ran out records that it expired ([lazy expiry](#lazy-expiry)).
+Reads one booking by its id. Call it after sending the approval link to see what the person did: `awaiting_approval` (not answered yet), `confirmed` (approved: `customer.verified` is `true`, and `customer.phoneLast4` is set if they gave a phone number), `cancelled` (declined, or cancelled by the agent or the shop) or `expired` (the hold ran out). Read-only, except that reading a hold whose time ran out records that it expired ([lazy expiry](#lazy-expiry)).
 
 - It never includes `approval`: the link is only in `book`'s result.
 - **Anyone holding a booking id can read it** (`TODO(ring-2)`: agent identity fixes this).
@@ -449,7 +425,7 @@ Reads one booking by its id. Call it after sending the approval link to see what
 
 ```
 Haircut, Sat 14 Nov, 2:30 pm EST, for Maya. Status: confirmed.
-Maya approved it with a code sent to the phone ending 0123. It is confirmed.
+Maya approved it (phone ending 0123). It is confirmed.
 Deposit: $10 (not collected yet). Booking id: bd3db26a-83b1-403c-b923-357982915d3c.
 ```
 
@@ -491,7 +467,7 @@ Cancels a booking under the shop's cancellation policy (see [The booking lifecyc
 The agent should tell the person the consequence and get their go-ahead first.
 
 - **Nothing is collected yet.** `depositEffect` is what the policy decides; `depositCollected` is always `false` until Ring 1c.
-- **`idempotency_key` is required**, as for `book`. A retry with the same key and `booking_id` returns the first result without cancelling twice. See [Idempotency](#idempotency).
+- **No idempotency key.** Cancelling an already-cancelled booking is `not_cancellable`, so a retry never cancels twice or writes a second event.
 - **Anyone holding a booking id can cancel it** (`TODO(ring-2)`: agent identity fixes this).
 - The owner isn't alerted about agent cancellations yet (`TODO(ring-1c)`).
 - Annotations: `readOnlyHint: false`, `destructiveHint: true`, `idempotentHint: true`, `openWorldHint: false`.
@@ -499,12 +475,11 @@ The agent should tell the person the consequence and get their go-ahead first.
 | Field | Type | Notes |
 |---|---|---|
 | `booking_id` | string | Required. The `booking.id` (a UUID) that `book` returned. |
-| `idempotency_key` | string | Required. 8–128 visible ASCII characters, no spaces. A fresh UUID per intended cancellation. |
 
 **Input**
 
 ```json
-{ "booking_id": "632aa35c-4e9e-4a08-8880-b5b1165939e2", "idempotency_key": "9e2d7c1a-5b3f-4e6d-8c9b-0a1f2e3d4c5b" }
+{ "booking_id": "632aa35c-4e9e-4a08-8880-b5b1165939e2" }
 ```
 
 **Text content** (more than 24 hours ahead)
@@ -519,7 +494,6 @@ The middle line depends on `depositEffect`:
 - `captured`: `Under the shop's policy the shop keeps the $10 deposit as a late-cancellation fee. No money has been collected yet, so nothing was charged or refunded.`
 - `none`: `This booking has no deposit, so there's nothing to release or keep. No money has been collected yet, so nothing was charged or refunded.`
 
-A replay adds `(replayed: this is the result of your earlier cancel with the same idempotency_key)` after the first line.
 
 **`structuredContent`** (`CancelResult`)
 
@@ -553,8 +527,7 @@ A cancelled booking frees its time: `get_availability` offers it again.
 |---|---|---|---|
 | `not_cancellable` | The booking is already final (cancelled, expired, completed or no-show), or its start has passed. | `status`, `booking_id`, plus `start` when it has started | "Don't retry. If the person still needs to change it, tell them to call the shop at +1 212-555-0142." |
 | `booking_not_found` | No booking with that id at this shop. | `booking_id` | "Check the booking id. It is the booking.id (a UUID) that book returned." |
-| `idempotency_conflict` | The key was already used to cancel a different booking. | `idempotency_key`, `tool: "cancel"` | "Use a new idempotency_key (a fresh UUID) for a different request." |
-| `invalid_request` | `booking_id` or `idempotency_key` is missing or malformed. | `field`, `value` | Says what to send instead. |
+| `invalid_request` | `booking_id` is missing or malformed. | `field`, `value` | Says what to send instead. |
 
 ```json
 {
@@ -569,34 +542,29 @@ A cancelled booking frees its time: `get_availability` offers it again.
 
 ## Consent flow
 
-A booking only becomes final when the person it's for approves it themselves. The agent never sees their phone number or the code, and nothing depends on the MCP client: any client that can show a link works, with no OAuth.
+A booking only becomes final when the person it's for approves it themselves, through a link only they receive. Nothing depends on the MCP client: any client that can show a link works, with no OAuth.
 
 ```
 agent                         Front Desk                         person
   │  book(service, start, name,    │                                  │
-  │       idempotency_key, mandate?)│                                 │
+  │       mandate?)                │                                  │
   │ ─────────────────────────────► │ hold the slot 10 min             │
   │ ◄───────────────────────────── │ awaiting_approval + approval.url │
   │  send the link ──────────────────────────────────────────────────►│
   │                                │ ◄── GET  /api/approvals/[token]  │ the page shows the booking,
   │                                │                                  │ the rules and the mandate
-  │                                │ ◄── POST …/code { phone }        │
-  │                                │ ── 6-digit code by text ───────► │ (Ring 1b: a log line;
-  │                                │                                  │  devCode locally)
-  │                                │ ◄── POST …/approve { code }      │ or POST …/decline
-  │                                │ confirmed, verified customer,    │
-  │                                │ owner alerted                    │
+  │                                │ ◄── POST …/approve { phone? }    │ or POST …/decline
+  │                                │ confirmed, owner alerted         │
   │  get_booking(id) ────────────► │                                  │
   │ ◄───────────────────────────── │ confirmed / cancelled / expired  │
 ```
 
 1. `book` returns the booking in `awaiting_approval` with `approval.url` = `${PUBLIC_BASE_URL}/approve/<token>` and `approval.expiresAt` (now + 10 minutes). The token is 32 random bytes, base64url; only its SHA-256 is stored.
 2. The agent sends the person the link. The page (built separately, in v0) reads [the approval API](#approval-api).
-3. The person enters their phone number and gets a 6-digit code (`POST …/code`). In Ring 1b no text is actually sent: the code goes through a stub sender that logs `{ "event": "otp.sent", "phoneLast4", "bookingId" }`. Locally, `FRONTDESK_DEV_CODES=1` returns it as `devCode` so you can demo without a phone. `TODO(ring-1c)`: Photon iMessage, with Resend as a fallback.
-4. **Approve** (`POST …/approve` with the code): the booking becomes `confirmed`, the customer is stored by phone number (plain E.164) and linked, `customer.verified` becomes `true` with `phoneLast4`, and the owner is alerted. That's the only owner alert: a hold alone never notifies anyone. `TODO(ring-1c)`: a service with a deposit will go to `awaiting_deposit` instead.
+3. **Approve** (`POST …/approve`): opening the link and tapping Approve is the consent. The booking becomes `confirmed`, `customer.verified` becomes `true`, and the owner is alerted. That's the only owner alert: a hold alone never notifies anyone. The person may give a phone number; it's stored with the booking as plain E.164, and `customer.phoneLast4` shows its last 4 digits. It isn't verified. `TODO(ring-1c)`: a code texted to that number comes back once real texting ships, and a service with a deposit will go to `awaiting_deposit` instead of `confirmed`.
    **Decline** (`POST …/decline`): the booking becomes `cancelled` (`cancelled_by` `customer`) and the slot is free.
    **No answer:** after 10 minutes the hold expires (`expired`) and the slot is free.
-5. The agent calls `get_booking` to see which happened, and tells the person.
+4. The agent calls `get_booking` to see which happened, and tells the person.
 
 The agent (`cancel`) or the owner can drop a hold at any time; the link then shows `expired` and refuses further answers (`approval_closed`).
 
@@ -612,20 +580,19 @@ There's no background job yet (`TODO(ring-2)`). A hold past its deadline expires
 
 Public routes for the approval page. **The token in the path is the credential**: no sign-in. Request-time only, `Cache-Control: no-store`, errors in the `ApiError` envelope.
 
-- **CSRF:** every `POST` must carry `Origin` equal to `PUBLIC_BASE_URL`'s origin (the page's own origin, e.g. `http://localhost:3000`). Otherwise it's **403** `invalid_request` (`details.field: "origin"`), before anything is read or written. Browsers always send `Origin` on a cross-site `POST`, so another site can't answer for the person. With curl, pass `-H "Origin: http://localhost:3000"`.
 - An unknown or malformed token is **404** `booking_not_found` (a malformed one isn't even looked up).
-- Tokens, codes and full phone numbers are never logged or echoed in an error. Tokens and codes are stored only as SHA-256 hashes; phone numbers are stored as plain E.164. (The hosting platform's request log does record request paths, so the token appears there; it's single-purpose and dead after 10 minutes.)
+- The token is never logged, stored in the clear or echoed in an error. (The hosting platform's request log does record request paths, so the token appears there; it's single-purpose and dead after 10 minutes.)
+- There's no `Origin` (CSRF) check: anyone holding the link can approve or decline from anywhere, curl included. That's an MVP decision; see the PR.
 
 | Method and path | Request | Response | Errors |
 |---|---|---|---|
 | `GET /api/approvals/[token]` | | `ApprovalView` | 404 |
-| `POST /api/approvals/[token]/code` | `SendCodeRequest` | `SendCodeResponse` | 400, 403, 404, 409 `approval_closed`, 410 `approval_expired`, 429 `rate_limited` |
-| `POST /api/approvals/[token]/approve` | `ApproveRequest` | `ApproveResponse` | 400, 403, 404, 409 `approval_closed`, 410 `approval_expired` or `code_expired`, 422 `code_invalid`, 429 `too_many_attempts` |
-| `POST /api/approvals/[token]/decline` | none | `DeclineResponse` | 403, 404, 409 `approval_closed`, 410 `approval_expired` |
+| `POST /api/approvals/[token]/approve` | `ApproveRequest` (optional) | `ApproveResponse` | 400, 404, 409 `approval_closed`, 410 `approval_expired` |
+| `POST /api/approvals/[token]/decline` | none | `DeclineResponse` | 404, 409 `approval_closed`, 410 `approval_expired` |
 
 #### `GET /api/approvals/[token]` → `ApprovalView`
 
-Expires the hold first if it lapsed. `status` is `pending` (the person can answer), `approved`, `declined`, or `expired` (the hold ran out, or the agent or shop cancelled before the person answered). `codeSentTo` (last 4 digits) is there while the latest code can still be used; `mandate` only when the agent sent one.
+Expires the hold first if it lapsed. `status` is `pending` (the person can answer), `approved`, `declined`, or `expired` (the hold ran out, or the agent or shop cancelled before the person answered). `mandate` is there only when the agent sent one.
 
 ```json
 {
@@ -650,25 +617,11 @@ Expires the hold first if it lapsed. `status` is `pending` (the person can answe
 }
 ```
 
-#### `POST /api/approvals/[token]/code` → `SendCodeResponse`
-
-Body: `{ "phone": "+14015550123" }`, E.164 (spaces, dashes, dots and parentheses are ignored). Only while the approval is pending.
-
-- A new 6-digit code (`crypto.randomInt`), valid for 10 minutes. Only its SHA-256 is stored, with the phone number (E.164). **A new code replaces the previous one.**
-- Limits (sliding one-hour windows): **3 codes per phone number** across all links, and **10 per link**. Over a limit → **429** `rate_limited` with `details.retryAfter` (seconds, also in the `Retry-After` header) and `details.limit` (`phone` or `link`). Nothing is sent.
-- `devCode` is included only when `FRONTDESK_DEV_CODES=1` and the app isn't running on Vercel production (`VERCEL_ENV` isn't `production`). Never in production.
-
-```json
-{ "sentTo": "0123", "expiresAt": "2026-11-10T11:10:00-05:00", "devCode": "292100" }
-```
-
 #### `POST /api/approvals/[token]/approve` → `ApproveResponse`
 
-Body: `{ "code": "292100" }` (6 digits; spaces ignored). Checks, in order:
+Body (optional): no body, `{}`, or `{ "phone": "+14015550123" }`. The phone is E.164; spaces, dashes, dots and parentheses are ignored, and anything else is `invalid_request` (`details.field: "phone"`, the number isn't echoed). Checks, in order:
 1. The approval is pending: already answered or cancelled → `approval_closed`; the hold ran out → `approval_expired` ("Ask your agent to book again.").
-2. The latest code is usable: none sent yet or already used → `code_invalid`; older than 10 minutes → `code_expired`; 5 attempts used → `too_many_attempts`. (While the hold and the code both last 10 minutes from when they're made, a lapsed hold is reported first.)
-3. The attempt is counted, then the code's SHA-256 is compared with the stored one in constant time. Wrong → `code_invalid` with `details.attemptsLeft`; the 5th wrong code → `too_many_attempts`, after which a new code is needed. A malformed code (not 6 digits) is `invalid_request` and isn't counted.
-4. In one transaction: the code is consumed (it works once), the customer is upserted by phone number (display name: the booking's `customer_name`) and linked, the booking becomes `confirmed` with an `approved` event (actor `customer`, `data.phoneLast4`), and the approval is marked decided, all only if the hold is still on. The owner is then alerted once.
+2. In one transaction, only if the hold is still on: the booking becomes `confirmed` with an `approved` event (actor `customer`, plus `data.phoneLast4` when a phone was given), the phone is stored on the booking, and the approval is marked decided. The owner is then alerted once.
 
 ```json
 {
@@ -703,7 +656,7 @@ Body: `{ "code": "292100" }` (6 digits; spaces ignored). Checks, in order:
 
 #### `POST /api/approvals/[token]/decline` → `DeclineResponse`
 
-No body, no code: holding the link is enough to say no. The booking becomes `cancelled` (a `declined` event, actor `customer`) and the slot is free. Only while pending.
+No body. The booking becomes `cancelled` (a `declined` event, actor `customer`) and the slot is free. Only while pending.
 
 #### Try it with curl
 
@@ -711,8 +664,7 @@ No body, no code: holding the link is enough to say no. The booking becomes `can
 T=<the token at the end of approval.url>
 A=http://localhost:3000/api/approvals/$T
 curl -s $A
-curl -s -X POST $A/code -H "Origin: http://localhost:3000" -H "Content-Type: application/json" -d '{"phone":"+14015550123"}'
-curl -s -X POST $A/approve -H "Origin: http://localhost:3000" -H "Content-Type: application/json" -d '{"code":"<devCode>"}'
+curl -s -X POST $A/approve -H "Content-Type: application/json" -d '{"phone":"+14015550123"}'
 ```
 
 ### Mandate
@@ -789,7 +741,7 @@ Every state change writes exactly one event, in the same transaction, starting w
 | `at` | RFC 3339 in the shop's offset. With Postgres, the database's time (see [Freezing time](#freezing-time-frontdesk_now)). |
 | `actor` | `agent`, `owner`, `customer` (the person, through the approval link) or `system` (a hold that ran out). |
 | `type` | `booked`, `approved`, `declined`, `expired`, `cancelled`, `completed` or `no_show`. Ring 1c adds more. |
-| `data` | `booked`: `{ status: "awaiting_approval", agentName, mandate? }`. A transition: `{ from, to, depositEffect, depositCollected }`; `approved` adds `phoneLast4`. |
+| `data` | `booked`: `{ status: "awaiting_approval", agentName, mandate? }`. A transition: `{ from, to, depositEffect, depositCollected }`; `approved` adds `phoneLast4` when the person gave a phone number. |
 
 ```json
 [
@@ -872,7 +824,7 @@ Public: no token. Bookings of any status whose time overlaps the range from 7 da
 }
 ```
 
-**No sign-in yet:** anyone with the URL can read customer names and the last 4 digits of verified phones. Owner sign-in is `TODO(ring-2)`.
+**No sign-in yet:** anyone with the URL can read customer names and the last 4 digits of the phone numbers people gave when approving. Owner sign-in is `TODO(ring-2)`.
 
 ## Owner routes
 
@@ -1176,15 +1128,14 @@ curl -s http://localhost:3000/api/shops/harts/bookings/<booking id> -H "Authoriz
 
 ## Try the full loop
 
-Start the app. With `DATABASE_URL` set (see [database.md](database.md)), bookings go to Postgres. Without it, they go to an in-memory store that resets when the server restarts. Put an owner token and dev codes in `.env.local` (git-ignored) so the owner routes work and the code request returns the code:
+Start the app. With `DATABASE_URL` set (see [database.md](database.md)), bookings go to Postgres. Without it, they go to an in-memory store that resets when the server restarts. Put an owner token in `.env.local` (git-ignored) so the owner routes work:
 
 ```bash
 echo "OWNER_API_TOKEN=$(openssl rand -hex 32)" >> .env.local
-echo "FRONTDESK_DEV_CODES=1" >> .env.local
 FRONTDESK_NOW=2026-11-10T10:00:00-05:00 pnpm dev
 ```
 
-If port 3000 is taken, Next picks another port: then also set `PUBLIC_BASE_URL=http://localhost:<port>`, or the approval links and the `Origin` check point at the wrong port.
+If port 3000 is taken, Next picks another port: then also set `PUBLIC_BASE_URL=http://localhost:<port>`, or the approval links point at the wrong port.
 
 The frozen clock makes the examples valid. It's Tuesday 10 Nov, 10:00 am, a day Hart's is open (it's closed Sunday and Monday). Saturday 14 Nov is 4 days ahead: inside the 6-day deposit horizon a haircut has, and more than 24 hours ahead, so cancelling releases the deposit.
 
@@ -1208,38 +1159,32 @@ $I --method tools/call --tool-name get_availability \
 $I --method tools/call --tool-name get_availability \
   --tool-arg service_id=haircut --tool-arg from=2026-11-14T00:00:00-05:00 --tool-arg to=2026-11-15T00:00:00-05:00
 
-# 4. Book one of the returned starts, with a fresh idempotency key → awaiting_approval and an approval link
-K=$(uuidgen)
+# 4. Book one of the returned starts → awaiting_approval and an approval link
 $I --method tools/call --tool-name book \
-  --tool-arg service_id=haircut --tool-arg start=2026-11-14T14:30:00-05:00 --tool-arg customer_name=Maya --tool-arg idempotency_key=$K
+  --tool-arg service_id=haircut --tool-arg start=2026-11-14T14:30:00-05:00 --tool-arg customer_name=Maya
 B=<the booking id from the text>
 T=<the token at the end of the approval link>
 
-# 5. Retry with the same key → the same booking and link, marked "(replayed: …)"; nothing new is booked
+# 5. The same slot again while it's held → slot_taken, with details.alternatives (1:45, 2:00 and 3:00 pm)
 $I --method tools/call --tool-name book \
-  --tool-arg service_id=haircut --tool-arg start=2026-11-14T14:30:00-05:00 --tool-arg customer_name=Maya --tool-arg idempotency_key=$K
+  --tool-arg service_id=haircut --tool-arg start=2026-11-14T14:30:00-05:00 --tool-arg customer_name=Jo
 
-# 6. Same slot while it's held, new key → slot_taken, with details.alternatives (1:45, 2:00 and 3:00 pm)
-$I --method tools/call --tool-name book \
-  --tool-arg service_id=haircut --tool-arg start=2026-11-14T14:30:00-05:00 --tool-arg customer_name=Jo --tool-arg idempotency_key=$(uuidgen)
-
-# 6b. Maya approves on the approval page; with curl: the view, a code (devCode comes back), approve
+# 6. Maya approves on the approval page; with curl: the view, then approve (the phone is optional)
 A=http://localhost:3000/api/approvals/$T
 curl -s $A
-curl -s -X POST $A/code -H "Origin: http://localhost:3000" -H "Content-Type: application/json" -d '{"phone":"+14015550123"}'
-curl -s -X POST $A/approve -H "Origin: http://localhost:3000" -H "Content-Type: application/json" -d '{"code":"<devCode>"}'
+curl -s -X POST $A/approve -H "Content-Type: application/json" -d '{"phone":"+14015550123"}'
 $I --method tools/call --tool-name get_booking --tool-arg booking_id=$B   # → confirmed, verified, phone ending 0123
 
 # 7. A haircut a week ahead → too_far (details.latest is 2026-11-16T10:00:00-05:00)
 $I --method tools/call --tool-name book \
-  --tool-arg service_id=haircut --tool-arg start=2026-11-17T10:00:00-05:00 --tool-arg customer_name=Jo --tool-arg idempotency_key=$(uuidgen)
+  --tool-arg service_id=haircut --tool-arg start=2026-11-17T10:00:00-05:00 --tool-arg customer_name=Jo
 
 # 8. The UI's view: the booking is there, with customer.verified true and phoneLast4 "0123"
 curl -s $O/bookings
 
 # 9. Cancel it, 4 days ahead → cancelled, depositEffect "released", depositCollected false
 $I --method tools/call --tool-name get_booking --tool-arg booking_id=$B
-$I --method tools/call --tool-name cancel --tool-arg booking_id=$B --tool-arg idempotency_key=$(uuidgen)
+$I --method tools/call --tool-name cancel --tool-arg booking_id=$B
 
 # 10. The owner's view: booked (agent), approved (customer), then cancelled (agent)
 curl -s $O/bookings/$B -H "$AUTH"
@@ -1249,18 +1194,16 @@ curl -s -X PUT $O/policies -H "$AUTH" -H "Content-Type: application/json" -d '{"
 $I --method tools/call --tool-name get_availability \
   --tool-arg service_id=haircut --tool-arg from=2026-11-14T00:00:00-05:00 --tool-arg to=2026-11-15T00:00:00-05:00
 $I --method tools/call --tool-name book \
-  --tool-arg service_id=haircut --tool-arg start=2026-11-14T14:30:00-05:00 --tool-arg customer_name=Maya --tool-arg idempotency_key=$(uuidgen)
+  --tool-arg service_id=haircut --tool-arg start=2026-11-14T14:30:00-05:00 --tool-arg customer_name=Maya
 curl -s -X PUT $O/policies -H "$AUTH" -H "Content-Type: application/json" -d '{"paused": false}'
 
 # 12. A no-show needs a confirmed booking whose start has passed. With the clock frozen, set the lead
 #     time to 0, book the frozen "now" itself (Tue 10 Nov, 10:00 am), and approve it as above.
 curl -s -X PUT $O/policies -H "$AUTH" -H "Content-Type: application/json" -d '{"leadTimeMin": 0}'
 $I --method tools/call --tool-name book \
-  --tool-arg service_id=haircut --tool-arg start=2026-11-10T10:00:00-05:00 --tool-arg customer_name=Sam --tool-arg idempotency_key=$(uuidgen)
+  --tool-arg service_id=haircut --tool-arg start=2026-11-10T10:00:00-05:00 --tool-arg customer_name=Sam
 P=<the booking id from the text>
-A=http://localhost:3000/api/approvals/<its token>
-curl -s -X POST $A/code -H "Origin: http://localhost:3000" -H "Content-Type: application/json" -d '{"phone":"+14015550199"}'
-curl -s -X POST $A/approve -H "Origin: http://localhost:3000" -H "Content-Type: application/json" -d '{"code":"<devCode>"}'
+curl -s -X POST http://localhost:3000/api/approvals/<its token>/approve
 curl -s -X POST $O/bookings/$P/no-show -H "$AUTH"      # → no_show, depositEffect "captured"
 curl -s $O/bookings/$P -H "$AUTH"                      # → booked, approved, then no_show by the owner
 
@@ -1282,15 +1225,15 @@ The seed ([`supabase/seed.sql`](../supabase/seed.sql)) has one shop, and the in-
 
 ### Freezing time: `FRONTDESK_NOW`
 
-Set `FRONTDESK_NOW` to an RFC 3339 instant to freeze Front Desk's clock. Demos are then reproducible, because everything that depends on "now" is computed from that instant: the lead time, the horizons, which starts are past, the cancellation window, whether an appointment has started, and, for consent, the hold's 10 minutes, a code's 10 minutes and the one-hour send limits. To see a hold expire, restart with `FRONTDESK_NOW` more than 10 minutes later.
+Set `FRONTDESK_NOW` to an RFC 3339 instant to freeze Front Desk's clock. Demos are then reproducible, because everything that depends on "now" is computed from that instant: the lead time, the horizons, which starts are past, the cancellation window, whether an appointment has started, and the hold's 10 minutes. To see a hold expire, restart with `FRONTDESK_NOW` more than 10 minutes later.
 
 ```bash
 FRONTDESK_NOW=2026-11-10T10:00:00-05:00 pnpm dev
 ```
 
 What it doesn't freeze depends on the store:
-- **Postgres:** `createdAt`, event times (`at`), the lifecycle timestamps and the age of idempotency keys are the database's real time (`now()`). Keys still expire 24 real hours after they were first used.
-- **In-memory store:** those use the frozen clock too, so `createdAt` and event times show the frozen instant, and idempotency keys never expire while the clock is frozen.
+- **Postgres:** `createdAt`, event times (`at`) and the lifecycle timestamps are the database's real time (`now()`).
+- **In-memory store:** those use the frozen clock too, so `createdAt` and event times show the frozen instant.
 
 On Vercel, set it as an environment variable. Leave it unset to use real time. An invalid value makes every call that reads the clock fail with `internal`, and the server log explains why.
 
@@ -1308,7 +1251,7 @@ In the Inspector UI:
 2. Enter `http://localhost:3000/api/mcp` (or a preview URL plus `/api/mcp`) and click **Connect**.
 3. Open **Tools**, then **List Tools**. You should see six tools: `list_services`, `get_policies`, `get_availability`, `book`, `get_booking` and `cancel`.
 
-`book` and `cancel` need an `idempotency_key`: paste a fresh UUID (e.g. from `uuidgen`). To see a replay, call again with the same one. `book` returns an approval link: approve it with the curl commands in [Try it with curl](#try-it-with-curl).
+`book` returns an approval link: approve it with the curl commands in [Try it with curl](#try-it-with-curl).
 
 From the command line:
 
@@ -1338,13 +1281,12 @@ These are marked `TODO(ring-N)` in the code:
 |---|---|---|
 | ring-1c | Collect deposits and move money (`depositEffect` is the policy's decision; `depositCollected` is always `false`) | `lib/server/frontdesk/service.ts` (`book`, `transitionBooking`), `lib/server/engine/lifecycle.ts` |
 | ring-1c | `awaiting_deposit`: approval confirms a booking even when its service has a deposit, until deposits come with Stripe | `lib/server/engine/lifecycle.ts` (`decideAnswer`), `lib/server/consent/approvals.ts` (`approveBooking`), `lib/server/frontdesk/service.ts` (`book`) |
-| ring-1c | Send codes for real: Photon iMessage, with Resend as a fallback (today a log line, or `devCode` locally) | `lib/server/consent/code-sender.ts` |
+| ring-1c | A code texted to the person's phone (Photon iMessage, Resend as a fallback) comes back once real texting ships; today the link alone is the consent | `lib/server/consent/approvals.ts`, `lib/types/frontdesk.ts` (approval page types), `supabase/migrations/0003_consent.sql` |
 | ring-1c | Owner alerts on a real channel (Photon) instead of a log line, including when an agent cancels | `lib/server/notify/log-notifier.ts`, `lib/server/frontdesk/service.ts` (`cancelBooking`) |
 | ring-2 | Let agents pick the shop (by slug or URL) instead of hard-coding Hart's | `lib/server/frontdesk/mcp.ts` (`DEFAULT_SHOP_SLUG`) |
 | ring-2 | Owner sign-in replaces `OWNER_API_TOKEN`, and protects the public bookings route | `lib/server/frontdesk/owner-auth.ts`, `lib/server/frontdesk/http.ts`, the owner route files, `lib/server/frontdesk/service.ts` (`listShopBookings`) |
 | ring-2 | MCP sign-in: authenticate callers (`book` and `cancel` are open to anyone) | `app/api/mcp/route.ts` |
 | ring-2 | Verified agent identity instead of the self-reported client name | `lib/server/frontdesk/mcp.ts` (`agentNameFrom`) |
-| ring-2 | A job that deletes idempotency keys older than 24 hours (a `book` key's saved result holds the approval link until then) | `lib/server/frontdesk/booking-store.ts` (`IDEMPOTENCY_TTL_MS`), `supabase/migrations/0002_rules.sql` |
 | ring-2 | `get_booking` and `cancel` still trust anyone holding the booking id; agent identity fixes this | `lib/server/frontdesk/service.ts` (`getBooking`, `cancelBooking`), `app/api/mcp/route.ts` |
 | ring-2 | Require a mandate once agents sign in | `lib/server/engine/lifecycle.ts` (`decide`, book), `lib/server/frontdesk/service.ts` (`book`), `lib/types/frontdesk.ts` (`Mandate`) |
 | ring-2 | A scheduled job that expires lapsed holds (today: lazy expiry on the next read or book) | `lib/server/frontdesk/booking-store.ts` (`refreshBooking`), `lib/server/frontdesk/service.ts` (`bookOnce`) |

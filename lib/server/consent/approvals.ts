@@ -1,34 +1,18 @@
-import type {
-  ApprovalView,
-  ApproveResponse,
-  Booking,
-  DeclineResponse,
-  Policies,
-  SendCodeResponse,
-  Shop,
-} from "../../types/frontdesk";
+import type { ApprovalView, ApproveResponse, Booking, DeclineResponse, Policies, Shop } from "../../types/frontdesk";
 import { decide, type Decision } from "../engine/lifecycle";
-import type { ApprovalRecord, ChallengeRecord } from "../frontdesk/booking-store";
+import type { ApprovalRecord } from "../frontdesk/booking-store";
 import { FrontDeskError } from "../frontdesk/errors";
 import { alertOwner, EVENT_FOR, policiesFor, type FrontDeskDeps } from "../frontdesk/service";
 import { toRfc3339 } from "../frontdesk/time";
-import {
-  CODE_TTL_MINUTES,
-  MAX_CODE_ATTEMPTS,
-  SEND_WINDOW_MS,
-  SENDS_PER_LINK_PER_HOUR,
-  SENDS_PER_PHONE_PER_HOUR,
-} from "./config";
-import { isWellFormedToken, last4, newCode, normalizePhone, sameDigest, sha256Hex } from "./crypto";
+import { isWellFormedToken, last4, normalizePhone, sha256Hex } from "./crypto";
 
-// The approval page's use cases, behind /api/approvals/[token]/*: what the person sees, sending them a
-// code, and their answer. The token in the link is the only credential (no sign-in, no OAuth), so it
-// works whatever MCP client the agent used. Transport-agnostic like service.ts; http.ts adds the
-// Origin check and turns results and FrontDeskErrors into responses.
+// The approval page's use cases, behind /api/approvals/[token]/*: what the person sees, and their
+// answer. The token in the link is the only credential (no sign-in, no OAuth), so it works whatever
+// MCP client the agent used: opening the link and tapping Approve is the consent.
+// TODO(ring-1c): a code texted to the person's phone comes back once real texting ships.
+// Transport-agnostic like service.ts; http.ts turns results and FrontDeskErrors into responses.
 //
-// Never logged or echoed in an error: the token, the code, the full phone number.
-
-const CODE_TTL_MS = CODE_TTL_MINUTES * 60 * 1000;
+// The token is never logged or echoed in an error.
 
 /** An approval request with its booking (after lazy expiry) and shop. */
 type OpenApproval = { approval: ApprovalRecord; booking: Booking; shop: Shop };
@@ -61,12 +45,7 @@ async function openApproval(deps: FrontDeskDeps, token: string): Promise<OpenApp
  * decide() the person's answer, or throw why they can't give it: approval_closed (already answered,
  * or the booking was cancelled), approval_expired (the hold lapsed).
  */
-function decideAnswer(
-  ctx: OpenApproval,
-  type: "approve" | "decline",
-  now: Date,
-  policies: Policies,
-): Decision {
+function decideAnswer(ctx: OpenApproval, type: "approve" | "decline", now: Date, policies: Policies): Decision {
   const { approval, booking } = ctx;
   if (approval.decision !== null) {
     throw new FrontDeskError(
@@ -98,28 +77,17 @@ async function whyNotPending(deps: FrontDeskDeps, token: string, type: "approve"
   );
 }
 
-/** The challenge can still be used to approve: unconsumed, unexpired, attempts left. */
-function usable(challenge: ChallengeRecord, now: Date): boolean {
-  return challenge.consumedAt === null && challenge.expiresAt.getTime() > now.getTime() && challenge.attempts < MAX_CODE_ATTEMPTS;
-}
-
 // ---- GET /api/approvals/[token] ----
 
 /** What the approval page shows. See ApprovalView for each status. */
 export async function getApprovalView(deps: FrontDeskDeps, token: string): Promise<ApprovalView> {
-  const ctx = await openApproval(deps, token);
-  const { approval, booking, shop } = ctx;
-  const [services, policies, challenge] = await Promise.all([
-    deps.catalog.listServices(shop.slug),
-    policiesFor(deps, shop.slug),
-    deps.store.latestChallenge(booking.id),
-  ]);
+  const { approval, booking, shop } = await openApproval(deps, token);
+  const [services, policies] = await Promise.all([deps.catalog.listServices(shop.slug), policiesFor(deps, shop.slug)]);
   const service = services.find((s) => s.id === booking.serviceId);
   if (!service) throw new Error(`Booking ${booking.id} has a service that doesn't exist: ${booking.serviceId}.`);
 
   const status: ApprovalView["status"] =
     approval.decision ?? (booking.status === "awaiting_approval" ? "pending" : "expired");
-  const codeSentTo = status === "pending" && challenge && usable(challenge, deps.clock.now()) ? last4(challenge.phone) : null;
   return {
     status,
     shop,
@@ -139,181 +107,69 @@ export async function getApprovalView(deps: FrontDeskDeps, token: string): Promi
     customerName: booking.customer.displayName,
     ...(approval.mandate ? { mandate: approval.mandate } : {}),
     expiresAt: toRfc3339(approval.approveBy, shop.timezone),
-    ...(codeSentTo ? { codeSentTo } : {}),
   };
 }
 
-// ---- POST /api/approvals/[token]/code ----
+// ---- POST /api/approvals/[token]/approve ----
 
-function bodyFields(body: unknown): Record<string, unknown> {
-  if (body === null || typeof body !== "object" || Array.isArray(body)) {
-    throw new FrontDeskError("invalid_request", "The request body must be a JSON object.", "Send a JSON object as the request body.", {
+/**
+ * The approve body's phone number as E.164, or null when there is none. The body is optional: none,
+ * an empty body or {} approve without a phone. A number that isn't E.164 (after removing spaces,
+ * dashes, dots and parentheses) is invalid_request; it isn't echoed back.
+ */
+export function parseApproveBody(body: unknown): string | null {
+  if (body === undefined || body === null) return null;
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new FrontDeskError("invalid_request", "The request body must be a JSON object.", "Send {} or { \"phone\": \"+14015550123\" }.", {
       field: "body",
     });
   }
-  return body as Record<string, unknown>;
-}
-
-/** The body's phone number as E.164. The number is never echoed back in an error. */
-export function parseSendCodeBody(body: unknown): string {
-  const { phone } = bodyFields(body);
+  const { phone } = body as Record<string, unknown>;
+  if (phone === undefined || phone === null || phone === "") return null;
   const e164 = typeof phone === "string" ? normalizePhone(phone) : null;
   if (!e164) {
     throw new FrontDeskError(
       "invalid_request",
       "phone must be a phone number in international format, starting with + and the country code.",
-      'Enter the number with its country code, e.g. "+14015550123".',
+      'Enter the number with its country code, e.g. "+14015550123", or leave it out.',
       { field: "phone" },
     );
   }
   return e164;
 }
 
-/** rate_limited for a send limit, with details.retryAfter in whole seconds. */
-function rateLimited(limit: "phone" | "booking", retryAfterMs: number): FrontDeskError {
-  const retryAfter = Math.max(1, Math.ceil(retryAfterMs / 1000));
-  const minutes = Math.ceil(retryAfter / 60);
-  const wait = `${minutes} minute${minutes === 1 ? "" : "s"}`;
-  return new FrontDeskError(
-    "rate_limited",
-    limit === "phone"
-      ? "Too many codes were sent to this phone number in the last hour."
-      : "Too many codes were requested with this link in the last hour.",
-    `Use the last code you received, or try again in ${wait}. If the hold runs out first, ask your agent to book again.`,
-    { retryAfter, limit: limit === "phone" ? "phone" : "link" },
-  );
-}
-
 /**
- * Send the person a 6-digit code (SendCodeRequest → SendCodeResponse), only while the approval is
- * pending. Limits: SENDS_PER_PHONE_PER_HOUR per phone number and SENDS_PER_LINK_PER_HOUR per link
- * (rate_limited). The code's SHA-256 is stored with the phone number; the code works for
- * CODE_TTL_MINUTES and replaces any earlier one. devCode is included only when deps.consent.devCodes.
- */
-export async function sendApprovalCode(deps: FrontDeskDeps, token: string, body: unknown): Promise<SendCodeResponse> {
-  const phone = parseSendCodeBody(body);
-  const ctx = await openApproval(deps, token);
-  const now = deps.clock.now();
-  decideAnswer(ctx, "approve", now, await policiesFor(deps, ctx.shop.slug));
-
-  const code = newCode();
-  const expiresAt = new Date(now.getTime() + CODE_TTL_MS);
-  const created = await deps.store.createChallenge({
-    bookingId: ctx.booking.id,
-    phone,
-    codeHash: sha256Hex(code),
-    expiresAt,
-    now,
-    limits: { perPhone: SENDS_PER_PHONE_PER_HOUR, perBooking: SENDS_PER_LINK_PER_HOUR, windowMs: SEND_WINDOW_MS },
-  });
-  if (!created.ok) throw rateLimited(created.limit, created.retryAfterMs);
-
-  await deps.codeSender.send({ phoneE164: phone, code, shopName: ctx.shop.name, bookingId: ctx.booking.id });
-  return {
-    sentTo: last4(phone),
-    expiresAt: toRfc3339(expiresAt, ctx.shop.timezone),
-    ...(deps.consent.devCodes ? { devCode: code } : {}),
-  };
-}
-
-// ---- POST /api/approvals/[token]/approve ----
-
-/** The body's code: 6 digits (spaces ignored). Malformed isn't an attempt. Never echoed back. */
-export function parseApproveBody(body: unknown): string {
-  const { code } = bodyFields(body);
-  const digits = typeof code === "string" ? code.replace(/\s/g, "") : "";
-  if (!/^\d{6}$/.test(digits)) {
-    throw new FrontDeskError("invalid_request", "code must be the 6 digits from the text message.", "Enter the 6-digit code you received.", {
-      field: "code",
-    });
-  }
-  return digits;
-}
-
-function codeInvalid(message: string, nextAction: string, details?: Record<string, unknown>): FrontDeskError {
-  return new FrontDeskError("code_invalid", message, nextAction, details);
-}
-
-const NEW_CODE = "Request a new code and enter that one.";
-
-/** Why a challenge can't be used (it isn't usable()). */
-function unusable(challenge: ChallengeRecord, now: Date): FrontDeskError {
-  if (challenge.consumedAt !== null) return codeInvalid("That code was already used.", NEW_CODE);
-  if (challenge.attempts >= MAX_CODE_ATTEMPTS) {
-    return new FrontDeskError("too_many_attempts", "Too many wrong codes.", NEW_CODE, { maxAttempts: MAX_CODE_ATTEMPTS });
-  }
-  if (challenge.expiresAt.getTime() <= now.getTime()) {
-    return new FrontDeskError("code_expired", `That code has expired: codes work for ${CODE_TTL_MINUTES} minutes.`, NEW_CODE);
-  }
-  return codeInvalid("That code can't be used.", NEW_CODE);
-}
-
-/**
- * Approve with the latest code (ApproveRequest → ApproveResponse): the booking becomes confirmed with a
- * verified customer, and the owner is alerted (once).
- * 1. The approval must be pending (approval_closed, approval_expired).
- * 2. The latest code must be usable: none sent → code_invalid; used → code_invalid; expired →
- *    code_expired; 5 attempts used → too_many_attempts.
- * 3. Count the attempt, then compare the code's SHA-256 with the stored one in constant time. Wrong:
- *    code_invalid with details.attemptsLeft, or too_many_attempts on the 5th wrong try.
- * 4. In one transaction: consume the code, upsert the customer by phone number (display name from the
- *    booking's customer name), link it, confirm the booking and write the "approved" event, only if
- *    the hold is still on. A hold that lapsed meanwhile → approval_expired.
+ * Approve (ApproveRequest → ApproveResponse): opening the link and approving is the consent. The
+ * booking becomes confirmed (customer.verified true; phoneLast4 when a phone was given), and the owner
+ * is alerted (once). Only while pending: already answered or cancelled → approval_closed; the hold
+ * lapsed → approval_expired ("Ask your agent to book again."). In one transaction, only if the hold is
+ * still on: the booking is confirmed with an "approved" event (actor customer) and the phone stored.
  * TODO(ring-1c): a service with a deposit goes to awaiting_deposit instead (see decide()).
  */
-export async function approveBooking(deps: FrontDeskDeps, token: string, body: unknown): Promise<ApproveResponse> {
-  const code = parseApproveBody(body);
+export async function approveBooking(deps: FrontDeskDeps, token: string, body?: unknown): Promise<ApproveResponse> {
+  const phone = parseApproveBody(body);
   const ctx = await openApproval(deps, token);
   const now = deps.clock.now();
   const decision = decideAnswer(ctx, "approve", now, await policiesFor(deps, ctx.shop.slug));
-  const { booking } = ctx;
-
-  const challenge = await deps.store.latestChallenge(booking.id);
-  if (!challenge) {
-    throw codeInvalid("No code has been sent for this booking yet.", "Enter your phone number to get a code first.");
-  }
-  if (!usable(challenge, now)) throw unusable(challenge, now);
-
-  const attempts = await deps.store.recordCodeAttempt(challenge.id, now, MAX_CODE_ATTEMPTS);
-  if (attempts === null) {
-    // Used, expired or out of attempts since it was read: say which.
-    const fresh = await deps.store.latestChallenge(booking.id);
-    throw unusable(fresh && fresh.id === challenge.id ? fresh : { ...challenge, consumedAt: now }, now);
-  }
-  if (!sameDigest(sha256Hex(code), challenge.codeHash)) {
-    const attemptsLeft = MAX_CODE_ATTEMPTS - attempts;
-    if (attemptsLeft <= 0) throw unusable({ ...challenge, attempts }, now);
-    throw codeInvalid(
-      "That code isn't right.",
-      `Check the code and try again (${attemptsLeft} attempt${attemptsLeft === 1 ? "" : "s"} left), or request a new code.`,
-      { attemptsLeft },
-    );
-  }
-
   const answered = await deps.store.answerApproval({
-    bookingId: booking.id,
+    bookingId: ctx.booking.id,
     decision: "approved",
     nextStatus: decision.nextStatus,
     now,
-    challengeId: challenge.id,
-    customer: { phone: challenge.phone, displayName: booking.customer.displayName },
+    phone,
     event: {
       actor: "customer",
       type: EVENT_FOR.approve,
       data: {
-        from: booking.status,
+        from: ctx.booking.status,
         to: decision.nextStatus,
         depositEffect: decision.depositEffect,
         depositCollected: false,
-        phoneLast4: last4(challenge.phone),
+        ...(phone ? { phoneLast4: last4(phone) } : {}),
       },
     },
   });
-  if (!answered.ok) {
-    throw answered.reason === "code_used"
-      ? codeInvalid("That code was already used.", NEW_CODE)
-      : await whyNotPending(deps, token, "approve");
-  }
+  if (!answered.ok) throw await whyNotPending(deps, token, "approve");
   // The owner hears about a booking only once the person approved it, never about a hold.
   await alertOwner(deps.notifier, answered.booking);
   return { booking: answered.booking };
@@ -323,8 +179,7 @@ export async function approveBooking(deps: FrontDeskDeps, token: string, body: u
 
 /**
  * Decline (→ DeclineResponse): the booking becomes cancelled (cancelled_by customer), freeing the slot.
- * No code needed: holding the link is enough to say no. Only while pending (approval_closed,
- * approval_expired).
+ * Only while pending (approval_closed, approval_expired).
  */
 export async function declineBooking(deps: FrontDeskDeps, token: string): Promise<DeclineResponse> {
   const ctx = await openApproval(deps, token);

@@ -3,15 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Policies } from "../../types/frontdesk";
 import { fixedClock } from "../clock";
 import { sha256Hex } from "../consent/crypto";
-import {
-  expiredEventData,
-  SlotTakenError,
-  type BookingStore,
-  type ChallengeRecord,
-  type IdempotencyScope,
-  type NewBooking,
-  type NewBookingEvent,
-} from "./booking-store";
+import { expiredEventData, SlotTakenError, type NewBooking, type NewBookingEvent } from "./booking-store";
 import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { SEED } from "./memory-store";
@@ -24,9 +16,9 @@ import { holdFields, withConsent } from "./test-support";
 // supabase/migrations/0001_skeleton.sql, 0002_rules.sql, 0003_consent.sql and supabase/seed.sql applied
 // (see docs/database.md).
 // Use a scratch database. Other test files may share it, so this file only adds rows of its own and
-// deletes them afterwards: bookings in 2099, idempotency keys with a random prefix, and a throwaway
-// shop (with its own staff member and service) for the lifecycle, idempotency and owner-write tests,
-// so Hart's seeded data is only read, never changed.
+// deletes them afterwards: bookings in 2099 and a throwaway shop (with its own staff member and
+// service) for the lifecycle, consent and owner-write tests, so Hart's seeded data is only read, never
+// changed.
 const url = process.env.DATABASE_URL_TEST?.trim();
 
 if (!url) {
@@ -38,7 +30,6 @@ if (!url) {
     const store = createPostgresStore(url);
     const sql = getPostgresClient(url);
     const created: string[] = [];
-    const bookKeys: string[] = [];
     const run = Math.random().toString(16).slice(2, 10);
     // A random day in 2099, so parallel or repeated runs don't collide with each other or real data.
     const day = new Date(Date.UTC(2099, 0, 1) + Math.floor(Math.random() * 300) * 86_400_000);
@@ -60,9 +51,6 @@ if (!url) {
     // The throwaway shop. Deleting it cascades to its staff, hours, services, policies and blocks.
     const shop = `vitest-${run}`;
     const staffId = `vitest-${run}-sam`;
-    const keyPrefix = `vitest-${run}-`;
-    const key = (name: string) => `${keyPrefix}${name}`;
-    const scope = (name: string, requestHash = "hash-a"): IdempotencyScope => ({ key: key(name), tool: "book", requestHash });
     const ours = (start: Date, end: Date, depositCents = 500): NewBooking => ({
       shopSlug: shop,
       serviceId: "trim",
@@ -80,7 +68,6 @@ if (!url) {
       type: "cancelled",
       data: { from: "awaiting_approval", to: "cancelled", depositEffect: "released", depositCollected: false },
     });
-    const keyRows = (name: string) => sql`select key from idempotency_keys where key = ${key(name)} and tool = 'book'`;
 
     beforeAll(async () => {
       await sql`insert into shops (slug, name, timezone) values (${shop}, 'Vitest Shop', 'America/New_York')`;
@@ -92,22 +79,20 @@ if (!url) {
     });
 
     afterAll(async () => {
-      // Customers aren't cascaded from bookings: delete the ones this file's approvals made.
-      await sql`
-        delete from customers where id in (
-          select customer_id from bookings where customer_id is not null and (shop_slug = ${shop} or id = any(${created}::uuid[]))
-        )
-      `;
       if (created.length > 0) {
-        await sql`delete from bookings where id = any(${created}::uuid[])`;
+        await sql`delete from bookings where id = any(${created}::uuid[])`; // events and approvals cascade
       }
-      if (bookKeys.length > 0) {
-        await sql`delete from idempotency_keys where key = any(${bookKeys}::text[])`;
-      }
-      await sql`delete from idempotency_keys where starts_with(key, ${keyPrefix})`;
-      await sql`delete from bookings where shop_slug = ${shop}`; // events cascade
+      await sql`delete from bookings where shop_slug = ${shop}`;
       await sql`delete from shops where slug = ${shop}`;
       await closePostgresClients();
+    });
+
+    it("0003 dropped idempotency_keys and left no customers or otp_challenges tables", async () => {
+      const [row] = await sql<{ keys: string | null; customers: string | null; otp: string | null }[]>`
+        select to_regclass('public.idempotency_keys')::text as keys, to_regclass('public.customers')::text as customers,
+               to_regclass('public.otp_challenges')::text as otp
+      `;
+      expect(row).toEqual({ keys: null, customers: null, otp: null });
     });
 
     it("reads the seeded shop, services, split hours and policies", async () => {
@@ -172,11 +157,9 @@ if (!url) {
         clock: fixedClock(saturday.minus({ days: 1 }).toJSDate()),
         notifier: { alertOwner: async () => {} },
       });
-      const [keyA, keyB] = [crypto.randomUUID(), crypto.randomUUID()];
-      bookKeys.push(keyA, keyB);
       const results = await Promise.allSettled([
-        book(deps, "harts", { service_id: "haircut", start, customer_name: "Agent A's customer", idempotency_key: keyA }, "vitest A"),
-        book(deps, "harts", { service_id: "haircut", start, customer_name: "Agent B's customer", idempotency_key: keyB }, "vitest B"),
+        book(deps, "harts", { service_id: "haircut", start, customer_name: "Agent A's customer" }, "vitest A"),
+        book(deps, "harts", { service_id: "haircut", start, customer_name: "Agent B's customer" }, "vitest B"),
       ]);
       for (const r of results) if (r.status === "fulfilled") created.push(r.value.booking.id);
       expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
@@ -213,14 +196,14 @@ if (!url) {
           data: { status: "awaiting_approval", agentName: "vitest" },
         },
       ]);
-      const [row] = await sql<{ approve_by: Date; mandate: unknown; customer_id: string | null; token_hash: string; decision: string | null }[]>`
-        select b.approve_by, b.mandate, b.customer_id, a.token_hash, a.decision
+      const [row] = await sql<{ approve_by: Date; mandate: unknown; customer_phone: string | null; token_hash: string; decision: string | null }[]>`
+        select b.approve_by, b.mandate, b.customer_phone, a.token_hash, a.decision
         from bookings b join approvals a on a.booking_id = b.id where b.id = ${booking.id}::uuid
       `;
       expect(row).toEqual({
         approve_by: HELD_UNTIL,
         mandate: null,
-        customer_id: null,
+        customer_phone: null,
         token_hash: fields.approvalTokenHash,
         decision: null,
       });
@@ -340,119 +323,18 @@ if (!url) {
       await store.deleteBlock(shop, block!.id);
     });
 
-    // ---- Idempotency ----
-
-    /** An action that books `start` for 30 minutes in the throwaway shop and counts its runs. */
-    function booking(start: Date) {
-      const counter = {
-        runs: 0,
-        action: async (s: BookingStore) => {
-          counter.runs++;
-          return { booking: await s.createBooking(ours(start, new Date(start.getTime() + 30 * 60_000))) };
-        },
-      };
-      return counter;
-    }
-
-    it("idempotent() runs the action once and replays its result for the same key and arguments", async () => {
-      const c = booking(at(7));
-      const first = await store.idempotent(scope("replay"), c.action);
-      expect(first.replayed).toBe(false);
-      const second = await store.idempotent(scope("replay"), c.action);
-      expect(second).toEqual({ result: first.result, replayed: true });
-      expect(c.runs).toBe(1);
-      const listed = await store.listBookings(shop, { start: at(7), end: at(7, 30) });
-      expect(listed.map((b) => b.id)).toEqual([first.result.booking.id]);
-      expect(await store.listEvents(first.result.booking.id)).toHaveLength(1);
-    });
-
-    it("idempotent() throws idempotency_conflict for the same key with different arguments", async () => {
-      let runs = 0;
-      await store.idempotent(scope("conflict", "hash-a"), async () => ++runs);
-      const err = await store.idempotent(scope("conflict", "hash-b"), async () => ++runs).catch((e: unknown) => e);
-      expect(err).toBeInstanceOf(FrontDeskError);
-      expect(err).toMatchObject({
-        code: "idempotency_conflict",
-        details: { idempotency_key: key("conflict"), tool: "book" },
-      });
-      expect(runs).toBe(1);
-    });
-
-    it("idempotent() rolls back the action's writes and the key when the action throws", async () => {
-      await expect(
-        store.idempotent(scope("rollback"), async (s) => {
-          await s.createBooking(ours(at(8), at(8, 30)));
-          throw new Error("after the write");
-        }),
-      ).rejects.toThrow("after the write");
-      expect(await store.listBookings(shop, { start: at(8), end: at(8, 30) })).toEqual([]);
-      expect(await keyRows("rollback")).toHaveLength(0);
-
-      // The next call runs (even with other arguments).
-      const next = await store.idempotent(scope("rollback", "hash-b"), async () => "ran");
-      expect(next).toEqual({ result: "ran", replayed: false });
-    });
-
-    it("idempotent(): concurrent calls with the same key make one booking and get the same result", async () => {
-      const c = booking(at(9));
-      const [a, b] = await Promise.all([
-        store.idempotent(scope("concurrent"), c.action),
-        store.idempotent(scope("concurrent"), c.action),
-      ]);
-      expect(c.runs).toBe(1);
-      expect(a.result).toEqual(b.result);
-      expect([a.replayed, b.replayed].sort()).toEqual([false, true]);
-      expect(await store.listBookings(shop, { start: at(9), end: at(9, 30) })).toHaveLength(1);
-    });
-
-    it("idempotent(): a key older than 24 hours may be reused", async () => {
-      let runs = 0;
-      await store.idempotent(scope("ttl", "hash-a"), async () => ++runs);
-      await sql`update idempotency_keys set created_at = now() - interval '24 hours 1 second' where key = ${key("ttl")}`;
-      expect(await store.idempotent(scope("ttl", "hash-b"), async () => ++runs)).toEqual({ result: 2, replayed: false });
-      expect(await store.idempotent(scope("ttl", "hash-b"), async () => ++runs)).toEqual({ result: 2, replayed: true });
-    });
-
-    it("idempotent(): a slot_taken inside the action rolls back only that insert (savepoint)", async () => {
-      const taken = await store.createBooking(ours(at(10), at(10, 30)));
-      const { result } = await store.idempotent(scope("savepoint"), async (s) => {
-        await expect(s.createBooking(ours(at(10), at(10, 30)))).rejects.toBeInstanceOf(SlotTakenError);
-        // The transaction is still usable.
-        return s.createBooking(ours(at(10, 30), at(11)));
-      });
-      expect((await store.listBookings(shop, { start: at(10), end: at(11) })).map((b) => b.id)).toEqual([taken.id, result.id]);
-      expect(await keyRows("savepoint")).toHaveLength(1);
-    });
-
-    it("idempotent() can't be nested", async () => {
-      await expect(
-        store.idempotent(scope("outer"), (s) => s.idempotent(scope("inner"), async () => 1)),
-      ).rejects.toThrow(/can't be nested/);
-      expect(await keyRows("outer")).toHaveLength(0);
-    });
-
-    // ---- Consent (Ring 1b): lazy expiry, approvals, codes (the throwaway shop, on the next day) ----
+    // ---- Consent (Ring 1b): lazy expiry and approvals (the throwaway shop, on the next day) ----
 
     /** A hold in the throwaway shop at `h`:00 the next day (30 minutes), lapsing at `approveBy`. */
     const holdAt = (h: number, approveBy: Date, extra: Partial<NewBooking> = {}) =>
       store.createBooking({ ...ours(at(24 + h), at(24 + h, 30)), approveBy, ...extra });
     const statusOf = async (id: string) => (await store.getBooking(id))?.status;
     const eventsOf = async (id: string) => (await store.listEvents(id)).map((e) => [e.type, e.actor]);
-    /** 6 digits of this run's own, so its phone numbers (and customers, and send limits) never meet another run's. */
+    /** 6 digits of this run's own, in the phone numbers this file stores. */
     const PHONE_PREFIX = String(100000 + Math.floor(Math.random() * 900000));
     /** A distinct E.164 number for this run, ending in 4321, e.g. phoneOf(5) = "+1<prefix>054321". */
     const phoneOf = (n: number) => `+1${PHONE_PREFIX}${String(n).padStart(2, "0")}4321`;
     const DEADLINE = at(30);
-    const LIMITS = { perPhone: 3, perBooking: 10, windowMs: 60 * 60 * 1000 };
-    const challenge = (bookingId: string, phone: string, now: Date, limits = LIMITS) =>
-      store.createChallenge({
-        bookingId,
-        phone,
-        codeHash: sha256Hex(`code-${Math.random()}`),
-        expiresAt: new Date(now.getTime() + 10 * 60_000),
-        now,
-        limits,
-      });
 
     it("refreshBooking() expires a lapsed hold (one expired event by the system) and reads it, in one statement", async () => {
       const hold = await holdAt(1, DEADLINE);
@@ -523,125 +405,75 @@ if (!url) {
       expect(await store.findApproval(sha256Hex(`token-${run}-nobody`))).toBeNull();
     });
 
-    it("createChallenge() enforces the per-booking and per-phone limits over a sliding window, with retryAfterMs", async () => {
-      const a = await holdAt(6, DEADLINE);
-      const b = await holdAt(7, DEADLINE);
-      const phone = phoneOf(1);
-      const t0 = at(28);
-      const minute = 60_000;
-      for (let i = 0; i < 3; i++) {
-        const sent = await challenge(i < 2 ? a.id : b.id, phone, new Date(t0.getTime() + i * minute));
-        expect(sent.ok).toBe(true);
-      }
-      // A 4th code to the same phone within the hour, for either booking → limited until the 1st ages out.
-      const now = new Date(t0.getTime() + 10 * minute);
-      expect(await challenge(b.id, phone, now)).toEqual({ ok: false, limit: "phone", retryAfterMs: 50 * minute });
-      // Exactly an hour after the first send, it no longer counts.
-      expect((await challenge(b.id, phone, new Date(t0.getTime() + 60 * minute))).ok).toBe(true);
-
-      // Per booking: at most 2 here, whatever the phone.
-      const tight = { ...LIMITS, perBooking: 2 };
-      expect(await challenge(a.id, phoneOf(2), now, tight)).toEqual({ ok: false, limit: "booking", retryAfterMs: 50 * minute });
-
-      const latest = await store.latestChallenge(b.id);
-      expect(latest).toMatchObject({ bookingId: b.id, phone, attempts: 0, consumedAt: null });
-      expect(latest!.createdAt).toEqual(new Date(t0.getTime() + 60 * minute));
-      expect(await store.latestChallenge(crypto.randomUUID())).toBeNull();
-      expect(await store.latestChallenge("not-a-uuid")).toBeNull();
-    });
-
-    it("recordCodeAttempt() counts attempts only while the code is usable", async () => {
-      const hold = await holdAt(9, DEADLINE);
-      const now = at(28);
-      const sent = await challenge(hold.id, phoneOf(3), now);
-      if (!sent.ok) throw new Error("expected a challenge");
-      const id = sent.challenge.id;
-      for (let n = 1; n <= 5; n++) expect(await store.recordCodeAttempt(id, now, 5)).toBe(n);
-      expect(await store.recordCodeAttempt(id, now, 5)).toBeNull();
-      const [row] = await sql<{ attempts: number }[]>`select attempts from otp_challenges where id = ${id}::bigint`;
-      expect(row.attempts).toBe(5);
-
-      const fresh = await challenge(hold.id, phoneOf(4), now);
-      if (!fresh.ok) throw new Error("expected a challenge");
-      expect(await store.recordCodeAttempt(fresh.challenge.id, fresh.challenge.expiresAt, 5)).toBeNull(); // expired
-      expect(await store.recordCodeAttempt("not-an-id", now, 5)).toBeNull();
-    });
-
-    it("answerApproval(): approve consumes the code, upserts the customer, links it and confirms, in one transaction", async () => {
+    it("answerApproval(): approve confirms, stores the phone and marks the approval decided, in one transaction", async () => {
       const hold = await holdAt(10, DEADLINE);
       const now = at(28);
       const phone = phoneOf(5);
-      const sent = (await challenge(hold.id, phone, now)) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
-      const answer = (bookingId: string, c: ChallengeRecord, displayName = "Postgres Test") =>
+      const approve = (bookingId: string, withPhone: string | null) =>
         store.answerApproval({
           bookingId,
           decision: "approved",
           nextStatus: "confirmed",
           now,
-          challengeId: c.id,
-          customer: { phone, displayName },
-          event: { actor: "customer", type: "approved", data: { phoneLast4: "4321" } },
+          phone: withPhone,
+          event: { actor: "customer", type: "approved", data: withPhone ? { phoneLast4: "4321" } : {} },
         });
 
-      const result = await answer(hold.id, sent.challenge);
+      const result = await approve(hold.id, phone);
       expect(result).toEqual({
         ok: true,
         booking: { ...hold, status: "confirmed", customer: { displayName: "Postgres Test", verified: true, phoneLast4: "4321" } },
       });
-      const [row] = await sql<{ customer_id: string; phone: string; display_name: string; consumed_at: Date; decision: string; decided_at: Date }[]>`
-        select c.id::text as customer_id, c.phone, c.display_name, o.consumed_at, a.decision, a.decided_at
-        from bookings b
-        join customers c on c.id = b.customer_id
-        join otp_challenges o on o.booking_id = b.id
-        join approvals a on a.booking_id = b.id
+      const [row] = await sql<{ customer_phone: string | null; decision: string; decided_at: Date }[]>`
+        select b.customer_phone, a.decision, a.decided_at
+        from bookings b join approvals a on a.booking_id = b.id
         where b.id = ${hold.id}::uuid
       `;
-      expect(row).toMatchObject({ phone, display_name: "Postgres Test", consumed_at: now, decision: "approved", decided_at: now });
+      expect(row).toEqual({ customer_phone: phone, decision: "approved", decided_at: now });
       expect(await eventsOf(hold.id)).toEqual([
         ["booked", "agent"],
         ["approved", "customer"],
       ]);
+      // Every read shows the verified customer, from the approval row.
+      expect(await store.getBooking(hold.id)).toEqual(result.ok && result.booking);
+      expect((await store.listBookings(shop, { start: at(34), end: at(34, 30) })).map((b) => b.customer)).toEqual([
+        { displayName: "Postgres Test", verified: true, phoneLast4: "4321" },
+      ]);
 
-      // The same code again: refused, nothing written. (Postgres checks the approval row first, so this
-      // already-answered booking reads as not_pending; a used code on a pending booking is code_used, below.)
-      expect(await answer(hold.id, sent.challenge)).toMatchObject({ ok: false });
+      // Answering again: refused, nothing written.
+      expect(await approve(hold.id, phoneOf(7))).toEqual({ ok: false, reason: "not_pending" });
       expect(await store.listEvents(hold.id)).toHaveLength(2);
+      expect((await sql<{ customer_phone: string }[]>`select customer_phone from bookings where id = ${hold.id}::uuid`)[0].customer_phone).toBe(phone);
 
-      // A used code on a booking still awaiting approval: code_used, and nothing written.
-      const pending = await holdAt(14, DEADLINE);
-      const used = (await challenge(pending.id, phone, now)) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
-      await sql`update otp_challenges set consumed_at = ${now.toISOString()}::timestamptz where id = ${used.challenge.id}::bigint`;
-      expect(await answer(pending.id, used.challenge)).toEqual({ ok: false, reason: "code_used" });
-      expect(await statusOf(pending.id)).toBe("awaiting_approval");
-      expect(await eventsOf(pending.id)).toEqual([["booked", "agent"]]);
-      expect((await sql<{ decision: string | null }[]>`select decision from approvals where booking_id = ${pending.id}::uuid`)[0].decision).toBeNull();
-
-      // The same phone approving another hold under another name: the same customer, its name updated.
+      // Without a phone: still verified (approved via the link), no phoneLast4, nothing stored.
       const second = await holdAt(11, DEADLINE);
-      const sent2 = (await challenge(second.id, phone, now)) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
-      expect((await answer(second.id, sent2.challenge, "Renamed Test")).ok).toBe(true);
-      const customers = await sql<{ id: string; display_name: string }[]>`
-        select id::text as id, display_name from customers where phone = ${phone}
-      `;
-      expect(customers).toEqual([{ id: row.customer_id, display_name: "Renamed Test" }]);
+      const bare = await approve(second.id, null);
+      expect(bare).toEqual({ ok: true, booking: { ...second, status: "confirmed", customer: { displayName: "Postgres Test", verified: true } } });
+      expect((await sql<{ customer_phone: string | null }[]>`select customer_phone from bookings where id = ${second.id}::uuid`)[0].customer_phone).toBeNull();
+    });
+
+    it("bookings.customer_phone accepts only E.164", async () => {
+      const hold = await holdAt(14, DEADLINE);
+      await expect(sql`update bookings set customer_phone = '555-0123' where id = ${hold.id}::uuid`).rejects.toMatchObject({ code: "23514" });
+      await sql`update bookings set customer_phone = ${phoneOf(8)} where id = ${hold.id}::uuid`;
+      expect((await store.getBooking(hold.id))?.customer).toEqual({ displayName: "Postgres Test", verified: false, phoneLast4: "4321" });
     });
 
     it("answerApproval(): a lapsed hold or an answered approval is not_pending, and nothing is written", async () => {
       const lapsed = await holdAt(12, DEADLINE);
-      const sent = (await challenge(lapsed.id, phoneOf(6), at(28))) as Extract<Awaited<ReturnType<typeof challenge>>, { ok: true }>;
       const result = await store.answerApproval({
         bookingId: lapsed.id,
         decision: "approved",
         nextStatus: "confirmed",
         now: DEADLINE,
-        challengeId: sent.challenge.id,
-        customer: { phone: phoneOf(6), displayName: "Postgres Test" },
+        phone: phoneOf(6),
         event: { actor: "customer", type: "approved", data: {} },
       });
       expect(result).toEqual({ ok: false, reason: "not_pending" });
-      expect((await store.latestChallenge(lapsed.id))?.consumedAt).toBeNull();
       expect(await store.findApproval((await sql<{ token_hash: string }[]>`select token_hash from approvals where booking_id = ${lapsed.id}::uuid`)[0].token_hash)).toMatchObject({ decision: null });
-      expect(await sql`select 1 from customers where phone = ${phoneOf(6)}`).toHaveLength(0);
+      expect(await statusOf(lapsed.id)).toBe("awaiting_approval");
+      expect((await sql<{ customer_phone: string | null }[]>`select customer_phone from bookings where id = ${lapsed.id}::uuid`)[0].customer_phone).toBeNull();
+      expect(await eventsOf(lapsed.id)).toEqual([["booked", "agent"]]);
 
       // Decline: cancelled by the customer; a second answer is not_pending.
       const hold = await holdAt(13, DEADLINE);

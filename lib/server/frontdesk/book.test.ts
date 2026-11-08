@@ -2,10 +2,8 @@ import { DateTime } from "luxon";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { BookInput, Mandate, Slot } from "../../types/frontdesk";
 import { fixedClock, type Clock } from "../clock";
-import type { IdempotencyScope } from "./booking-store";
 import type { NewBlock, TimeRange } from "./catalog";
 import { FrontDeskError } from "./errors";
-import { requestHash } from "./idempotency";
 import { SEED, type MemoryStore } from "./memory-store";
 import { closePostgresClients, createPostgresStore, getPostgresClient } from "./postgres-store";
 import { book, getAvailability, getBooking, listServices, type FrontDeskDeps } from "./service";
@@ -18,15 +16,8 @@ import { approveAsCustomer, memoryDeps, NOW, recordingNotifier, SAT, withCatalog
 // 10 minutes (until 12:10 pm on Monday) and returns the approval link.
 
 const at = (hhmm: string) => `2026-11-14T${hhmm}:00-05:00`;
-const key = () => crypto.randomUUID();
-const input = (service_id: string, start: string, customer_name = "Maya", idempotency_key = key()): BookInput => ({
-  service_id,
-  start,
-  customer_name,
-  idempotency_key,
-});
-const haircut = (start: string, customer_name = "Maya", idempotency_key = key()) =>
-  input("haircut", start, customer_name, idempotency_key);
+const input = (service_id: string, start: string, customer_name = "Maya"): BookInput => ({ service_id, start, customer_name });
+const haircut = (start: string, customer_name = "Maya") => input("haircut", start, customer_name);
 
 /** A clock tests can move. */
 function mutableClock(start: Date = NOW): Clock & { advance(ms: number): void } {
@@ -39,7 +30,6 @@ function mutableClock(start: Date = NOW): Clock & { advance(ms: number): void } 
   };
 }
 
-const HOUR_MS = 60 * 60 * 1000;
 /** Tuesday 10 Nov, a working day. */
 const tuesdayAt = (hhmm: string) => new Date(`2026-11-10T${hhmm}:00-05:00`);
 
@@ -72,7 +62,7 @@ function staleOnce(deps: FrontDeskDeps): FrontDeskDeps {
   }));
 }
 
-/** `deps` that record the range of every busy-time read (including the ones inside book's idempotent action). */
+/** `deps` that record the range of every busy-time read. */
 function recordingBusy(deps: FrontDeskDeps): { deps: FrontDeskDeps; ranges: TimeRange[] } {
   const ranges: TimeRange[] = [];
   return {
@@ -124,7 +114,7 @@ describe("book", () => {
     const deps = memoryDeps({ notifier });
     expect(await saturdayStarts(deps)).toContain(at("14:30"));
 
-    const { booking, staffName, replayed } = await book(deps, "harts", haircut(at("14:30"), "  Maya Lopez  "), "claude-ai");
+    const { booking, staffName } = await book(deps, "harts", haircut(at("14:30"), "  Maya Lopez  "), "claude-ai");
 
     expect(booking).toEqual({
       id: expect.stringMatching(/^[0-9a-f-]{36}$/),
@@ -143,7 +133,6 @@ describe("book", () => {
       approval: { url: expect.stringMatching(APPROVAL_URL), expiresAt: HOLD_EXPIRES },
     });
     expect(staffName).toBe("Dana");
-    expect(replayed).toBe(false);
     // The owner hears about it only once the person approves.
     expect(notifier.alerts).toEqual([]);
     const confirmed = await approveAsCustomer(deps, booking);
@@ -319,7 +308,6 @@ describe("book: slot_taken", () => {
     expect(loser.booking.approval?.url).toMatch(APPROVAL_URL);
     expect(loser.booking.customer.displayName).toBe("Jo");
     expect(loser.staffName).toBe("Sam");
-    expect(loser.replayed).toBe(false);
 
     const stored = await deps.store.listBookings("harts", { start: new Date(SAT.from), end: new Date(SAT.to) });
     expect(stored.map((b) => b.staffId).sort()).toEqual(["dana", "sam"]);
@@ -496,115 +484,45 @@ describe("book: a start that isn't bookable gets the most specific code", () => 
   });
 });
 
-describe("book: idempotency", () => {
-  it("returns the same booking and the same approval link for the same key and arguments, without booking twice", async () => {
+describe("book: no idempotency keys", () => {
+  it("calling twice for the same time doesn't double-book: the second is slot_taken while the hold is on", async () => {
     const notifier = recordingNotifier();
     const deps = memoryDeps({ notifier });
     const args = haircut(at("14:30"));
 
     const first = await book(deps, "harts", args, "agent");
-    const again = await book(deps, "harts", args, "agent");
-
-    expect(first.replayed).toBe(false);
-    expect(again.replayed).toBe(true);
-    expect(again.booking).toEqual(first.booking);
-    expect(again.booking.approval?.url).toMatch(APPROVAL_URL);
-    expect(again.booking.approval).toEqual(first.booking.approval);
-    expect(again.staffName).toBe("Dana");
+    const err = await rejection(book(deps, "harts", args, "agent"));
+    expect(err.code).toBe("slot_taken");
     expect(await deps.store.listBookings("harts", { start: new Date(SAT.from), end: new Date(SAT.to) })).toHaveLength(1);
     expect((await deps.store.listEvents(first.booking.id)).map((e) => e.type)).toEqual(["booked"]);
-    expect(notifier.alerts).toHaveLength(0);
     expect((deps.store as MemoryStore).consentRows().approvals).toHaveLength(1);
-
-    // The replayed link still works: the person can approve with it, and the owner is alerted once.
-    await approveAsCustomer(deps, again.booking);
-    expect(notifier.alerts).toHaveLength(1);
-  });
-
-  it("treats the same instant with another offset, and the same name with extra spaces, as the same request", async () => {
-    const deps = memoryDeps();
-    const k = key();
-    const first = await book(deps, "harts", haircut(at("14:30"), "Maya", k), "agent");
-    const again = await book(deps, "harts", haircut("2026-11-14T19:30:00Z", "  Maya ", k), "agent");
-    expect(again.replayed).toBe(true);
-    expect(again.booking.id).toBe(first.booking.id);
-  });
-
-  it.each<[string, BookInput]>([
-    ["another start", haircut(at("15:30"), "Maya", "reused-key-0001")],
-    ["another customer name", haircut(at("14:30"), "Jo", "reused-key-0001")],
-    ["another service", input("beard-trim", at("14:30"), "Maya", "reused-key-0001")],
-  ])("is idempotency_conflict when a used key comes back with %s", async (_label, second) => {
-    const deps = memoryDeps();
-    await book(deps, "harts", haircut(at("14:30"), "Maya", "reused-key-0001"), "agent");
-    const err = await rejection(book(deps, "harts", second, "agent"));
-    expect(err.code).toBe("idempotency_conflict");
-    expect(err.details).toEqual({ idempotency_key: "reused-key-0001", tool: "book" });
-    expect(err.nextAction).toMatch(/new idempotency_key/);
-  });
-
-  it("doesn't remember a failed call: a corrected retry with the same key books", async () => {
-    const deps = memoryDeps();
-    const k = key();
-    expect((await rejection(book(deps, "harts", haircut("2026-11-09T13:00:00-05:00", "Maya", k), "agent"))).code).toBe(
-      "too_soon",
-    );
-    const retry = await book(deps, "harts", haircut(at("14:30"), "Maya", k), "agent");
-    expect(retry.replayed).toBe(false);
-    expect(retry.booking.start).toBe(at("14:30"));
-    // From now on the key belongs to the successful request.
-    expect((await book(deps, "harts", haircut(at("14:30"), "Maya", k), "agent")).replayed).toBe(true);
-  });
-
-  it("books once when two calls with the same key arrive together", async () => {
-    const notifier = recordingNotifier();
-    const deps = memoryDeps({ notifier });
-    const args = haircut(at("14:30"));
-    const [a, b] = await Promise.all([book(deps, "harts", args, "agent"), book(deps, "harts", args, "agent")]);
-    expect(a.booking.id).toBe(b.booking.id);
-    expect(a.booking.approval).toEqual(b.booking.approval);
-    expect([a.replayed, b.replayed].sort()).toEqual([false, true]);
     expect(notifier.alerts).toHaveLength(0);
   });
 
-  it.each<[string, unknown]>([
-    ["a 7-character key", "1234567"],
-    ["a 129-character key", "k".repeat(129)],
-    ["a key with a space", "my booking key"],
-    ["a key outside visible ASCII", "clé-de-réservation"],
-    ["a numeric key", 12345678],
-    ["a missing key", undefined],
-  ])("refuses %s with invalid_request naming idempotency_key", async (_label, idempotency_key) => {
-    const args = { service_id: "haircut", start: at("14:30"), customer_name: "Maya", idempotency_key } as unknown as BookInput;
-    const err = await rejection(book(memoryDeps(), "harts", args, "agent"));
-    expect(err.code).toBe("invalid_request");
-    expect(err.details).toEqual({ field: "idempotency_key", value: idempotency_key ?? null });
-    expect(err.nextAction).toBe(
-      "Send a fresh UUID as idempotency_key (8–128 characters, no spaces). Reuse it only to retry this same call.",
-    );
+  it("two calls for the same time at once: one hold, one slot_taken", async () => {
+    const deps = memoryDeps();
+    const args = haircut(at("14:30"));
+    const results = await Promise.allSettled([book(deps, "harts", args, "agent"), book(deps, "harts", args, "agent")]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const reason = (results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason as FrontDeskError;
+    expect(reason.code).toBe("slot_taken");
+    expect(await deps.store.listBookings("harts", { start: new Date(SAT.from), end: new Date(SAT.to) })).toHaveLength(1);
   });
 
-  it.each([["8", "k".repeat(8)], ["128", "k".repeat(128)]])("accepts a %s-character key", async (_n, k) => {
-    const { booking } = await book(memoryDeps(), "harts", haircut(at("14:30"), "Maya", k), "agent");
+  it("each hold gets its own approval link", async () => {
+    const deps = memoryDeps();
+    const a = await book(deps, "harts", haircut(at("14:30")), "agent");
+    const b = await book(deps, "harts", haircut(at("15:30")), "agent");
+    expect(a.booking.approval?.url).toMatch(APPROVAL_URL);
+    expect(b.booking.approval?.url).toMatch(APPROVAL_URL);
+    expect(a.booking.approval?.url).not.toBe(b.booking.approval?.url);
+  });
+
+  it("ignores an idempotency_key an older agent still sends", async () => {
+    const deps = memoryDeps();
+    const args = { ...haircut(at("14:30")), idempotency_key: "old-client-key-0001" } as unknown as BookInput;
+    const { booking } = await book(deps, "harts", args, "agent");
     expect(booking.status).toBe("awaiting_approval");
-  });
-
-  it("lets a key be reused for a new request after 24 hours", async () => {
-    const clock = mutableClock();
-    const deps = memoryDeps({ clock });
-    const k = key();
-    const first = await book(deps, "harts", haircut(at("14:30"), "Maya", k), "agent");
-
-    clock.advance(23 * HOUR_MS);
-    expect((await rejection(book(deps, "harts", haircut(at("15:30"), "Maya", k), "agent"))).code).toBe(
-      "idempotency_conflict",
-    );
-
-    clock.advance(2 * HOUR_MS); // 25 hours after the first call
-    const later = await book(deps, "harts", haircut(at("15:30"), "Maya", k), "agent");
-    expect(later.replayed).toBe(false);
-    expect(later.booking.id).not.toBe(first.booking.id);
-    expect(later.booking.start).toBe(at("15:30"));
   });
 });
 
@@ -679,8 +597,7 @@ describe("book: the hold", () => {
 
 describe("book: mandate", () => {
   // haircut: $35.00, $10.00 deposit, 30 minutes. Booked at 14:30–15:00 on Saturday.
-  const withMandate = (mandate: unknown, start = at("14:30"), idempotency_key = key()) =>
-    ({ ...haircut(start, "Maya", idempotency_key), mandate }) as unknown as BookInput;
+  const withMandate = (mandate: unknown, start = at("14:30")) => ({ ...haircut(start, "Maya"), mandate }) as unknown as BookInput;
 
   it.each<[string, Mandate, Record<string, unknown>]>([
     ["price_cap", { priceCapCents: 3499 }, { priceCents: 3500, priceCapCents: 3499 }],
@@ -769,64 +686,10 @@ describe("book: mandate", () => {
   });
 });
 
-describe("book: mandate and idempotency", () => {
-  /** `deps` that record every idempotency scope book uses. */
-  function recordingScopes(deps: FrontDeskDeps): { deps: FrontDeskDeps; scopes: IdempotencyScope[] } {
-    const scopes: IdempotencyScope[] = [];
-    return {
-      scopes,
-      deps: { ...deps, store: { ...deps.store, idempotent: (scope, action) => (scopes.push(scope), deps.store.idempotent(scope, action)) } },
-    };
-  }
-
-  it("replays the same approval link for the same key, arguments and mandate", async () => {
-    const deps = memoryDeps();
-    const k = key();
-    const mandate = { priceCapCents: 4000, window: { from: at("09:00"), to: at("17:00") } };
-    const first = await book(deps, "harts", { ...haircut(at("14:30"), "Maya", k), mandate }, "agent");
-    // The same window written in UTC is the same request.
-    const utcWindow = { from: "2026-11-14T14:00:00Z", to: "2026-11-14T22:00:00Z" };
-    const again = await book(deps, "harts", { ...haircut(at("14:30"), "Maya", k), mandate: { ...mandate, window: utcWindow } }, "agent");
-    expect(again.replayed).toBe(true);
-    expect(again.booking.approval?.url).toBe(first.booking.approval?.url);
-  });
-
-  it.each<[string, Mandate | undefined, Mandate | undefined]>([
-    ["a mandate added", undefined, { priceCapCents: 4000 }],
-    ["the mandate dropped", { priceCapCents: 4000 }, undefined],
-    ["another price cap", { priceCapCents: 4000 }, { priceCapCents: 4500 }],
-    ["another deposit cap", { depositCapCents: 1000 }, { depositCapCents: 1500 }],
-    ["another window", { window: { from: at("09:00"), to: at("17:00") } }, { window: { from: at("09:00"), to: at("16:00") } }],
-  ])("is idempotency_conflict when a used key comes back with %s", async (_label, firstMandate, secondMandate) => {
-    const deps = memoryDeps();
-    const k = "mandate-key-0001";
-    const withM = (m: Mandate | undefined): BookInput => ({ ...haircut(at("14:30"), "Maya", k), ...(m ? { mandate: m } : {}) });
-    await book(deps, "harts", withM(firstMandate), "agent");
-    const err = await rejection(book(deps, "harts", withM(secondMandate), "agent"));
-    expect(err.code).toBe("idempotency_conflict");
-  });
-
-  it("hashes a request without a mandate exactly as Ring 1a did, and treats null or {} as no mandate", async () => {
-    const { deps, scopes } = recordingScopes(memoryDeps());
-    const k = key();
-    const first = await book(deps, "harts", haircut(at("14:30"), "Maya", k), "agent");
-    expect(scopes[0].requestHash).toBe(
-      requestHash({ shop: "harts", service_id: "haircut", start: "2026-11-14T19:30:00.000Z", customer_name: "Maya" }),
-    );
-    for (const mandate of [null, {}]) {
-      const again = await book(deps, "harts", { ...haircut(at("14:30"), "Maya", k), mandate } as unknown as BookInput, "agent");
-      expect(again.replayed).toBe(true);
-      expect(again.booking.approval).toEqual(first.booking.approval);
-    }
-    expect(new Set(scopes.map((s) => s.requestHash)).size).toBe(1);
-  });
-});
-
 // ---- On Postgres ----
-// The same fixes against a real database, when DATABASE_URL_TEST points at one with 0001, 0002 and the
-// seed applied (see docs/database.md): a lost race books the other staff member inside the
-// idempotency transaction, and extreme dates and NUL characters never reach a query (Postgres would
-// refuse them, a 500). Like flow-pg.test.ts it never touches Hart's: it makes a throwaway shop (two
+// The same fixes against a real database, when DATABASE_URL_TEST points at one with every migration and
+// the seed applied (see docs/database.md): a lost race books the other staff member, and extreme dates
+// and NUL characters never reach a query (Postgres would refuse them, a 500). Like flow-pg.test.ts it never touches Hart's: it makes a throwaway shop (two
 // staff members working Tue–Sat 09:00–17:00, a 30-minute service, the default policies), books only
 // in 2099, and deletes everything it made in afterAll.
 const pgUrl = process.env.DATABASE_URL_TEST?.trim();
@@ -858,13 +721,7 @@ if (!pgUrl) {
       notifier: recordingNotifier(),
     });
 
-    /** Every idempotency key this block uses, deleted in afterAll. */
-    const keys: string[] = [];
-    const trim = (start: string, customer_name = "E2E Book"): BookInput => {
-      const idempotency_key = crypto.randomUUID();
-      keys.push(idempotency_key);
-      return { service_id: "trim", start, customer_name, idempotency_key };
-    };
+    const trim = (start: string, customer_name = "E2E Book"): BookInput => ({ service_id: "trim", start, customer_name });
 
     beforeAll(async () => {
       await sql`insert into shops (slug, name, timezone) values (${shop}, 'Vitest Book Shop', ${zone})`;
@@ -881,26 +738,22 @@ if (!pgUrl) {
     });
 
     afterAll(async () => {
-      if (keys.length > 0) await sql`delete from idempotency_keys where key = any(${keys}::text[])`;
       await sql`delete from bookings where shop_slug = ${shop}`; // events cascade
       await sql`delete from shops where slug = ${shop}`; // staff, hours and services cascade
       await closePostgresClients();
     });
 
-    it("books the other staff member when the race for the first is lost, in the same transaction as the key", async () => {
+    it("books the other staff member when the race for the first is lost", async () => {
       const winner = await book(deps, shop, trim(time(10)), "vitest A");
       expect(winner.booking.staffId).toBe(ann);
 
-      const args = trim(time(10), "E2E Loser");
-      const loser = await book(staleOnce(deps), shop, args, "vitest B");
+      const loser = await book(staleOnce(deps), shop, trim(time(10), "E2E Loser"), "vitest B");
       expect(loser.booking).toMatchObject({ staffId: bob, start: time(10), status: "awaiting_approval" });
       expect(loser.staffName).toBe("Bob");
-      // The retry committed with the idempotency key: the same call replays it.
-      const replay = await book(deps, shop, args, "vitest B");
-      expect(replay.replayed).toBe(true);
-      expect(replay.booking.id).toBe(loser.booking.id);
-      expect(replay.booking.approval).toEqual(loser.booking.approval);
+      expect(loser.booking.approval?.url).not.toBe(winner.booking.approval?.url);
       expect(await deps.store.listEvents(loser.booking.id)).toHaveLength(1);
+      // Both staff members are now held at 10:00: a third call is slot_taken.
+      expect((await rejection(book(deps, shop, trim(time(10), "E2E Third"), "vitest C"))).code).toBe("slot_taken");
     });
 
     it("is too_far for year 9999 and too_soon for year 1, and get_availability offers nothing there", async () => {

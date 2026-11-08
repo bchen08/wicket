@@ -14,7 +14,7 @@ import type {
   WeeklyHours,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
-import { approveBooking, sendApprovalCode } from "../consent/approvals";
+import { approveBooking } from "../consent/approvals";
 import { newApprovalToken, sha256Hex } from "../consent/crypto";
 import type { ManageAction } from "../engine/lifecycle";
 import { DepositExceedsPriceError } from "./catalog";
@@ -36,7 +36,7 @@ import {
   type OwnerOptions,
 } from "./http";
 import type { FrontDeskDeps } from "./service";
-import { lastSentCode, memoryDeps, NOW } from "./test-support";
+import { memoryDeps, NOW } from "./test-support";
 
 // The owner routes, through the http.ts handlers the route files call (the routes only add
 // `await connection()` and read params). In-memory store; "now" is Mon 9 Nov 2026, noon in New York.
@@ -139,13 +139,12 @@ async function createHold(
 }
 
 let phoneSeq = 0;
-/** A fresh phone per approval, so the 3-codes-per-phone-per-hour limit never gets in the way. */
+/** A different phone number for each approval. */
 const nextPhone = () => `+1401555${String(1000 + (phoneSeq++ % 9000))}`;
 
-/** The person approves through the approval use cases (send a code, approve with it). */
+/** The person approves through the approval use case (open the link, approve, giving a phone number). */
 async function approve(deps: FrontDeskDeps, token: string, phone = nextPhone()): Promise<Booking> {
-  await sendApprovalCode(deps, token, { phone });
-  return (await approveBooking(deps, token, { code: lastSentCode(deps) })).booking;
+  return (await approveBooking(deps, token, { phone })).booking;
 }
 
 /** A confirmed booking with dana: a hold the person approved (events: booked, approved). */
@@ -1006,7 +1005,7 @@ describe("POST /api/shops/[shop]/bookings/[id]/cancel, /complete and /no-show (o
       ["cancelled", "owner"],
     ]);
     // The person can no longer approve it.
-    await expect(sendApprovalCode(deps, future.token, { phone: nextPhone() })).rejects.toMatchObject({ code: "approval_closed" });
+    await expect(approveBooking(deps, future.token, { phone: nextPhone() })).rejects.toMatchObject({ code: "approval_closed" });
   });
 
   it.each(["complete", "mark_no_show"] as const)("can't %s a hold awaiting approval (400 invalid_request)", async (action) => {

@@ -91,7 +91,6 @@ function envelopeOf(result: ToolResult): ApiError["error"] {
   return (JSON.parse(result.content[0].text) as ApiError).error;
 }
 
-const key = () => crypto.randomUUID();
 /** book's result without the approval link, as get_booking and every later read show it. */
 function withoutLink(booking: Booking): Booking {
   const copy = { ...booking };
@@ -106,12 +105,11 @@ const bookArgs = (extra: Record<string, unknown> = {}) => ({
   service_id: "haircut",
   start: SLOT,
   customer_name: "Maya",
-  idempotency_key: key(),
   ...extra,
 });
 
 describe("MCP /api/mcp", () => {
-  it("lists six tools: four read-only reads, book (idempotent, not destructive), cancel (destructive, idempotent)", async () => {
+  it("lists six tools: four read-only reads, book (not idempotent, not destructive), cancel (destructive, idempotent)", async () => {
     const tools = await listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "book",
@@ -125,10 +123,11 @@ describe("MCP /api/mcp", () => {
       const tool = tools.find((t) => t.name === name)!;
       expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true });
     }
+    // Each book call places a new hold (or is slot_taken); a repeated cancel is not_cancellable.
     expect(tools.find((t) => t.name === "book")!.annotations).toMatchObject({
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: true,
+      idempotentHint: false,
       openWorldHint: false,
     });
     expect(tools.find((t) => t.name === "cancel")!.annotations).toMatchObject({
@@ -150,28 +149,14 @@ describe("MCP /api/mcp", () => {
     expect(avail.inputSchema.properties?.from?.format).toBe("date-time");
   });
 
-  it("advertises idempotency_key (required for book and cancel) and booking_id in the input schemas", async () => {
+  it("advertises the required fields and booking_id in the input schemas; no idempotency_key", async () => {
     const tools = await listTools();
     const schema = (name: string) => tools.find((t) => t.name === name)!.inputSchema;
-    expect([...(schema("book").required ?? [])].sort()).toEqual(["customer_name", "idempotency_key", "service_id", "start"]);
-    expect([...(schema("cancel").required ?? [])].sort()).toEqual(["booking_id", "idempotency_key"]);
+    expect([...(schema("book").required ?? [])].sort()).toEqual(["customer_name", "service_id", "start"]);
+    expect(schema("cancel").required).toEqual(["booking_id"]);
     expect(schema("get_booking").required).toEqual(["booking_id"]);
     for (const name of ["book", "cancel"]) {
-      const idempotencyKey = schema(name).properties?.idempotency_key;
-      // The same rule as parseIdempotencyKey and lib/types/frontdesk.ts: 8–128 visible ASCII characters.
-      expect(idempotencyKey).toMatchObject({
-        type: "string",
-        minLength: 8,
-        maxLength: 128,
-        pattern: "^[\\x21-\\x7E]{8,128}$",
-      });
-      const pattern = new RegExp(String(idempotencyKey?.pattern));
-      expect(pattern.test(crypto.randomUUID())).toBe(true);
-      for (const bad of ["1234567", "k".repeat(129), "my booking key", "clé-de-réservation"]) {
-        expect(pattern.test(bad)).toBe(false);
-      }
-      expect(String(idempotencyKey?.description)).toMatch(/fresh UUID/);
-      expect(String(idempotencyKey?.description)).toContain("8–128 visible ASCII characters, no spaces");
+      expect(schema(name).properties).not.toHaveProperty("idempotency_key");
     }
     for (const name of ["get_booking", "cancel"]) {
       expect(schema(name).properties?.booking_id).toMatchObject({ type: "string" });
@@ -193,8 +178,12 @@ describe("MCP /api/mcp", () => {
     expect(description("cancel")).toMatch(/cancelWindowHours/);
     expect(description("cancel")).toMatch(/not_cancellable/);
     expect(description("cancel")).toMatch(/depositCollected/);
-    for (const code of ["slot_taken", "too_soon", "too_far", "outside_hours", "paused", "outside_mandate", "idempotency_conflict"]) {
+    for (const code of ["slot_taken", "too_soon", "too_far", "outside_hours", "paused", "outside_mandate"]) {
       expect(description("book")).toContain(code);
+    }
+    // No codes and no idempotency keys any more.
+    for (const name of ["book", "cancel", "get_booking"]) {
+      expect(description(name)).not.toMatch(/idempotency|code texted|texted to their phone/);
     }
     // The server instructions: nothing is final until the person approves through the link.
     expect(SERVER_INSTRUCTIONS).toMatch(/No booking is final until the person approves it themselves/);
@@ -202,6 +191,8 @@ describe("MCP /api/mcp", () => {
     expect(SERVER_INSTRUCTIONS).toMatch(/approval link \(booking\.approval\.url\)/);
     expect(SERVER_INSTRUCTIONS).toMatch(/get_booking to check the status/);
     expect(SERVER_INSTRUCTIONS).toMatch(/mandate/);
+    expect(SERVER_INSTRUCTIONS).toMatch(/they open it and approve or decline/);
+    expect(SERVER_INSTRUCTIONS).not.toMatch(/idempotency|code texted/);
   });
 
   it("list_services shows dollars in text and cents in structuredContent", async () => {
@@ -301,14 +292,14 @@ describe("MCP /api/mcp", () => {
 });
 
 describe("MCP book tool", () => {
-  it("is advertised with the hold, the approval link, idempotency and the rules in its description, and actionable inputs", async () => {
+  it("is advertised with the hold, the approval link and the rules in its description, and actionable inputs", async () => {
     const tool = (await listTools()).find((t) => t.name === "book")!;
     expect(tool.description).toMatch(/Hold an appointment at Hart's Barbers for 10 minutes until the person approves it/);
     expect(tool.description).toMatch(/status awaiting_approval and booking\.approval\.url/);
     expect(tool.description).toMatch(/get_booking/);
     expect(tool.description).toMatch(/No deposit is collected/);
-    expect(tool.description).toMatch(/send a fresh UUID per booking/);
-    expect(tool.description).toMatch(/returns the same result, approval link included, instead of booking twice/);
+    expect(tool.description).toMatch(/They open it and approve \(→ confirmed\) or decline \(→ cancelled\)/);
+    expect(tool.description).toMatch(/calling again for the same time gets slot_taken while the hold is on/);
     expect(tool.inputSchema.properties?.start).toMatchObject({ type: "string", format: "date-time" });
     expect(String(tool.inputSchema.properties?.start.description)).toMatch(/returned by get_availability/);
     expect(tool.inputSchema.properties?.customer_name).toMatchObject({ type: "string", minLength: 1, maxLength: 80 });
@@ -347,7 +338,7 @@ describe("MCP book tool", () => {
     const text = result.content[0].text;
     expect(text).toContain("Held Haircut with Dana, Sat 14 Nov, 2:30 pm EST, for Maya. It is not confirmed yet.");
     expect(text).toContain(
-      `Hold placed until Mon 9 Nov, 12:10 pm EST. Send Maya this link to approve with a code texted to their phone: ` +
+      `Hold placed until Mon 9 Nov, 12:10 pm EST. Send Maya this link to approve: ` +
         `${booking.approval!.url}. Then call get_booking to check the status.`,
     );
     expect(text).toContain("A $10 deposit will be required once deposits are enabled");
@@ -408,23 +399,13 @@ describe("MCP book tool", () => {
     expect(error.next_action).toBe("Tell the person to call the shop at +1 212-555-0142.");
   });
 
-  it("returns idempotency_conflict for a used key with different arguments", async () => {
-    const args = bookArgs();
-    expect((await callTool("book", args)).isError).toBeFalsy();
-    const error = envelopeOf(await callTool("book", { ...args, start: "2026-11-14T16:00:00-05:00" }));
-    expect(error.code).toBe("idempotency_conflict");
-    expect(error.next_action).toMatch(/new idempotency_key/);
-  });
-
   it.each<[string, Record<string, unknown>, string]>([
     ["no arguments", {}, "service_id"],
-    ["a missing customer_name", { service_id: "haircut", start: SLOT, idempotency_key: "abcd-1234" }, "customer_name"],
+    ["a missing customer_name", { service_id: "haircut", start: SLOT }, "customer_name"],
     ["a blank customer_name", bookArgs({ customer_name: "   " }), "customer_name"],
     ["an 81-character customer_name", bookArgs({ customer_name: "x".repeat(81) }), "customer_name"],
     ["a start without an offset", bookArgs({ start: "2026-11-14T14:30:00" }), "start"],
     ["a numeric start", bookArgs({ start: 1763148600 }), "start"],
-    ["a missing idempotency_key", { service_id: "haircut", start: SLOT, customer_name: "Maya" }, "idempotency_key"],
-    ["a 7-character idempotency_key", bookArgs({ idempotency_key: "1234567" }), "idempotency_key"],
   ])("returns the invalid_request envelope for %s", async (_label, args, field) => {
     const error = envelopeOf(await callTool("book", args));
     expect(error.code).toBe("invalid_request");
@@ -434,7 +415,7 @@ describe("MCP book tool", () => {
 });
 
 describe("MCP get_booking and cancel", () => {
-  it("runs the whole loop: list → policies → availability → book (and replay) → get → cancel (and replay) → get", async () => {
+  it("runs the whole loop: list → policies → availability → book (again: slot_taken) → get → approve → get → cancel (again: not_cancellable) → get", async () => {
     const services = (await callTool("list_services")).structuredContent as ListServicesResult;
     expect(services.services.map((s) => s.id)).toContain("haircut");
 
@@ -444,20 +425,12 @@ describe("MCP get_booking and cancel", () => {
     const avail = (await callTool("get_availability", { service_id: "haircut", ...SAT })).structuredContent as GetAvailabilityResult;
     const start = avail.slots.find((s) => s.start === SLOT)!.start;
 
-    const bookKey = key();
-    const booked = await callTool("book", bookArgs({ start, idempotency_key: bookKey }));
+    const booked = await callTool("book", bookArgs({ start }));
     expect(booked.isError).toBeFalsy();
     const { booking } = booked.structuredContent as BookResult;
 
-    // The replay carries the same approval link: it can't be recomputed from the stored hash.
-    const rebooked = await callTool("book", bookArgs({ start, idempotency_key: bookKey }));
-    expect(rebooked.isError).toBeFalsy();
-    expect((rebooked.structuredContent as BookResult).booking).toEqual(booking);
-    expect((rebooked.structuredContent as BookResult).booking.approval?.url).toBe(booking.approval?.url);
-    expect(rebooked.content[0].text).toContain(
-      "(replayed: this is the booking from your earlier call with the same idempotency_key",
-    );
-    expect(rebooked.content[0].text).toContain(booking.approval!.url);
+    // Calling book again (e.g. a retry) can't double-book: the hold is in the way.
+    expect(envelopeOf(await callTool("book", bookArgs({ start }))).code).toBe("slot_taken");
 
     // get_booking never shows the link, and says the person hasn't answered yet.
     const waiting = await callTool("get_booking", { booking_id: booking.id });
@@ -467,7 +440,7 @@ describe("MCP get_booking and cancel", () => {
     expect(waiting.content[0].text).toContain("Waiting for Maya to approve with the link from book");
     expect(waiting.content[0].text).not.toContain(approvalToken(booking));
 
-    // The person approves through the link; get_booking reports it.
+    // The person approves through the link (giving their phone); get_booking reports it.
     const approved = await approveAsCustomer(deps, booking);
     const fetched = await callTool("get_booking", { booking_id: booking.id });
     expect(fetched.isError).toBeFalsy();
@@ -478,10 +451,9 @@ describe("MCP get_booking and cancel", () => {
       customer: { displayName: "Maya", verified: true, phoneLast4: "0123" },
     });
     expect(fetched.content[0].text).toContain("Status: confirmed.");
-    expect(fetched.content[0].text).toContain("Maya approved it with a code sent to the phone ending 0123. It is confirmed.");
+    expect(fetched.content[0].text).toContain("Maya approved it (phone ending 0123). It is confirmed.");
 
-    const cancelKey = key();
-    const cancelled = await callTool("cancel", { booking_id: booking.id, idempotency_key: cancelKey });
+    const cancelled = await callTool("cancel", { booking_id: booking.id });
     expect(cancelled.isError).toBeFalsy();
     expect(cancelled.structuredContent).toEqual({
       booking: { ...approved, status: "cancelled" },
@@ -492,12 +464,11 @@ describe("MCP get_booking and cancel", () => {
     expect(text).toContain("Status: cancelled.");
     expect(text).toContain("the $10 deposit is released");
     expect(text).toContain("nothing was charged or refunded");
-    expect(text).not.toContain("replayed");
 
-    const recancelled = await callTool("cancel", { booking_id: booking.id, idempotency_key: cancelKey });
-    expect(recancelled.isError).toBeFalsy();
-    expect(recancelled.structuredContent).toEqual(cancelled.structuredContent);
-    expect(recancelled.content[0].text).toContain("(replayed:");
+    // Cancelling again (e.g. a retry) can't cancel twice.
+    const recancelled = envelopeOf(await callTool("cancel", { booking_id: booking.id }));
+    expect(recancelled.code).toBe("not_cancellable");
+    expect(recancelled.details).toMatchObject({ status: "cancelled" });
 
     const after = await callTool("get_booking", { booking_id: booking.id });
     expect((after.structuredContent as GetBookingResult).booking.status).toBe("cancelled");
@@ -507,7 +478,7 @@ describe("MCP get_booking and cancel", () => {
     const booked = await callTool("book", bookArgs({ start: "2026-11-10T10:00:00-05:00" }));
     const { booking } = booked.structuredContent as BookResult;
     await approveAsCustomer(deps, booking);
-    const cancelled = await callTool("cancel", { booking_id: booking.id, idempotency_key: key() });
+    const cancelled = await callTool("cancel", { booking_id: booking.id });
     expect((cancelled.structuredContent as CancelResult).depositEffect).toBe("captured");
     expect(cancelled.content[0].text).toContain("the shop keeps the $10 deposit as a late-cancellation fee");
   });
@@ -515,7 +486,7 @@ describe("MCP get_booking and cancel", () => {
   it("cancel of a hold inside 24 hours frees the time without keeping the deposit", async () => {
     const booked = await callTool("book", bookArgs({ start: "2026-11-10T10:00:00-05:00" }));
     const { booking } = booked.structuredContent as BookResult;
-    const cancelled = await callTool("cancel", { booking_id: booking.id, idempotency_key: key() });
+    const cancelled = await callTool("cancel", { booking_id: booking.id });
     expect(cancelled.structuredContent).toEqual({
       booking: { ...withoutLink(booking), status: "cancelled" },
       depositEffect: "released",
@@ -527,7 +498,7 @@ describe("MCP get_booking and cancel", () => {
     const id = "6f1c2a4e-9b0d-4c3e-8a7f-1d2e3f4a5b6c";
     for (const result of [
       await callTool("get_booking", { booking_id: id }),
-      await callTool("cancel", { booking_id: id, idempotency_key: key() }),
+      await callTool("cancel", { booking_id: id }),
     ]) {
       const error = envelopeOf(result);
       expect(error.code).toBe("booking_not_found");
@@ -535,28 +506,17 @@ describe("MCP get_booking and cancel", () => {
     }
   });
 
-  it("returns not_cancellable when cancelling a cancelled booking with a new key", async () => {
+  it("returns not_cancellable when cancelling a cancelled booking", async () => {
     const { booking } = (await callTool("book", bookArgs())).structuredContent as BookResult;
-    expect((await callTool("cancel", { booking_id: booking.id, idempotency_key: key() })).isError).toBeFalsy();
-    const error = envelopeOf(await callTool("cancel", { booking_id: booking.id, idempotency_key: key() }));
+    expect((await callTool("cancel", { booking_id: booking.id })).isError).toBeFalsy();
+    const error = envelopeOf(await callTool("cancel", { booking_id: booking.id }));
     expect(error.code).toBe("not_cancellable");
     expect(error.details).toMatchObject({ status: "cancelled" });
-  });
-
-  it("returns idempotency_conflict when a cancel key is reused for another booking", async () => {
-    const one = ((await callTool("book", bookArgs())).structuredContent as BookResult).booking;
-    const two = ((await callTool("book", bookArgs({ start: "2026-11-14T16:00:00-05:00" }))).structuredContent as BookResult)
-      .booking;
-    const reused = key();
-    expect((await callTool("cancel", { booking_id: one.id, idempotency_key: reused })).isError).toBeFalsy();
-    const error = envelopeOf(await callTool("cancel", { booking_id: two.id, idempotency_key: reused }));
-    expect(error.code).toBe("idempotency_conflict");
   });
 
   it.each<[string, string, Record<string, unknown>, string]>([
     ["get_booking", "no arguments", {}, "booking_id"],
     ["cancel", "no arguments", {}, "booking_id"],
-    ["cancel", "a missing idempotency_key", { booking_id: "6f1c2a4e-9b0d-4c3e-8a7f-1d2e3f4a5b6c" }, "idempotency_key"],
   ])("%s returns the invalid_request envelope for %s", async (tool, _label, args, field) => {
     const error = envelopeOf(await callTool(tool, args));
     expect(error.code).toBe("invalid_request");

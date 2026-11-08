@@ -21,7 +21,6 @@ import type {
   Slot,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
-import type { CodeSender } from "../consent/code-sender";
 import { approvalUrl, type ConsentConfig } from "../consent/config";
 import { newApprovalToken, sha256Hex } from "../consent/crypto";
 import {
@@ -40,8 +39,6 @@ import type { Notifier } from "../notify/notifier";
 import { SlotTakenError, type BookingStore } from "./booking-store";
 import type { BusyInterval, ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
-import { parseIdempotencyKey, requestHash } from "./idempotency";
-import { normalizeUuid } from "./idempotency-errors";
 import { DEFAULT_POLICIES } from "./policies";
 import { parseRfc3339, toRfc3339 } from "./time";
 
@@ -54,10 +51,8 @@ export type FrontDeskDeps = {
   clock: Clock;
   store: BookingStore;
   notifier: Notifier;
-  /** Approval links and dev codes (Ring 1b). */
+  /** Approval links (Ring 1b). */
   consent: ConsentConfig;
-  /** Delivers one-time codes to phones (Ring 1b: a log line). */
-  codeSender: CodeSender;
 };
 
 const MIN_MS = 60_000;
@@ -421,25 +416,15 @@ export function parseMandate(raw: unknown): Mandate | null {
   return Object.keys(mandate).length > 0 ? mandate : null;
 }
 
-/** The mandate as a stable string for the idempotency hash: fixed key order, window ends as instants. */
-function mandateFingerprint(m: Mandate): string {
-  const instant = (v: string) => (parseRfc3339(v) as Date).toISOString();
-  return JSON.stringify([
-    m.priceCapCents ?? null,
-    m.depositCapCents ?? null,
-    m.window ? [instant(m.window.from), instant(m.window.to)] : null,
-  ]);
-}
-
 /**
  * Check raw `book` tool arguments (any JSON) and narrow them to BookInput, in the same style as
  * parseGetAvailabilityArgs: missing fields and wrong JSON types become invalid_request errors.
- * customer_name is returned trimmed; idempotency_key is checked by parseIdempotencyKey; mandate by
- * parseMandate (omitted from the result when there is none).
+ * customer_name is returned trimmed; mandate is checked by parseMandate (omitted from the result when
+ * there is none).
  */
 export function parseBookArgs(raw: unknown): BookInput {
   const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  const { service_id, start, customer_name, idempotency_key } = args;
+  const { service_id, start, customer_name } = args;
 
   if (typeof service_id !== "string" || service_id.trim() === "") {
     throw invalidField(
@@ -480,7 +465,6 @@ export function parseBookArgs(raw: unknown): BookInput {
     service_id,
     start,
     customer_name: name,
-    idempotency_key: parseIdempotencyKey(idempotency_key),
     ...(mandate ? { mandate } : {}),
   };
 }
@@ -492,31 +476,25 @@ export function parseBookArgs(raw: unknown): BookInput {
 export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string };
 
 /**
- * Hold `input.start` for `input.service_id` until the person approves it, at most once per
- * idempotency_key. Returns the booking in awaiting_approval with booking.approval: the link to send
- * the person, and when the hold lapses (10 minutes).
+ * Hold `input.start` for `input.service_id` until the person approves it. Returns the booking in
+ * awaiting_approval with booking.approval: the link to send the person, and when the hold lapses (10
+ * minutes). Calling it twice places two holds; the second for the same time is slot_taken (the
+ * no_overlap constraint), so a retried call can't double-book.
  *
  * 1. Validate the input (invalid_request), the mandate included.
- * 2. Hash the normalized request (shop, service, start as an instant, trimmed name, and the mandate
- *    when there is one) and run the rest inside store.idempotent: the same key with the same request
- *    returns the first call's result (replayed: true), the same approval link included, without
- *    booking again; the same key with another request is idempotency_conflict. A call that fails
- *    isn't remembered, so it can be retried with the same key. The saved result holds the link, since
- *    the token can't be recomputed from its stored hash.
- * 3. Check the start against the shop's rules (engine checkStart): paused, too_soon
+ * 2. Check the start against the shop's rules (engine checkStart): paused, too_soon
  *    (details.earliest), too_far (details.latest). These are decided before busy time is read, so a
  *    start far in the past or future never queries bookings.
- * 4. decide() the "book" action: the person's mandate (outside_mandate, details.field) and the hold's
+ * 3. decide() the "book" action: the person's mandate (outside_mandate, details.field) and the hold's
  *    deadline (now + 10 minutes).
- * 5. Lazy expiry: expire the shop's lapsed holds around the start, in the same transaction, so a
- *    stale hold never blocks this booking. Then check against hours, blocked time and bookings:
+ * 4. Lazy expiry: expire the shop's lapsed holds around the start, just before inserting, so a stale
+ *    hold never blocks this booking. Then check against hours, blocked time and bookings:
  *    outside_hours, or slot_taken (details.alternatives: up to 3 nearby free starts). The staff
  *    member comes from the check.
- * 6. Store it with a new approval token's hash, with the store the idempotent action receives (in
- *    Postgres, the key's transaction). If another booking got there first (SlotTakenError, i.e. the
+ * 5. Store it with a new approval token's hash. If another booking got there first (SlotTakenError, i.e. the
  *    no_overlap constraint), read busy time again and, if another staff member is free at exactly this
  *    start, try once more with them. If that fails too, or nobody is free, fail with slot_taken; the
- *    database is the final word even when step 5 passed.
+ *    database is the final word even when step 4 passed.
  *
  * The owner is alerted when the person approves (lib/server/consent/approvals.ts), not here.
  *
@@ -529,7 +507,7 @@ export async function book(
   shopSlug: string,
   input: BookInput,
   agentName: string,
-): Promise<BookOutcome & { replayed: boolean }> {
+): Promise<BookOutcome> {
   const args = parseBookArgs(input);
   const start = parseRfc3339(args.start);
   if (!start) {
@@ -541,30 +519,13 @@ export async function book(
     );
   }
 
-  const scope = {
-    key: args.idempotency_key,
-    tool: "book" as const,
-    // The instant, not the string: the same time written with another offset is the same request.
-    // The mandate counts only when there is one, so a request without it hashes as it did in Ring 1a.
-    requestHash: requestHash({
-      shop: shopSlug,
-      service_id: args.service_id,
-      start: start.toISOString(),
-      customer_name: args.customer_name,
-      ...(args.mandate ? { mandate: mandateFingerprint(args.mandate) } : {}),
-    }),
-  };
-  // The action reads and writes through the store it's given (in Postgres, the key's transaction).
-  const { result, replayed } = await deps.store.idempotent(scope, (tx) =>
-    bookOnce({ ...deps, catalog: tx, store: tx }, shopSlug, args, start, cleanAgentName(agentName)),
-  );
-  return { ...result, replayed };
+  return bookOnce(deps, shopSlug, args, start, cleanAgentName(agentName));
 }
 
 /** checkStart's refusals that come from the shop's rules alone, before hours and busy time count. */
 const RULE_REFUSALS: ReadonlySet<RefusedStart["reason"]> = new Set(["paused", "too_soon", "too_far"]);
 
-/** Steps 3 to 6 of book(): check the start and store the hold. `deps.catalog` and `deps.store` are the idempotent action's store. */
+/** Steps 2 to 5 of book(): check the start and store the hold. */
 async function bookOnce(
   deps: FrontDeskDeps,
   shopSlug: string,
@@ -622,7 +583,7 @@ async function bookOnce(
   );
   if (held instanceof FrontDeskError) throw held;
 
-  // Lazy expiry, in this transaction: a lapsed hold must not block this booking (the no_overlap
+  // Lazy expiry, just before the insert: a lapsed hold must not block this booking (the no_overlap
   // constraint would still count it) nor hide an alternative. TODO(ring-2): a scheduled job too.
   await deps.store.expireStaleHolds(shop.slug, busyRange(service, start), now);
 
@@ -630,8 +591,7 @@ async function bookOnce(
   const check = checkStart(engine, start);
   if (!check.ok) throw refused(check, engine);
 
-  // The link's secret. Only its hash is stored; the link itself is returned once (and kept in the
-  // idempotency key's saved result for replays).
+  // The link's secret. Only its hash is stored; the link itself is returned once, here.
   const token = newApprovalToken();
   /** The stored booking, or null if another booking holds that staff member's time (SlotTakenError). */
   const create = async (staffId: string): Promise<Booking | null> => {
@@ -846,19 +806,14 @@ export async function getBooking(
 /** Check raw `cancel` arguments (any JSON) and narrow them to CancelInput. booking_id is returned trimmed. */
 export function parseCancelArgs(raw: unknown): CancelInput {
   const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  return {
-    booking_id: parseBookingId(args.booking_id),
-    idempotency_key: parseIdempotencyKey(args.idempotency_key),
-  };
+  return { booking_id: parseBookingId(args.booking_id) };
 }
 
 /**
  * An agent cancels a booking, under the shop's policy (decide(): a hold awaiting approval → cancelled
  * any time; confirmed at least cancelWindowHours ahead → deposit released; later but before the start
- * → captured; after the start or from a final status, a lapsed hold included → not_cancellable). At
- * most once per idempotency_key: the same key for the same booking returns the first result
- * (replayed: true) without a second event; the same key for another booking is idempotency_conflict.
- * A call that fails isn't remembered.
+ * → captured; after the start or from a final status, a lapsed hold included → not_cancellable). A
+ * second cancel of the same booking is not_cancellable (it's already cancelled), so a retry is harmless.
  * TODO(ring-2): get_booking and cancel still trust anyone holding the booking id; agent identity fixes this.
  * TODO(ring-1c): alert the owner when an agent cancels (the Notifier only knows new bookings).
  */
@@ -866,18 +821,9 @@ export async function cancelBooking(
   deps: FrontDeskDeps,
   shopSlug: string,
   input: CancelInput,
-): Promise<CancelResult & { replayed: boolean }> {
+): Promise<CancelResult> {
   const args = parseCancelArgs(input);
-  const scope = {
-    key: args.idempotency_key,
-    tool: "cancel" as const,
-    // A UUID in either case is the same booking, so the same request.
-    requestHash: requestHash({ shop: shopSlug, booking_id: normalizeUuid(args.booking_id) ?? args.booking_id }),
-  };
-  const { result, replayed } = await deps.store.idempotent(scope, (tx) =>
-    transitionBooking({ ...deps, catalog: tx, store: tx }, shopSlug, args.booking_id, "cancel", "agent"),
-  );
-  return { ...result, replayed };
+  return transitionBooking(deps, shopSlug, args.booking_id, "cancel", "agent");
 }
 
 // ---- Bookings list (UI) ----
