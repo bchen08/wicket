@@ -10,11 +10,13 @@
 // 2. Read-only checks: health, services, owner access, errors, the MCP route, and the web booking API's
 //    availability, agents.md and /.well-known/front-desk.json.
 // 3. The booking loop, only where /api/status says writesAllowed (the Preview database, or in-memory
-//    data): book → slot_taken → get_booking → decline → the slot is free again over MCP, then the web
-//    booking API: a JSON book gets a link, a form post at that held start is sent back with
-//    ?error=slot_taken, the JSON booking is declined, and a form post lands on /approve/<token>. Every
-//    booking it makes is declined at the end, even after a failure. Its MCP requests and web bookings say
-//    they come from "front-desk-smoke", so the bookings show who made them.
+//    data): book → slot_taken → get_booking → decline → the slot is free again → the owner's alerts list
+//    has booking_cancelled for it; then book another start → approve → the alerts list has
+//    booking_confirmed for it. Then the web booking API: a JSON book gets a link, a form post at that held
+//    start is sent back with ?error=slot_taken, the JSON booking is declined, and a form post lands on
+//    /approve/<token>. Every booking it makes is declined or cancelled at the end, even after a failure.
+//    Its MCP requests and web bookings say they come from "front-desk-smoke", so the bookings show who
+//    made them.
 //
 // --bypass <secret> (or VERCEL_AUTOMATION_BYPASS_SECRET) sends Vercel's x-vercel-protection-bypass header
 // on every request, for previews behind Vercel Authentication. --owner-token overrides the owner token,
@@ -263,6 +265,7 @@ function describeStatus(s) {
     `${db.mode}${shop}`,
     `schema ${db.schema}`,
     db.writesAllowed ? "writes allowed" : "writes not allowed",
+    ...(s.alerts ? [`alerts by ${s.alerts}`] : []),
   ].join(" · ");
 }
 
@@ -375,6 +378,27 @@ export async function runSmoke({
     return `200, ${n} booking${n === 1 ? "" : "s"}`;
   });
 
+  await check("5", "Owner alerts without a token → 401 with the unlock hint", async () => {
+    const res = await client.request("/api/shops/harts/alerts");
+    const nextAction = res.json?.error?.next_action;
+    expect(res.status === 401 && nextAction === UNLOCK_NEXT_ACTION, http(res));
+    return `401, next_action "${nextAction}"`;
+  });
+
+  /** GET /api/shops/harts/alerts with the owner token: the alerts array, or a failed check. */
+  async function ownerAlerts() {
+    const res = await client.request("/api/shops/harts/alerts", { headers: { authorization: `Bearer ${token}` } });
+    expect(res.status === 200 && Array.isArray(res.json?.alerts), http(res));
+    return res.json.alerts;
+  }
+  const describeAlert = (a) => `${a.kind} by ${a.channel}, ${a.status}${a.error ? `: ${a.error}` : ""}`;
+
+  await check("5", `Owner alerts with Bearer ${tokenLabel} → 200`, async () => {
+    if (!token) return { skipped: `no owner token for ${status.environment}: pass --owner-token` };
+    const alerts = await ownerAlerts();
+    return `200, ${alerts.length} alert${alerts.length === 1 ? "" : "s"}${alerts[0] ? ` (newest: ${describeAlert(alerts[0])})` : ""}`;
+  });
+
   await check("6", "/api/shops/nope/services → 404 not_found", async () => {
     const res = await client.request("/api/shops/nope/services");
     expect(res.status === 404 && res.json?.error?.code === "not_found", http(res));
@@ -406,7 +430,7 @@ export async function runSmoke({
 
   // ---- Web booking API, read-only (docs/web-booking.md) ----
 
-  /** What the web checks found, for the web booking checks: { slots, slot, booking }. */
+  /** What the web booking checks booked: { slot, booking }. */
   const web = {};
 
   await check("W1", "Web availability: GET /api/shops/harts/availability?service=haircut", async () => {
@@ -417,7 +441,6 @@ export async function runSmoke({
     expect(days.length === 7, `${days.length} days, expected 7`);
     const bad = slots.find((s) => typeof s?.start !== "string" || typeof s?.display !== "string");
     expect(!bad, `a slot without start or display: ${snippet(JSON.stringify(bad))}`);
-    web.slots = slots;
     const n = slots.length;
     return `7 days from ${res.json.from}, ${n} open start${n === 1 ? "" : "s"}${n ? `, first ${slots[0].display}` : ""}`;
   });
@@ -452,6 +475,9 @@ export async function runSmoke({
     ["12", "get_booking returns the same approval link"],
     ["14", "Decline through /api/approvals/<token>/decline → cancelled"],
     ["14", "The declined start is free again"],
+    ["14", "The owner's alerts list has booking_cancelled for it"],
+    ["17", "Book another start and approve it → confirmed"],
+    ["17", "The owner's alerts list has booking_confirmed for it"],
   ];
   const webLoop = [
     ["W4", "Web book (JSON) → 201 awaiting_approval, link on this origin"],
@@ -459,7 +485,7 @@ export async function runSmoke({
     ["W4", "Decline the web booking → cancelled"],
     ["W5", "Web book (form post) → 303 to /approve/<token>"],
   ];
-  /** Bookings this run made: { id, token, done } (done: declined or cancelled). */
+  /** Bookings this run made: { id, token, done, approved } (done: declined or cancelled). */
   const made = [];
 
   if (!status.database?.writesAllowed) {
@@ -475,16 +501,46 @@ export async function runSmoke({
     };
     const remember = (booking) => {
       const linkToken = booking?.approval?.url?.split("/approve/")[1];
-      made.push({ id: booking.id, token: linkToken ? decodeURIComponent(linkToken) : undefined, done: false });
+      made.push({ id: booking.id, token: linkToken ? decodeURIComponent(linkToken) : undefined, done: false, approved: false });
+    };
+    /** Book a Haircut at a random open start in the next few days: { slot, booking }, or a failed check. */
+    const bookOne = async () => {
+      const from = now();
+      const avail = await client.callTool("get_availability", {
+        service_id: "haircut",
+        from: rfc3339(from),
+        to: rfc3339(from + BOOKING_WINDOW_DAYS * 24 * 3600_000),
+        limit: 50,
+      });
+      expect(!avail.error, `get_availability: ${snippet(JSON.stringify(avail.error))}`);
+      const slots = avail.value?.slots ?? [];
+      expect(slots.length > 0, `no open Haircut starts in the next ${BOOKING_WINDOW_DAYS} days`);
+      // A random start, so two runs at once rarely pick the same one.
+      const slot = slots[Math.floor(random() * slots.length)];
+      const booked = await client.callTool("book", { service_id: "haircut", start: slot.start, customer_name: SMOKE_CUSTOMER });
+      expect(!booked.error, `book ${slot.start}: ${snippet(JSON.stringify(booked.error))}`);
+      const booking = booked.value?.booking;
+      if (booking?.id) remember(booking);
+      return { slot, booking };
+    };
+    /** The owner's alert of `kind` for `bookingId`, as evidence; a failed check if it's missing or failed. */
+    const alertFor = async (bookingId, kind) => {
+      if (!token) return { skipped: `no owner token for ${status.environment}: pass --owner-token` };
+      const alerts = await ownerAlerts();
+      const alert = alerts.find((a) => a.bookingId === bookingId && a.kind === kind);
+      expect(alert, `no ${kind} alert for ${bookingId} among the newest ${alerts.length}`);
+      const evidence = describeAlert(alert);
+      expect(alert.status === "logged" || alert.status === "sent", evidence);
+      return evidence;
     };
     /** A booking known only by its approval link (a form post's 303), so cleanup can decline it. */
     const rememberLink = (location) => {
       const linkToken = location.split("/approve/")[1]?.split(/[?#]/)[0];
-      if (linkToken) made.push({ id: undefined, token: decodeURIComponent(linkToken), done: false });
+      if (linkToken) made.push({ id: undefined, token: decodeURIComponent(linkToken), done: false, approved: false });
     };
     /** Decline one of this run's bookings through its approval link, as the page's Decline button does. */
-    const decline = (token) =>
-      client.request(`/api/approvals/${encodeURIComponent(token)}/decline`, {
+    const decline = (linkToken) =>
+      client.request(`/api/approvals/${encodeURIComponent(linkToken)}/decline`, {
         method: "POST",
         headers: { "content-type": "application/json" },
       });
@@ -497,27 +553,18 @@ export async function runSmoke({
           : { "content-type": "application/json" },
         body: form ? new URLSearchParams(fields).toString() : JSON.stringify(fields),
       });
+    /** Open Haircut starts from the web availability route, read now. */
+    const webSlots = async () => {
+      const res = await client.request("/api/shops/harts/availability?service=haircut");
+      expect(res.status === 200 && Array.isArray(res.json?.days), `availability: ${http(res)}`);
+      return res.json.days.flatMap((d) => (Array.isArray(d?.slots) ? d.slots : []));
+    };
     const webFields = (start) => ({ service: "haircut", start, name: SMOKE_CUSTOMER, bookedBy: SMOKE_AGENT });
     const shortLink = (link) => link.replace(/(\/approve\/.{6}).*/, "$1…");
 
     try {
       await check(...loop[0], async () => {
-        const from = now();
-        const avail = await client.callTool("get_availability", {
-          service_id: "haircut",
-          from: rfc3339(from),
-          to: rfc3339(from + BOOKING_WINDOW_DAYS * 24 * 3600_000),
-          limit: 50,
-        });
-        expect(!avail.error, `get_availability: ${snippet(JSON.stringify(avail.error))}`);
-        const slots = avail.value?.slots ?? [];
-        expect(slots.length > 0, `no open Haircut starts in the next ${BOOKING_WINDOW_DAYS} days`);
-        // A random start, so two runs at once rarely pick the same one.
-        const slot = slots[Math.floor(random() * slots.length)];
-        const booked = await client.callTool("book", { service_id: "haircut", start: slot.start, customer_name: SMOKE_CUSTOMER });
-        expect(!booked.error, `book ${slot.start}: ${snippet(JSON.stringify(booked.error))}`);
-        const booking = booked.value?.booking;
-        if (booking?.id) remember(booking);
+        const { slot, booking } = await bookOne();
         const link = booking?.approval?.url ?? "";
         const evidence = `${booking?.display ?? slot.start}: ${booking?.status}, link ${link.replace(/(\/approve\/.{6}).*/, "$1…")}, agent "${booking?.agent?.name}"`;
         expect(booking?.status === "awaiting_approval", evidence);
@@ -568,10 +615,37 @@ export async function runSmoke({
         return `${ctx.booking.display ?? ctx.slot.start} is back in get_availability`;
       });
 
+      await check(...loop[5], async () => {
+        needs("declined");
+        return alertFor(ctx.booking.id, "booking_cancelled");
+      });
+
+      await check(...loop[6], async () => {
+        const { booking } = await bookOne();
+        expect(booking?.status === "awaiting_approval", `booked: ${booking?.status}`);
+        const mine = made.find((b) => b.id === booking.id);
+        expect(mine?.token, "the booking has no approval token");
+        const res = await client.request(`/api/approvals/${encodeURIComponent(mine.token)}/approve`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        expect(res.status === 200 && res.json?.booking?.status === "confirmed", http(res));
+        mine.approved = true;
+        ctx.approved = booking;
+        return `${booking.display ?? booking.start}: 200, status confirmed`;
+      });
+
+      await check(...loop[7], async () => {
+        needs("approved");
+        return alertFor(ctx.approved.id, "booking_confirmed");
+      });
+
       // The web booking API (W4, W5): the same engine, over plain HTTP.
       await check(...webLoop[0], async () => {
-        const pool = (web.slots ?? []).filter((s) => s.start !== ctx.slot?.start);
-        expect(pool.length > 0, "not run: W1 found no open Haircut starts");
+        // Read now, not W1's list: the loop above left a confirmed booking until cleanup.
+        const pool = await webSlots();
+        expect(pool.length > 0, "the web availability has no open Haircut starts");
         const slot = pool[Math.floor(random() * pool.length)];
         const res = await webBook(webFields(slot.start));
         const booking = res.json?.booking;
@@ -610,8 +684,8 @@ export async function runSmoke({
       });
 
       await check(...webLoop[3], async () => {
-        const pool = (web.slots ?? []).filter((s) => s.start !== ctx.slot?.start && s.start !== web.slot?.start);
-        expect(pool.length > 0, "not run: W1 found no second open Haircut start");
+        const pool = (await webSlots()).filter((s) => s.start !== web.slot?.start);
+        expect(pool.length > 0, "the web availability has no other open Haircut start");
         const slot = pool[Math.floor(random() * pool.length)];
         const res = await webBook(webFields(slot.start), { form: true, referer: `${baseUrl}/` });
         const location = res.headers.get("location") ?? "";
@@ -621,12 +695,12 @@ export async function runSmoke({
         return `${slot.display}: 303 → ${shortLink(location)}`;
       });
     } finally {
-      // Decline every booking this run made, even after a failure.
-      await check("—", "Cleanup: every booking it made is declined", async () => {
+      // Decline (or, once approved, cancel) every booking this run made, even after a failure.
+      await check("—", "Cleanup: every booking it made is declined or cancelled", async () => {
         const left = [];
         for (const b of made.filter((x) => !x.done)) {
           try {
-            if (b.token) {
+            if (b.token && !b.approved) {
               const res = await decline(b.token);
               if (res.status === 200) {
                 b.done = true;
@@ -646,7 +720,7 @@ export async function runSmoke({
           }
         }
         expect(left.length === 0, `still held: ${left.join(", ")}`);
-        return `${made.length} made, ${made.length} declined: none left behind`;
+        return `${made.length} made, ${made.length} declined or cancelled: none left behind`;
       });
     }
   }

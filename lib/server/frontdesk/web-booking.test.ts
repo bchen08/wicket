@@ -463,6 +463,15 @@ describe("GET /api/shops/[shop]/booking-page", () => {
     }
   });
 
+  it("never shows the owner's email: the booking page and agents.md are public", async () => {
+    const f = fixture({ policies: { ownerEmail: "dana@harts.example" } });
+    const page = await (await bookingPageGet(f.getDeps, get("/api/shops/harts/booking-page"), "harts")).text();
+    const md = await (await agentsMdGet(f.getDeps, get("/api/shops/harts/agents.md"), "harts")).text();
+    expect((JSON.parse(page) as BookingPageResponse).policies).not.toHaveProperty("ownerEmail");
+    expect(page).not.toContain("dana@harts.example");
+    expect(md).not.toContain("dana@harts.example");
+  });
+
   it("while paused, the first line says so and whom to call", async () => {
     const f = fixture({ policies: { paused: true } });
     const body = (await (await bookingPageGet(f.getDeps, get("/api/shops/harts/booking-page"), "harts")).json()) as BookingPageResponse;

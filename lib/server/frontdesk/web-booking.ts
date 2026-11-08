@@ -1,10 +1,10 @@
 import { DateTime } from "luxon";
 import type {
+  AgentPolicies,
   AvailabilityDay,
   Booking,
   BookingPageResponse,
   FrontDeskDiscovery,
-  Policies,
   Service,
   Shop,
   Slot,
@@ -301,7 +301,7 @@ function bookResponse(
 // ---- Booking page ----
 
 /** The shop's rules for the person, one sentence per line. */
-export function policiesForPeople(shop: Shop, p: Policies): string {
+export function policiesForPeople(shop: Shop, p: AgentPolicies): string {
   const phone = p.phone?.trim() || null;
   const lines = [
     ...(p.paused ? [`${shop.name} isn't taking bookings right now.${phone ? ` Call ${phone}.` : ""}`] : []),

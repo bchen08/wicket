@@ -1,4 +1,5 @@
 import type {
+  AlertsResponse,
   ApiErrorCode,
   BlockResponse,
   BlocksResponse,
@@ -19,6 +20,7 @@ import {
   getBookingDetail,
   getShopHours,
   getShopPolicies,
+  listShopAlerts,
   listShopBlocks,
   ownerBookingAction,
   replaceShopHours,
@@ -281,4 +283,17 @@ export function bookingDetailGet(
   return ownerRespond<BookingDetailResponse>(getDeps, request, options, (deps) =>
     getBookingDetail(deps, shopSlug, bookingId),
   );
+}
+
+/**
+ * GET /api/shops/[shop]/alerts → AlertsResponse: the newest 50 owner alerts. Like the bookings list, its 401
+ * says to unlock the console.
+ */
+export function alertsGet(
+  getDeps: () => FrontDeskDeps,
+  request: Request,
+  shopSlug: string,
+  options?: OwnerOptions,
+): Promise<Response> {
+  return ownerRespond<AlertsResponse>(getDeps, request, options, (deps) => listShopAlerts(deps, shopSlug), 200, UNLOCK_NEXT_ACTION);
 }

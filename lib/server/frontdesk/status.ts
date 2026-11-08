@@ -58,6 +58,11 @@ export type StatusOptions = {
   timeoutMs?: number;
 };
 
+/** How owner alerts go out here: email when RESEND_API_KEY is set, else log. Neither is a problem. */
+export function toAlertChannel(resendApiKey: string | undefined): StatusResponse["alerts"] {
+  return resendApiKey?.trim() ? "email" : "log";
+}
+
 /** VERCEL_ENV as one of the three environments; anything else (unset locally) is development. */
 export function toEnvironment(vercelEnv: string | undefined): Environment {
   const value = vercelEnv?.trim();
@@ -254,6 +259,7 @@ export async function getStatus(env: Env, origin: string, options: StatusOptions
     database,
     ownerAccess,
     approvalLinks: { origin },
+    alerts: toAlertChannel(env.RESEND_API_KEY),
     problems,
   };
 }
@@ -273,6 +279,7 @@ export async function statusResponse(request: Request, env: Env, options: Status
       database: { mode: env.DATABASE_URL?.trim() ? "postgres" : "memory", reachable: false, shopName: null, writesAllowed: false, schema: "unknown", missing: [] },
       ownerAccess: configuredOwnerToken(env.OWNER_API_TOKEN) === "" ? "missing" : "configured",
       approvalLinks: { origin },
+      alerts: toAlertChannel(env.RESEND_API_KEY),
       problems: [`The status check itself failed (${describeError(err, env.DATABASE_URL)}): see this deployment's function logs in Vercel.`],
     };
   }

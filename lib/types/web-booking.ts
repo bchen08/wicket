@@ -2,7 +2,7 @@
 // and the backend of the web booking page. Same engine and approval link as the MCP tools. Re-exported
 // from lib/types/frontdesk.ts. See docs/web-booking.md.
 
-import type { Booking, Mandate, Policies, Service, Shop, Slot } from "./frontdesk";
+import type { AgentPolicies, Booking, Mandate, Service, Shop, Slot } from "./frontdesk";
 
 /** One day of open starts, in the shop's time zone. */
 export type AvailabilityDay = {
@@ -84,8 +84,11 @@ export type BookingPageResponse = {
   shop: Shop;
   /** Every service, in the shop's order, each with the next 7 days of open starts. */
   services: BookingPageService[];
-  /** The shop's rules. `paused: true` means no starts are offered; show `phone`. */
-  policies: Policies;
+  /**
+   * The shop's rules, as agents get them from get_policies: everything but the owner's email. `paused: true`
+   * means no starts are offered; show `phone`.
+   */
+  policies: AgentPolicies;
   /** The rules in plain language for the person, one sentence per line (split on "\n"). */
   policiesText: string;
   /** Today, YYYY-MM-DD in the shop's time zone: the first day in every service's `days`. */

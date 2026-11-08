@@ -1,6 +1,5 @@
-import type { Notifier } from "./notifier";
-
-// TODO(ring-1c): alert the owner on a real channel (Photon) instead of a log line.
+import { alertSubject } from "./email";
+import type { OwnerAlert } from "./notifier";
 
 /** The customer's first name only: everything before the first space. */
 export function firstName(displayName: string): string {
@@ -8,22 +7,20 @@ export function firstName(displayName: string): string {
 }
 
 /**
- * Ring 0 notifier: one structured JSON log line per approved booking (event "booking.confirmed"),
- * readable in Vercel's logs. Logs no customer details beyond the first name.
+ * The log channel: one structured JSON line per alert (event "booking.confirmed" or "booking.cancelled"),
+ * readable in Vercel's function logs. Used wherever alerts aren't emailed (no RESEND_API_KEY, e.g. previews,
+ * or no ownerEmail). Logs no customer details beyond the first name.
  */
-export function createLogNotifier(log: (line: string) => void = console.log): Notifier {
-  return {
-    async alertOwner(booking) {
-      log(
-        JSON.stringify({
-          event: "booking.confirmed",
-          id: booking.id,
-          shop: booking.shopSlug,
-          service: booking.serviceId,
-          start: booking.start,
-          customer_first_name: firstName(booking.customer.displayName),
-        }),
-      );
-    },
-  };
+export function alertLogLine(alert: OwnerAlert): string {
+  const { booking } = alert;
+  return JSON.stringify({
+    event: alert.kind === "booking_confirmed" ? "booking.confirmed" : "booking.cancelled",
+    id: booking.id,
+    shop: booking.shopSlug,
+    service: booking.serviceId,
+    start: booking.start,
+    customer_first_name: firstName(booking.customer.displayName),
+    ...(alert.cancelledBy ? { cancelled_by: alert.cancelledBy } : {}),
+    subject: alertSubject(alert),
+  });
 }

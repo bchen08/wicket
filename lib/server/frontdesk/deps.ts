@@ -1,5 +1,5 @@
 import { systemClock } from "../clock";
-import { createLogNotifier } from "../notify/log-notifier";
+import { createNotifier } from "../notify/notifier";
 import { createMemoryStore } from "./memory-store";
 import { createPostgresStore } from "./postgres-store";
 import type { FrontDeskDeps } from "./service";
@@ -13,6 +13,9 @@ import type { FrontDeskDeps } from "./service";
 //
 // Approval links need no setting: each route sets deps.baseUrl to the origin of the request it serves
 // (withRequestOrigin in service.ts).
+//
+// Owner alerts: RESEND_API_KEY set (Production only) → email to the shop's ownerEmail; otherwise, or for a
+// shop without an ownerEmail, a log line. See lib/server/notify/notifier.ts.
 
 /** Front Desk is deployed without the settings it needs. Surfaces as an `internal` error; the log says why. */
 export class ConfigurationError extends Error {
@@ -30,7 +33,7 @@ export const LOCAL_BASE_URL = "http://localhost:3000";
 /** Build deps from `env`, without caching. Exported for tests; the app uses getFrontDeskDeps(). */
 export function createFrontDeskDeps(env: Env, warn: (message: string) => void = console.warn): FrontDeskDeps {
   const clock = systemClock;
-  const notifier = createLogNotifier();
+  const notifier = createNotifier({ resendApiKey: env.RESEND_API_KEY });
   const url = env.DATABASE_URL?.trim();
 
   if (!url && env.VERCEL) {

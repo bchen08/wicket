@@ -1,5 +1,9 @@
 import { DateTime } from "luxon";
 import type {
+  Alert,
+  AlertChannel,
+  AlertKind,
+  AlertStatus,
   Booking,
   BookingActor,
   BookingEvent,
@@ -70,6 +74,19 @@ export type AnswerApprovalResult =
    */
   | { ok: false; reason: "not_pending" };
 
+/** An owner alert to record (the alerts table), after it was sent or failed. */
+export type NewAlert = {
+  shopSlug: string;
+  bookingId: string;
+  kind: AlertKind;
+  channel: AlertChannel;
+  /** The email address it went to; null for a log line. */
+  recipient: string | null;
+  status: AlertStatus;
+  /** Why it failed; null unless status is failed. */
+  error: string | null;
+};
+
 /** The event a transition writes. The store stamps `at` (Postgres now(), the memory store's clock). */
 export type NewBookingEvent = {
   actor: BookingActor;
@@ -134,6 +151,13 @@ export interface BookingStore {
    * only if it wasn't. Anything that doesn't match rolls everything back.
    */
   answerApproval(input: ApprovalAnswer): Promise<AnswerApprovalResult>;
+
+  // ---- Owner alerts ----
+
+  /** Store one alert (created_at: Postgres now(), the memory store's clock) and return it. */
+  recordAlert(alert: NewAlert): Promise<Alert>;
+  /** The shop's newest `limit` alerts, newest first (by created_at, then id). Empty if there are none. */
+  listAlerts(shopSlug: string, limit: number): Promise<Alert[]>;
 }
 
 /** The staff member is already booked for part of that time. Another agent got there first. */
@@ -238,6 +262,23 @@ export function toBookingEvent(r: EventRecord): BookingEvent {
     actor: r.actor,
     type: r.type,
     data: r.data,
+  };
+}
+
+/** A stored alert plus the shop's zone. Both stores map through this. */
+export type AlertRecord = Omit<Alert, "createdAt"> & { createdAt: Date; timezone: string };
+
+export function toAlert(r: AlertRecord): Alert {
+  return {
+    id: r.id,
+    shopSlug: r.shopSlug,
+    bookingId: r.bookingId,
+    kind: r.kind,
+    channel: r.channel,
+    recipient: r.recipient,
+    status: r.status,
+    error: r.error,
+    createdAt: toRfc3339(r.createdAt, r.timezone),
   };
 }
 

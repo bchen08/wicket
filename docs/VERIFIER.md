@@ -32,7 +32,7 @@ Some checks write data, such as booking through the MCP `book` tool. Those may o
 - On a preview, that means it uses the **Preview database** (its shop is named "Hart's Barbers (preview)"). A preview on any other database is BLOCKED, because it might be production's.
 - In production it is always `false`. Never write to production.
 
-`pnpm smoke` checks this itself, and declines every booking it makes. Before any write you make by hand (approving a booking in step 2, for example), open `<PREVIEW_URL>/api/status` yourself; if `writesAllowed` is `false`, mark that check **SKIPPED: writes not allowed here** and don't write.
+`pnpm smoke` checks this itself, and declines (or, once approved, cancels) every booking it makes. Before any write you make by hand (approving a booking in step 2, for example), open `<PREVIEW_URL>/api/status` yourself; if `writesAllowed` is `false`, mark that check **SKIPPED: writes not allowed here** and don't write.
 
 The Preview database is shared by every PR and rebuilt by the most recent PR that changed `supabase/`. See [database.md → The Preview database keeps itself current](database.md#the-preview-database-keeps-itself-current).
 
