@@ -1,186 +1,247 @@
+import type { CSSProperties, ReactNode } from "react";
 import Link from "next/link";
-import {
-  ArrowDown,
-  ArrowRight,
-  Check,
-  CreditCard,
-  PlugZap,
-  ShieldCheck,
-  Scissors,
-  Flower2,
-  Stethoscope,
-  Sparkles,
-} from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { BookingPreview } from "@/components/booking-preview";
-import { features, steps } from "@/lib/mock";
+import {
+  AppointmentSlip,
+  ApprovalCard,
+  ApprovalText,
+  AskBubble,
+  ShopNotice,
+} from "@/components/booking-preview";
+import { agentEndpoints, bookCall, contactHref, menu, shop } from "@/lib/mock";
+
+// The landing page is printed paper and ink; the console keeps its own palette. The accent is reserved for approval.
+export const paperTheme = {
+  "--background": "#f5f1e8",
+  "--foreground": "#1d1b18",
+  "--surface": "#e9e3d6",
+  "--muted-foreground": "#5d574d",
+  "--border": "#d6cdbb",
+  "--primary": "#1d1b18",
+  "--primary-foreground": "#f5f1e8",
+  "--secondary": "#e9e3d6",
+  "--secondary-foreground": "#1d1b18",
+  "--accent": "#b3361d",
+  "--accent-foreground": "#f5f1e8",
+  "--ring": "#1d1b18",
+  "--font-serif": "var(--font-newsreader), Georgia, serif",
+} as CSSProperties;
+
+const shell = "mx-auto w-full max-w-5xl px-6 sm:px-10";
+
+export function Masthead() {
+  return (
+    <header className="border-b border-border">
+      <div className={`${shell} flex min-h-16 items-center justify-between gap-4`}>
+        <Link href="/" className="font-serif text-xl">
+          Front Desk
+        </Link>
+        <Link
+          href={shop.path}
+          className="text-sm underline-offset-4 hover:underline"
+        >
+          {"Hart's booking page"}
+        </Link>
+      </div>
+    </header>
+  );
+}
 
 export function Hero() {
   return (
-    <section aria-labelledby="hero-title" className="page-shell hero-section">
-      <div className="hero-copy">
-        <p className="eyebrow flex items-center gap-2.5">
-          <span className="size-1.5 rounded-full bg-primary" /> A new way to
-          fill your calendar
-        </p>
-        <h1
-          id="hero-title"
-          className="mt-7 text-[clamp(3.5rem,6.3vw,5.6rem)] leading-[1.06] font-medium tracking-[-0.065em]"
-        >
-          Let AI agents
-          <br />
-          book your
-          <br />
-          <span className="text-primary">business.</span>
-        </h1>
-        <p className="mt-6 max-w-[410px] text-[15px] leading-[1.85] text-muted-foreground">
-          Your next customer has an AI assistant. Let it book you in seconds.
-          Every booking is customer-approved and can be backed by a deposit. Set
-          your hours once. We&apos;ll take it from there.
-        </p>
-        <div className="mt-8 flex flex-wrap items-center gap-5">
-          <Button asChild size="lg">
-            <Link href="/console">
-              Get started{" "}
-              <ArrowRight data-icon="inline-end" aria-hidden="true" />
-            </Link>
-          </Button>
-          <a
-            href="#how-it-works"
-            className="inline-flex min-h-11 items-center gap-2 text-sm font-medium hover:text-primary"
+    <section aria-labelledby="hero-title" className={`${shell} py-16 sm:py-24`}>
+      <div className="flex flex-col gap-14 md:flex-row md:items-center md:justify-between md:gap-12">
+        <div className="flex max-w-xl flex-col gap-6">
+          <h1
+            id="hero-title"
+            className="font-serif text-4xl leading-tight text-balance sm:text-5xl lg:text-6xl"
           >
-            See how it works{" "}
-            <ArrowDown className="size-3.5" aria-hidden="true" />
-          </a>
-        </div>
-        <Link href="/harts" className="mt-3 inline-flex min-h-11 items-center text-sm font-medium text-primary underline underline-offset-4">
-          See a shop&apos;s booking page
-        </Link>
-        <p className="mt-5 flex items-center gap-2 text-xs text-muted-foreground">
-          <Check className="size-3.5 text-primary" aria-hidden="true" /> Your
-          business. Your hours. Your rules.
-        </p>
-      </div>
-      <BookingPreview />
-    </section>
-  );
-}
-
-export function BusinessStrip() {
-  const businesses = [
-    { icon: Scissors, label: "Barbershops" },
-    { icon: Flower2, label: "Salons & spas" },
-    { icon: Stethoscope, label: "Independent clinics" },
-    { icon: Sparkles, label: "And businesses like yours" },
-  ];
-  return (
-    <section
-      aria-label="Made for independent businesses"
-      className="border-y border-border bg-surface/60"
-    >
-      <div className="page-shell flex flex-col items-center justify-between gap-6 py-7 lg:flex-row">
-        <p className="text-xs text-muted-foreground">
-          Built for local. Ready for what&apos;s next.
-        </p>
-        <div className="flex flex-wrap justify-center gap-x-8 gap-y-4">
-          {businesses.map(({ icon: Icon, label }) => (
-            <span
-              key={label}
-              className="flex items-center gap-2.5 text-xs font-medium"
-            >
-              <Icon
-                className="size-4 text-muted-foreground"
-                strokeWidth={1.5}
-                aria-hidden="true"
-              />
-              {label}
-            </span>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-export function Features() {
-  const icons = [PlugZap, ShieldCheck, CreditCard];
-  return (
-    <section
-      id="why-front-desk"
-      aria-labelledby="features-title"
-      className="page-shell section-space"
-    >
-      <div className="text-center">
-        <p className="eyebrow text-primary">
-          Less admin. More of what you love.
-        </p>
-        <h2 id="features-title" className="section-title mt-4">
-          A fuller calendar. A lighter workload.
-        </h2>
-        <p className="mt-4 text-sm leading-7 text-muted-foreground">
-          All the opportunity of AI. None of the uncertainty.
-        </p>
-      </div>
-      <div className="mt-12 grid gap-10 md:grid-cols-3 md:gap-8">
-        {features.map((feature, i) => {
-          const Icon = icons[i];
-          return (
-            <article key={feature.title} className="feature-block">
-              <div className="mb-5 flex size-11 items-center justify-center rounded-xl border border-primary/10 bg-accent">
-                <Icon
-                  className="size-5 text-primary"
-                  strokeWidth={1.5}
-                  aria-hidden="true"
-                />
-              </div>
-              <h3 className="text-base font-medium tracking-[-0.025em]">
-                {feature.title}
-              </h3>
-              <p className="mt-3 max-w-sm text-sm leading-7 text-muted-foreground">
-                {feature.description}
-              </p>
-            </article>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-export function HowItWorks() {
-  return (
-    <section
-      id="how-it-works"
-      aria-labelledby="how-title"
-      className="border-y border-border bg-surface/60"
-    >
-      <div className="page-shell section-space">
-        <div className="flex flex-col justify-between gap-5 md:flex-row md:items-end">
-          <div>
-            <p className="eyebrow text-primary">Simple by design</p>
-            <h2 id="how-title" className="section-title mt-4">
-              You run your business.
-              <br />
-              We handle the handoff.
-            </h2>
-          </div>
-          <p className="max-w-xs text-sm leading-7 text-muted-foreground">
-            No new inbox to manage. No conversations to chase. Just appointments
-            you can count on.
+            {"Your customers' AI assistants can book your shop now."}
+          </h1>
+          <p className="max-w-md text-base leading-relaxed text-muted-foreground text-pretty">
+            The customer approves every booking by text, and a card deposit
+            stops no-shows.
           </p>
+          <div className="flex flex-wrap items-center gap-3">
+            <Button asChild size="lg">
+              <Link href={shop.path}>{"Book a test haircut at Hart's"}</Link>
+            </Button>
+            <Button asChild size="lg" variant="outline">
+              <a href={contactHref}>Set up your shop</a>
+            </Button>
+          </div>
         </div>
-        <ol className="mt-12 grid gap-9 md:grid-cols-3">
-          {steps.map((step, i) => (
-            <li key={step.title}>
-              <span className="font-mono text-xs text-primary">0{i + 1}</span>
-              <h3 className="mt-4 text-base font-medium">{step.title}</h3>
-              <p className="mt-3 max-w-xs text-sm leading-7 text-muted-foreground">
-                {step.description}
-              </p>
+        <AppointmentSlip />
+      </div>
+    </section>
+  );
+}
+
+function SectionHeading({ id, children }: { id: string; children: ReactNode }) {
+  return (
+    <h2 id={id} className="font-serif text-3xl leading-tight sm:text-4xl">
+      {children}
+    </h2>
+  );
+}
+
+const story = [
+  {
+    time: "2:14 pm",
+    text: "Someone asks Claude for a haircut.",
+    artifact: <AskBubble />,
+  },
+  {
+    time: "2:14 pm",
+    text: "Front Desk holds 2:30 and texts them a link to approve it.",
+    artifact: <ApprovalText />,
+  },
+  {
+    time: "2:15 pm",
+    text: "They approve, and place a $10 hold on their card.",
+    artifact: <ApprovalCard />,
+  },
+  {
+    time: "2:15 pm",
+    text: "The shop gets a text and an email, and the booking is on the console.",
+    artifact: <ShopNotice />,
+  },
+];
+
+export function WhatHappens() {
+  return (
+    <section aria-labelledby="story-title" className="border-t border-border">
+      <div className={`${shell} flex flex-col gap-10 py-16 sm:py-20`}>
+        <SectionHeading id="story-title">What happens</SectionHeading>
+        <ol className="flex flex-col">
+          {story.map((step, i) => (
+            <li
+              key={i}
+              className="flex flex-col gap-4 border-t border-border py-8 sm:flex-row sm:gap-8"
+            >
+              <time className="w-20 shrink-0 font-mono text-sm text-muted-foreground">
+                {step.time}
+              </time>
+              <div className="flex flex-1 flex-col gap-5 md:flex-row md:items-start md:justify-between md:gap-10">
+                <p className="max-w-xs text-base leading-relaxed">{step.text}</p>
+                <div className="md:w-80 md:shrink-0">{step.artifact}</div>
+              </div>
             </li>
           ))}
         </ol>
       </div>
     </section>
+  );
+}
+
+function PlainList({ items }: { items: string[] }) {
+  return (
+    <ul className="flex flex-col">
+      {items.map((item) => (
+        <li key={item} className="border-t border-border py-3 leading-relaxed">
+          {item}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+export function ForTheShop() {
+  return (
+    <section aria-labelledby="shop-title" className="border-t border-border">
+      <div className={`${shell} flex flex-col gap-10 py-16 sm:py-20`}>
+        <SectionHeading id="shop-title">For the shop</SectionHeading>
+        <div className="grid gap-10 md:grid-cols-2 md:gap-16">
+          <div className="flex flex-col gap-4">
+            <h3 className="font-serif text-xl">What you do</h3>
+            <PlainList
+              items={[
+                "Set your services, hours and rules once.",
+                "Get a text for every booking.",
+              ]}
+            />
+          </div>
+          <div className="flex flex-col gap-4">
+            <h3 className="font-serif text-xl">What you never do</h3>
+            <PlainList
+              items={[
+                "Answer the phone for it.",
+                "Chase no-shows.",
+                "Learn a new app.",
+              ]}
+            />
+          </div>
+        </div>
+        <div className="flex max-w-md flex-col gap-3">
+          <p className="text-sm text-muted-foreground">{"Hart's menu, as set today:"}</p>
+          <table className="w-full font-mono text-sm">
+            <caption className="sr-only">{"Hart's Barbers services"}</caption>
+            <tbody>
+              {menu.map((item) => (
+                <tr key={item.name} className="border-t border-border">
+                  <th scope="row" className="py-2 text-left font-normal">
+                    {item.name}
+                  </th>
+                  <td className="py-2 text-muted-foreground">{item.duration}</td>
+                  <td className="py-2 text-right">{item.price}</td>
+                  <td className="py-2 text-right text-muted-foreground">{item.deposit}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export function ForAgents() {
+  return (
+    <section aria-labelledby="agents-title" className="border-t border-border">
+      <div className={`${shell} flex flex-col gap-10 py-16 sm:py-20`}>
+        <div className="flex flex-col gap-3">
+          <SectionHeading id="agents-title">For agents</SectionHeading>
+          <p className="max-w-lg leading-relaxed text-muted-foreground">
+            For developers and AI companies. Each shop is an MCP server with a
+            plain-text guide.
+          </p>
+        </div>
+        <div className="grid gap-10 md:grid-cols-[1fr_1.4fr] md:gap-16">
+          <dl className="flex flex-col">
+            {agentEndpoints.map((endpoint) => (
+              <div key={endpoint.path} className="flex flex-col gap-1 border-t border-border py-3">
+                <dt className="text-sm text-muted-foreground">{endpoint.label}</dt>
+                <dd className="font-mono text-sm break-all">
+                  <a href={endpoint.path} className="underline-offset-4 hover:underline">
+                    {endpoint.path}
+                  </a>
+                </dd>
+              </div>
+            ))}
+          </dl>
+          <pre className="overflow-x-auto border-t border-border pt-4 font-mono text-xs leading-relaxed sm:text-sm">
+            <code>{bookCall}</code>
+          </pre>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export function Footer() {
+  return (
+    <footer className="border-t border-border">
+      <div className={`${shell} flex flex-col gap-4 py-10 text-sm sm:flex-row sm:items-center sm:justify-between`}>
+        <p className="font-serif text-lg">Built in Providence for independent shops.</p>
+        <nav aria-label="Footer" className="flex gap-6">
+          <Link href={shop.path} className="underline-offset-4 hover:underline">
+            {"Hart's Barbers"}
+          </Link>
+          <a href={contactHref} className="underline-offset-4 hover:underline">
+            Email us
+          </a>
+        </nav>
+      </div>
+    </footer>
   );
 }

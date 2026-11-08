@@ -1,27 +1,27 @@
 import {
-  BusinessStrip,
-  Features,
+  Footer,
+  ForAgents,
+  ForTheShop,
   Hero,
-  HowItWorks,
+  Masthead,
+  WhatHappens,
+  paperTheme,
 } from "@/components/landing-sections";
-import { GetStarted } from "@/components/get-started";
-import { SiteFooter, SiteHeader } from "@/components/site-chrome";
 
 export default function Home() {
   return (
-    <div id="top">
+    <div style={paperTheme} className="flex min-h-full flex-1 flex-col bg-background text-foreground">
       <a href="#main-content" className="skip-link">
         Skip to content
       </a>
-      <SiteHeader />
-      <main id="main-content">
+      <Masthead />
+      <main id="main-content" className="flex-1">
         <Hero />
-        <BusinessStrip />
-        <Features />
-        <HowItWorks />
-        <GetStarted />
+        <WhatHappens />
+        <ForTheShop />
+        <ForAgents />
       </main>
-      <SiteFooter />
+      <Footer />
     </div>
   );
 }
