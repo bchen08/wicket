@@ -97,8 +97,8 @@ export async function OwnerBookings() {
         </p>
       ) : (
         <>
-          <BookingGroup title="Upcoming" bookings={upcoming} />
-          <BookingGroup title="Past" bookings={past} />
+          <BookingGroup title="Upcoming" bookings={upcoming} now={now} />
+          <BookingGroup title="Past" bookings={past} now={now} />
         </>
       )}
     </div>
