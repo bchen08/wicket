@@ -158,7 +158,13 @@ describe("MCP /api/mcp", () => {
     expect(schema("cancel").required).toEqual(["booking_id"]);
     expect(schema("get_booking").required).toEqual(["booking_id"]);
     // Exactly the contract's arguments: no retry key, no phone code.
-    expect(Object.keys(schema("book").properties ?? {}).sort()).toEqual(["customer_name", "mandate", "service_id", "start"]);
+    expect(Object.keys(schema("book").properties ?? {}).sort()).toEqual([
+      "customer_name",
+      "customer_phone",
+      "mandate",
+      "service_id",
+      "start",
+    ]);
     expect(Object.keys(schema("cancel").properties ?? {})).toEqual(["booking_id"]);
     for (const name of ["get_booking", "cancel"]) {
       expect(schema(name).properties?.booking_id).toMatchObject({ type: "string" });
@@ -214,8 +220,9 @@ describe("MCP /api/mcp", () => {
     deps = memoryDeps({ policies: { ownerEmail: "dana@example.com" } });
     const result = await callTool("get_policies");
     expect(result.isError).toBeFalsy();
-    const { ownerEmail, ...rules } = SEED.policies.harts;
+    const { ownerEmail, ownerMobile, ...rules } = SEED.policies.harts;
     expect(ownerEmail).toBeNull();
+    expect(ownerMobile).toBeNull();
     expect(result.structuredContent).toEqual({
       shop: { slug: "harts", name: "Hart's Barbers", timezone: "America/New_York" },
       policies: rules,

@@ -50,7 +50,7 @@ async function readBookForm(request: Request): Promise<WebBookFields> {
     const value = form.get(name);
     return typeof value === "string" ? value : undefined;
   };
-  return { service: text("service"), start: text("start"), name: text("name"), bookedBy: text("bookedBy") };
+  return { service: text("service"), start: text("start"), name: text("name"), bookedBy: text("bookedBy"), phone: text("phone") };
 }
 
 /** A 303 See Other to `location`, never cached. */
@@ -95,7 +95,7 @@ async function formBook(getDeps: () => FrontDeskDeps, request: Request, shopSlug
 
 /**
  * POST /api/shops/[shop]/book. JSON (WebBookRequest) → 201 WebBookResponse, or the ApiError envelope.
- * A plain HTML form post (service, start, name, bookedBy) → 303 to the approval page, or back to the
+ * A plain HTML form post (service, start, name, bookedBy, phone) → 303 to the approval page, or back to the
  * Referer with ?error=<code>&message=<text>.
  */
 export function bookPost(getDeps: () => FrontDeskDeps, request: Request, shopSlug: string): Promise<Response> {

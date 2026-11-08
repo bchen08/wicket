@@ -1,4 +1,5 @@
 import type { StatusResponse } from "../../types/frontdesk";
+import { textingMode } from "../notify/texting";
 import { configuredStripeKey, getFrontDeskDeps } from "./deps";
 import { NO_STORE } from "./http";
 import { configuredOwnerToken } from "./owner-auth";
@@ -267,6 +268,8 @@ export async function getStatus(env: Env, origin: string, options: StatusOptions
     deposits: depositsMode(env),
     approvalLinks: { origin },
     alerts: toAlertChannel(env.RESEND_API_KEY),
+    // Off is fine too: nothing is texted, and everything else works as before.
+    texting: textingMode(env),
     problems,
   };
 }
@@ -288,6 +291,7 @@ export async function statusResponse(request: Request, env: Env, options: Status
       deposits: depositsMode(env),
       approvalLinks: { origin },
       alerts: toAlertChannel(env.RESEND_API_KEY),
+      texting: textingMode(env),
       problems: [`The status check itself failed (${describeError(err, env.DATABASE_URL)}): see this deployment's function logs in Vercel.`],
     };
   }

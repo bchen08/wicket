@@ -20,6 +20,9 @@
 //    or cancelled at the end, even after a failure.
 //    Its MCP requests and web bookings say they come from "front-desk-smoke", so the bookings show who
 //    made them.
+// 4. Feature checks: every scripts/smoke-checks/*.mjs, in name order (loadSmokeChecks). Each one's default
+//    export is `async (ctx) => {}` and records its rows with ctx.check, like the checks here; it gets the same
+//    client, /api/status, owner token and helpers (see the ctx object in runSmoke), and cleans up after itself.
 //
 // --bypass <secret> (or VERCEL_AUTOMATION_BYPASS_SECRET) sends Vercel's x-vercel-protection-bypass header
 // on every request, for previews behind Vercel Authentication. --owner-token overrides the owner token,
@@ -27,6 +30,7 @@
 //
 // Exit codes: 0 every check passed (some may be SKIPPED), 1 a check failed, 2 BLOCKED, 64 bad arguments.
 
+import { readdir } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 export const SMOKE_AGENT = "front-desk-smoke";
@@ -290,9 +294,29 @@ function rfc3339(ms) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
+/** Where feature checks live: one .mjs file per feature (e.g. texting.mjs), each with a default export. */
+const SMOKE_CHECKS_DIR = new URL("./smoke-checks/", import.meta.url);
+
+/** Every feature check in scripts/smoke-checks/*.mjs, in file-name order: their default exports. */
+export async function loadSmokeChecks(dir = SMOKE_CHECKS_DIR) {
+  let names;
+  try {
+    names = (await readdir(dir)).filter((n) => n.endsWith(".mjs") && !n.endsWith(".test.mjs")).sort();
+  } catch {
+    return [];
+  }
+  const checks = [];
+  for (const name of names) {
+    const mod = await import(new URL(name, dir).href);
+    if (typeof mod.default === "function") checks.push(mod.default);
+  }
+  return checks;
+}
+
 /**
  * Run the smoke test. Prints as it goes through `print`, and returns the verdict, the exit code and the
- * rows. `fetch`, `now`, `random` and `print` are there for tests.
+ * rows. `fetch`, `now`, `random` and `print` are there for tests, and so is `checks` (the feature checks
+ * to run; default: loadSmokeChecks()).
  */
 export async function runSmoke({
   baseUrl,
@@ -303,6 +327,7 @@ export async function runSmoke({
   now = () => Date.now(),
   random = Math.random,
   print = (line) => console.log(line),
+  checks,
 }) {
   const client = createClient({ baseUrl, bypass, fetchImpl });
   const rows = [];
@@ -813,6 +838,17 @@ export async function runSmoke({
         expect(left.length === 0, `still held: ${left.join(", ")}`);
         return `${made.length} made, ${made.length} declined or cancelled: none left behind`;
       });
+    }
+  }
+
+  // ---- Feature checks (scripts/smoke-checks/*.mjs) ----
+
+  const featureCtx = { check, client, status, baseUrl, token, now, random, expect, CheckFailed, http, snippet, rfc3339, SMOKE_AGENT, SMOKE_CUSTOMER };
+  for (const run of checks ?? (await loadSmokeChecks())) {
+    try {
+      await run(featureCtx);
+    } catch (err) {
+      rows.push({ item: "—", title: `Feature check ${run.name || "(unnamed)"}`, result: "FAIL", evidence: `error: ${errorText(err)}` });
     }
   }
 

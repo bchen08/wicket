@@ -16,6 +16,7 @@ import {
   type NewAlert,
   type NewBooking,
   type NewBookingEvent,
+  type NewOwnerCode,
 } from "./booking-store";
 import {
   DepositExceedsPriceError,
@@ -37,6 +38,9 @@ import { DEFAULT_POLICIES } from "./policies";
 // like postgres-store.ts in every method. Data lives only as long as the store.
 
 type StaffSeed = { id: string; shopSlug: string; name: string; weekly: WeeklyHours[] };
+
+/** The bookings.customer_phone check: E.164. */
+const E164 = /^\+[1-9][0-9]{7,14}$/;
 
 const OPEN_DAYS = [2, 3, 4, 5, 6] as const; // Tue–Sat (ISO weekdays)
 
@@ -85,6 +89,8 @@ export const SEED: {
       noShowRule: "If you don't show up, we keep the deposit. Otherwise it is released after your appointment.",
       // Not seeded: the owner sets it (PUT /api/shops/harts/policies). Until then alerts are logged.
       ownerEmail: null,
+      // Not seeded either: until the owner sets it, nothing is texted to the owner.
+      ownerMobile: null,
     },
   },
 };
@@ -175,6 +181,8 @@ type StoredBlock = NewBlock & { id: string };
 
 type StoredAlert = NewAlert & { seq: number; createdAt: Date };
 
+type StoredOwnerCode = NewOwnerCode & { usedAt: Date | null };
+
 /** Longest blocked_times.reason (the column's check constraint). */
 const MAX_BLOCK_REASON = 200;
 
@@ -231,6 +239,7 @@ function pickPolicies(p: Policies): Policies {
     lateCancelRule: p.lateCancelRule,
     noShowRule: p.noShowRule,
     ownerEmail: p.ownerEmail,
+    ownerMobile: p.ownerMobile,
   };
 }
 
@@ -268,6 +277,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   const events: StoredEvent[] = [];
   const blocks: StoredBlock[] = [];
   const alerts: StoredAlert[] = [];
+  const ownerCodes: StoredOwnerCode[] = [];
   let eventSeq = 0;
   let alertSeq = 0;
   // Ring 1b approval requests, keyed by booking id.
@@ -331,6 +341,8 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
     if (input.approvalToken && [...approvals.values()].some((a) => a.token === input.approvalToken)) {
       throw new Error("approvals.token must be unique.");
     }
+    // The bookings.customer_phone check.
+    if (input.customerPhone && !E164.test(input.customerPhone)) throw new Error("customer_phone must be E.164.");
     const stored: StoredBooking = {
       id: crypto.randomUUID(),
       shopSlug: input.shopSlug,
@@ -348,7 +360,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
       completedAt: null,
       noShowAt: null,
       approveBy: input.approveBy ? copyDate(input.approveBy) : null,
-      customerPhone: null,
+      customerPhone: input.customerPhone ?? null,
       mandate: input.mandate ? jsonCopy(input.mandate) : null,
       depositState: input.depositState ?? "none",
       checkoutSessionId: input.checkoutSessionId ?? null,
@@ -644,7 +656,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
         throw new Error('Only an "agent", "owner" or "customer" can cancel a booking.');
       }
       // The bookings.customer_phone check.
-      if (input.phone && !/^\+[1-9][0-9]{7,14}$/.test(input.phone)) throw new Error("customer_phone must be E.164.");
+      if (input.phone && !E164.test(input.phone)) throw new Error("customer_phone must be E.164.");
       const deposit = input.decision === "approved" ? input.deposit : undefined;
       checkDepositRow(input.nextStatus, deposit?.state ?? b.depositState, deposit?.payBy ?? b.payBy);
       const at = now();
@@ -706,6 +718,25 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
         .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.seq - a.seq)
         .slice(0, limit)
         .map((a) => toAlert({ ...a, id: String(a.seq), createdAt: copyDate(a.createdAt), timezone: shop.timezone }));
+    },
+
+    // ---- Texting: the owner's sign-in codes ----
+
+    async saveOwnerCode(code) {
+      // The owner_codes table's foreign key and checks.
+      if (!shopOf(code.shopSlug)) throw new Error(`Unknown shop: ${code.shopSlug}`);
+      if (!/^[0-9]{6}$/.test(code.code)) throw new Error("owner_codes.code must be six digits.");
+      ownerCodes.push({ ...code, expiresAt: copyDate(code.expiresAt), usedAt: null });
+    },
+
+    async redeemOwnerCode(shopSlug, code, at) {
+      // One synchronous step (no await), like the single UPDATE in Postgres: the newest matching code.
+      const match = ownerCodes.findLast(
+        (c) => c.shopSlug === shopSlug && c.code === code && c.usedAt === null && c.expiresAt.getTime() > at.getTime(),
+      );
+      if (!match) return false;
+      match.usedAt = copyDate(at);
+      return true;
     },
   };
 

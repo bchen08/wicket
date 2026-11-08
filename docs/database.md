@@ -9,6 +9,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 | [`supabase/migrations/0003_consent.sql`](../supabase/migrations/0003_consent.sql) | Ring 1b: holds awaiting approval (`approve_by`, the mandate, the person's phone) and approval requests (one per booking, with the link's token) |
 | [`supabase/migrations/0004_alerts.sql`](../supabase/migrations/0004_alerts.sql) | Owner alerts: `policies.owner_email` and the `alerts` table (one row per alert sent, logged or failed). Drops the unused `idempotency_keys`. |
 | [`supabase/migrations/0005_deposits.sql`](../supabase/migrations/0005_deposits.sql) | Deposits through Stripe Checkout: the Checkout Session, its URL, the PaymentIntent, `pay_by`, `deposit_state` and the last refused capture or release on `bookings`. See [deposits.md](deposits.md#database-0005_depositssql). |
+| [`supabase/migrations/0007_texting.sql`](../supabase/migrations/0007_texting.sql) | Texting: `policies.owner_mobile`, the `text` alert channel, and the `owner_codes` table (the owner's texted sign-in codes). Additive only. See [texting.md](texting.md#database-0007_textingsql). |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -20,15 +21,16 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 - `bookings (id, shop_slug, service_id, staff_id, during tstzrange, status, customer_name, agent_name, created_at, cancelled_at, cancelled_by, completed_at, no_show_at, deposit_cents, approve_by, customer_phone, mandate)`
   - `status` is one of `awaiting_approval`, `awaiting_deposit`, `confirmed`, `cancelled`, `expired`, `completed`, `no_show`. `book` writes `awaiting_approval`; Ring 1c will write `awaiting_deposit`.
   - `approve_by`: when the hold lapses (booking time + 10 minutes). Required while `awaiting_approval`.
-  - `customer_phone`: the phone number the person gave when approving, plain E.164, or null. Optional and not checked. `Booking.customer.phone` shows it.
+  - `customer_phone`: the person's phone number, plain E.164, or null: the one the agent gave with `book` (`customer_phone`; texted the approval link where texting is on), replaced by the one the person gave when approving, if any. Optional and not checked. `Booking.customer.phone` shows it.
   - `mandate`: the person's limits as the agent sent them (a JSON object), or null.
   - `cancelled_by` is `agent`, `owner` or `customer` (the person declined). Each transition stamps its own time column.
   - `deposit_cents` is a snapshot of the service's deposit when the booking was made, so a later price change doesn't rewrite history.
 - `approvals (booking_id pk, token unique, created_at, decided_at, decision)`: one per booking. `token` is the token in the approval link, stored as it is, so every booking response can carry the link while the hold is on (`Booking.approval`). `decision` is `approved` or `declined`, set together with `decided_at`. `Booking.customer.approved` is `decision = 'approved'`.
-- `policies (shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone, deposit_rule, late_cancel_rule, no_show_rule, owner_email, updated_at)`: one row per shop. A shop without a row uses the column defaults (120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules, no owner email). `owner_email` (at most 254 characters, or null) is where owner alerts are emailed; agents never see it.
+- `policies (shop_slug, lead_time_min, horizon_days, deposit_horizon_days, cancel_window_hours, paused, phone, deposit_rule, late_cancel_rule, no_show_rule, owner_email, owner_mobile, updated_at)`: one row per shop. A shop without a row uses the column defaults (120 minutes, 30 days, 6 days, 24 hours, not paused, no phone, empty rules, no owner email or mobile). `owner_email` (at most 254 characters, or null) is where owner alerts are emailed; `owner_mobile` (E.164, or null) is where they're texted, and where the sign-in code goes, where texting is on. Agents never see either.
 - `blocked_times (id, staff_id, during tstzrange, reason, created_at)`: holidays and time off. Half-open, like bookings. The owner sees `reason`; agents never do.
 - `events (id, booking_id, at, actor, type, data jsonb)`: one row per booking state change (`booked`, `approved`, `declined`, `expired`, `cancelled`, `completed`, `no_show`), written in the same transaction as the change. `actor` is `agent`, `owner`, `customer` or `system`.
-- `alerts (id, shop_slug, booking_id, kind, channel, recipient, status, error, created_at)`: one row per owner alert, whatever happened to it. `kind` is `booking_confirmed` or `booking_cancelled`; `channel` is `email` (to `recipient`) or `log` (`recipient` null); `status` is `sent`, `logged` or `failed` (with `error`). `id` increases. Deleting a booking deletes its alerts. The owner reads the newest 50 with `GET /api/shops/[shop]/alerts` ([frontdesk-api.md](frontdesk-api.md#owner-alerts)).
+- `alerts (id, shop_slug, booking_id, kind, channel, recipient, status, error, created_at)`: one row per owner alert, whatever happened to it. `kind` is `booking_confirmed` or `booking_cancelled`; `channel` is `email` (to `recipient`), `text` (to `recipient`, the owner's mobile; as well as the email or log line) or `log` (`recipient` null); `status` is `sent`, `logged` or `failed` (with `error`). `id` increases. Deleting a booking deletes its alerts. The owner reads the newest 50 with `GET /api/shops/[shop]/alerts` ([frontdesk-api.md](frontdesk-api.md#owner-alerts)).
+- `owner_codes (id, shop_slug, code, sent_to, expires_at, used_at, created_at)`: 6-digit sign-in codes texted to the owner ([texting.md](texting.md#3-owner-sign-in-by-texted-code)). Valid until `expires_at` (10 minutes), once: `used_at` is set when one signs in. Stored as they are.
 - `idempotency_keys`: from 0002, unused since the MVP reset, dropped by 0004.
 
 Double booking is impossible at the database level:
@@ -161,6 +163,15 @@ What 0004 does to existing data:
 
 The code already deployed tolerates it: it never reads `owner_email` or `alerts`. If the new code is deployed before the integration has applied 0004, reading a shop's policies fails, so most Front Desk calls fail with `internal` until it has; `/api/status` names what's missing.
 
+### Texting: applying 0007
+
+`0007_texting.sql` is applied like any other migration. It seeds nothing, and it is additive only:
+- `policies.owner_mobile` is null for every shop, so nothing is texted to the owner until it's set (`PUT /api/shops/harts/policies` with `{"ownerMobile": "+1…"}`).
+- The `alerts.channel` check is replaced by one that also accepts `text`. Existing rows all pass it.
+- `owner_codes` starts empty.
+
+The code already deployed tolerates it, because it never reads the new column or table. If the new code is deployed before 0007 is applied, reading a shop's policies fails (`owner_mobile`), so most Front Desk calls fail with `internal` until it is. `/api/status` names what's missing.
+
 ### 2. Get the connection string: use the transaction pooler
 
 In the Supabase dashboard, click **Connect**, choose **Transaction pooler**, and copy the URI. It looks like:
@@ -222,6 +233,10 @@ With it, [owner alerts](frontdesk-api.md#owner-alerts) are emailed through Resen
 
 A failed send (a wrong key, an address Resend won't deliver to) never affects the booking. It shows up in `GET /api/shops/harts/alerts` as `"status": "failed"` with Resend's message.
 
+### 6. Texting (optional, Production only)
+
+Set **one** sender's variables for **Production** only (previews then never text anyone): Photon's `PHOTON_API_KEY`, `PHOTON_PROJECT_ID` and `PHOTON_LINE`, or Twilio's `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` and `TWILIO_FROM`. Redeploy; `/api/status` shows `"texting": "photon"` or `"twilio"`. Then set Hart's `ownerMobile` (`PUT /api/shops/harts/policies` with `{"ownerMobile": "+1…"}`) for owner alerts and sign-in codes by text. See [texting.md](texting.md).
+
 ## Environment variables
 
 | Variable | Where | Required | What |
@@ -229,6 +244,8 @@ A failed send (a wrong key, an address Resend won't deliver to) never affects th
 | `DATABASE_URL` | Vercel (per environment), local | On Vercel | The Supabase transaction pooler string (port 6543). Unset locally: in-memory data. |
 | `OWNER_API_TOKEN` | Vercel (per environment), local | For the owner routes and `/console` | The shop's access code: the owner routes' Bearer token and the `fd_owner` cookie's value. |
 | `RESEND_API_KEY` | Vercel, **Production only** | No | Email owner alerts through Resend to the shop's `ownerEmail`. Unset (previews, local): alerts are logged instead. |
+| `PHOTON_API_KEY`, `PHOTON_PROJECT_ID`, `PHOTON_LINE` | Vercel, **Production only** | No | Texting by iMessage through Photon ([texting.md](texting.md#photon-imessage)). All three set: `/api/status` `"texting": "photon"`. |
+| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM` | Vercel, **Production only** | No | Texting by SMS through Twilio, when Photon isn't set ([texting.md](texting.md#twilio-sms)). Neither sender set: texting is off, and everything works as before. |
 | `STRIPE_SECRET_KEY` | Vercel (Preview and Production), local | No | A Stripe **test** secret key (`sk_test_…`): deposits are held through Stripe Checkout. Unset: deposits are off and bookings confirm without one. See [deposits.md](deposits.md#setup). |
 | `FRONTDESK_NOW` | Local, demos | No | Freeze Front Desk's clock at an RFC 3339 instant. |
 | `DATABASE_URL_TEST` | Local, CI if wanted | No | A scratch Postgres for the Postgres tests. |
@@ -318,7 +335,7 @@ The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/dep
 
 ## Running the Postgres tests
 
-`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql` to `0005_deposits.sql`) and the seed applied:
+`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration in `supabase/migrations/` and the seed applied:
 
 ```bash
 DATABASE_URL_TEST=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm test
@@ -329,7 +346,7 @@ Four files use it:
 | File | What it covers |
 |---|---|
 | [`lib/server/frontdesk/status-pg.test.ts`](../lib/server/frontdesk/status-pg.test.ts) | `/api/status` on a real database: every column in `REQUIRED_SCHEMA` exists once every migration has run, the shop's name, and the schema reported `current`. Read-only. |
-| [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, lazy expiry, approval answers, owner alerts, and the owner writes (policies with `owner_email`, services, hours, blocks). |
+| [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, lazy expiry, approval answers, owner alerts (text alerts included), the owner's texted sign-in codes, and the owner writes (policies with `owner_email` and `owner_mobile`, services, hours, blocks). |
 | [`lib/server/frontdesk/flow-pg.test.ts`](../lib/server/frontdesk/flow-pg.test.ts) | The lifecycle flow through the service layer, the code the MCP tools and owner routes call: book (and the same slot again → slot_taken), approve, cancel (released, captured, none), cancel after the start, an owner no-show, and concurrent books and cancels. |
 | [`lib/server/consent/consent-pg.test.ts`](../lib/server/consent/consent-pg.test.ts) | The consent flow on Postgres: approve with and without a phone (the token and the phone stored as they are), decline, and lazy expiry (a stale hold never blocks a new booking; exactly one `expired` event under concurrency). |
 

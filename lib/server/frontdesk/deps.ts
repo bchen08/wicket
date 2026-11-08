@@ -2,6 +2,7 @@ import { systemClock } from "../clock";
 import type { DepositPayments } from "../deposits/payments";
 import { createStripePayments } from "../deposits/stripe";
 import { createNotifier } from "../notify/notifier";
+import { textSenderFrom } from "../notify/texting";
 import { createMemoryStore } from "./memory-store";
 import { createPostgresStore } from "./postgres-store";
 import type { FrontDeskDeps } from "./service";
@@ -18,6 +19,11 @@ import type { FrontDeskDeps } from "./service";
 //
 // Owner alerts: RESEND_API_KEY set (Production only) → email to the shop's ownerEmail; otherwise, or for a
 // shop without an ownerEmail, a log line. See lib/server/notify/notifier.ts.
+//
+// Texting (lib/server/notify/texting.ts, docs/texting.md):
+//   PHOTON_API_KEY, PHOTON_PROJECT_ID, PHOTON_LINE set → iMessage through Photon
+//   else TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM set → SMS through Twilio
+//   else → texting off (deps.texter null): nothing is texted
 //
 // Deposits:
 //   STRIPE_SECRET_KEY set         → deposits through Stripe Checkout (test mode; lib/server/deposits)
@@ -52,6 +58,7 @@ export function createFrontDeskDeps(env: Env, warn: (message: string) => void = 
   const clock = systemClock;
   const notifier = createNotifier({ resendApiKey: env.RESEND_API_KEY });
   const payments = paymentsFrom(env);
+  const texter = textSenderFrom(env);
   const url = env.DATABASE_URL?.trim();
 
   if (!url && env.VERCEL) {
@@ -63,14 +70,14 @@ export function createFrontDeskDeps(env: Env, warn: (message: string) => void = 
   const baseUrl = LOCAL_BASE_URL;
   if (url) {
     const db = createPostgresStore(url);
-    return { clock, notifier, payments, baseUrl, catalog: db, store: db };
+    return { clock, notifier, payments, texter, baseUrl, catalog: db, store: db };
   }
   warn(
     "[frontdesk] DATABASE_URL is not set: using in-memory demo data. Bookings are lost when the server restarts. " +
       "See docs/database.md to use Postgres.",
   );
   const memory = createMemoryStore({ clock });
-  return { clock, notifier, payments, baseUrl, catalog: memory, store: memory };
+  return { clock, notifier, payments, texter, baseUrl, catalog: memory, store: memory };
 }
 
 // Cached on globalThis, not in a module variable: Next.js can load this module once per route

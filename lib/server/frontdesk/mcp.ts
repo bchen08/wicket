@@ -224,6 +224,13 @@ const bookInputShape = {
       },
     },
   }),
+  customer_phone: advertise({
+    type: "string",
+    description:
+      'Optional: the person\'s mobile number with its country code, e.g. "+14015550123". Only if they gave it to you. ' +
+      "It's stored with the booking, and where the shop can text, Front Desk texts them the approval link itself " +
+      "(the result's texted is then true: don't send the link again).",
+  }),
 } satisfies Record<keyof BookInput, z.ZodType>; // same keys as the contract, no more, no fewer
 
 const BOOK_REQUIRED = ["service_id", "start", "customer_name"] as const;
@@ -266,7 +273,10 @@ const bookingSchema = z.object({
     displayName: z.string(),
     approved: z.boolean().describe("true once the person tapped Approve on the approval link."),
     verified: z.boolean().describe("Deprecated: the same as approved. Read approved."),
-    phone: z.string().optional().describe("The phone number the person gave when approving (E.164), if any."),
+    phone: z
+      .string()
+      .optional()
+      .describe("The person's phone number (E.164), if any: customer_phone from book, or the one they gave when approving."),
   }),
   agent: z.object({ name: z.string().describe("Best-effort label for the booking agent: the client's self-reported name.") }),
   depositCents: z.number().int().describe("Deposit the service requires, in integer US cents. 0 = none."),
@@ -305,7 +315,15 @@ const bookingSchema = z.object({
     .describe("Present while the booking awaits approval or its deposit, in book's and get_booking's results."),
 });
 
-const bookOutputSchema = z.object({ booking: bookingSchema });
+const bookOutputSchema = z.object({
+  booking: bookingSchema,
+  texted: z
+    .boolean()
+    .describe(
+      "true when Front Desk texted the approval link to customer_phone: don't send it again. false: send " +
+        "booking.approval.url to the person yourself.",
+    ),
+});
 
 const getBookingOutputSchema = z.object({ booking: bookingSchema });
 
@@ -424,7 +442,7 @@ function displayInstant(rfc3339: string): string {
  * What the agent must do after book: "Hold placed until <time>. Send <name> this link to approve:
  * <url>. Then call get_booking to check the status."
  */
-export function bookText({ booking, staffName, holdDisplay, depositsOn }: BookOutcome): string {
+export function bookText({ booking, texted, staffName, holdDisplay, depositsOn }: BookOutcome): string {
   const name = booking.customer.displayName;
   const amount = formatUsdShort(booking.depositCents);
   const deposit =
@@ -436,9 +454,13 @@ export function bookText({ booking, staffName, holdDisplay, depositsOn }: BookOu
         : `This service has a ${amount} deposit, but the shop isn't collecting deposits yet, so nothing will be charged.`;
   const lines = [`Held ${booking.serviceName} with ${staffName}, ${booking.display}, for ${name}. It is not confirmed yet.`];
   if (booking.approval) {
+    const until = holdDisplay ?? displayInstant(booking.approval.expiresAt);
     lines.push(
-      `Hold placed until ${holdDisplay ?? displayInstant(booking.approval.expiresAt)}. Send ${name} this link to approve: ` +
-        `${booking.approval.url}. Then call get_booking to check the status.`,
+      texted
+        ? `Hold placed until ${until}. Front Desk texted ${name} the approval link at ${booking.customer.phone}, so don't ` +
+            `send it again (it's ${booking.approval.url} if they ask). Then call get_booking to check the status.`
+        : `Hold placed until ${until}. Send ${name} this link to approve: ${booking.approval.url}. Then call get_booking ` +
+            "to check the status.",
     );
   }
   lines.push(
@@ -702,6 +724,8 @@ export function registerFrontDeskTools(
         `customer_name is the name the booking is under (1–${MAX_CUSTOMER_NAME} characters). ` +
         "mandate (optional): the person's limits (priceCapCents, depositCapCents, window { from, to }); the server " +
         "refuses a booking outside them. " +
+        "customer_phone (optional): the person's mobile number (E.164); where the shop can text, Front Desk texts them " +
+        "the link and the result has texted: true, so don't send it again. " +
         "Call it once per booking: calling again for the same time gets slot_taken while the hold is on. " +
 
         `${ERROR_FORMAT} ` +
@@ -730,7 +754,7 @@ export function registerFrontDeskTools(
       try {
         const args = parseBookArgs(rawArgs);
         const outcome = await book(getDeps(), shopSlug, args, agentNameFrom(ctx));
-        const result: BookResult = { booking: outcome.booking };
+        const result: BookResult = { booking: outcome.booking, texted: outcome.texted };
         return {
           content: [{ type: "text", text: bookText(outcome) }],
           structuredContent: result,

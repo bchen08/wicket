@@ -68,6 +68,7 @@ describe("GET /api/status", () => {
       deposits: "off",
       approvalLinks: { origin: "http://localhost:3000" },
       alerts: "log",
+      texting: "off",
       problems: [],
     });
   });
@@ -90,6 +91,7 @@ describe("GET /api/status", () => {
       deposits: "off",
       approvalLinks: { origin: ORIGIN },
       alerts: "log",
+      texting: "off",
       problems: [],
     });
   });
@@ -161,6 +163,17 @@ describe("GET /api/status", () => {
     expect(JSON.stringify(email)).not.toContain("re_live_123");
     const log = await getStatus(previewEnv({ RESEND_API_KEY: " " }), ORIGIN, database(CURRENT));
     expect(log).toMatchObject({ status: "ready", alerts: "log", problems: [] });
+  });
+
+  it("says how texts go: photon, else twilio, else off; off is not a problem, and no value is shown", async () => {
+    const photon = { PHOTON_API_KEY: "pho_sk_secret", PHOTON_PROJECT_ID: "pho_prj_1", PHOTON_LINE: "+12125550100" };
+    const twilio = { TWILIO_ACCOUNT_SID: "AC123", TWILIO_AUTH_TOKEN: "twilio-secret", TWILIO_FROM: "+12125550101" };
+    const both = await getStatus(previewEnv({ ...photon, ...twilio }), ORIGIN, database(CURRENT));
+    expect(both.texting).toBe("photon");
+    expect(JSON.stringify(both)).not.toMatch(/pho_sk_secret|twilio-secret/);
+    expect((await getStatus(previewEnv(twilio), ORIGIN, database(CURRENT))).texting).toBe("twilio");
+    const off = await getStatus(previewEnv({ PHOTON_API_KEY: "pho_sk_secret", TWILIO_FROM: " " }), ORIGIN, database(CURRENT));
+    expect(off).toMatchObject({ status: "ready", texting: "off", problems: [] });
   });
 
   it("never allows writes in production, even on a database marked (preview)", async () => {

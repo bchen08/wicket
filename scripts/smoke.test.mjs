@@ -207,6 +207,8 @@ async function smoke(deployment, options = {}) {
     now: () => Date.parse("2026-11-08T12:00:00Z"),
     random: () => 0,
     print: (line) => lines.push(line),
+    // The feature checks in scripts/smoke-checks/ have their own tests (e.g. smoke-checks/texting.test.mjs).
+    checks: [],
     ...options,
   });
   return { ...outcome, output: lines.join("\n") };

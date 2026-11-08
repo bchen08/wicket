@@ -1,6 +1,9 @@
 import type { ApiError, OwnerSessionResponse } from "../../types/frontdesk";
+import { getFrontDeskDeps } from "./deps";
 import { FrontDeskError } from "./errors";
 import { errorResponse, isFormPost } from "./http";
+import { redeemOwnerCode } from "./owner-code";
+import type { FrontDeskDeps } from "./service";
 import {
   configuredOwnerToken,
   hasOwnerCookie,
@@ -12,10 +15,10 @@ import {
 } from "./owner-auth";
 
 // The handlers behind POST, GET and DELETE /api/owner/session: the stub owner session. The owner
-// enters the shop's access code (OWNER_API_TOKEN) once, at /console/unlock or as JSON; the answer sets
-// the fd_owner cookie to it (HttpOnly, so page code can't read it), and checkOwnerAuth accepts that
-// cookie on every owner route.
-// TODO(ring-2): owner sign-in by texted code replaces this.
+// enters the shop's access code (OWNER_API_TOKEN) once, at /console/unlock or as JSON, or a code texted to
+// their mobile by POST /api/owner/code (owner-code.ts, where texting is on); the answer sets the fd_owner
+// cookie to the access code (HttpOnly, so page code can't read it), and checkOwnerAuth accepts that cookie
+// on every owner route.
 
 // Never cache: the answer depends on the caller's cookie.
 const NO_STORE = { "cache-control": "no-store" };
@@ -39,6 +42,8 @@ export type OwnerSessionOptions = {
   getToken?: () => string | undefined;
   /** Wall-clock milliseconds, for expiresAt. Defaults to Date.now. */
   now?: () => number;
+  /** Where texted codes are checked (deps.store, deps.clock). Defaults to getFrontDeskDeps; only read for a code. */
+  getDeps?: () => FrontDeskDeps;
 };
 
 const envToken = () => process.env.OWNER_API_TOKEN;
@@ -74,8 +79,11 @@ function invalidField(field: string, message: string): FrontDeskError {
   });
 }
 
-/** The `token` from a JSON POST body, or invalid_request (400) naming what's wrong. */
-function readToken(text: string): string {
+/** What a JSON POST body signs in with: the access code, or a texted code. */
+type Credential = { token: string } | { code: string };
+
+/** The `token` or `code` from a JSON POST body (`code` when it has one), or invalid_request (400) naming what's wrong. */
+function readCredential(text: string): Credential {
   if (text.trim() === "") throw invalidField("body", "The request body is empty.");
   let body: unknown;
   try {
@@ -86,17 +94,24 @@ function readToken(text: string): string {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     throw invalidField("body", "The request body must be a JSON object.");
   }
-  const token = (body as Record<string, unknown>).token;
+  const { token, code } = body as Record<string, unknown>;
+  if (code !== undefined && code !== null) {
+    if (typeof code !== "string") throw invalidField("code", "code must be a string: the 6 digits texted to the owner.");
+    return { code };
+  }
   if (typeof token !== "string") throw invalidField("token", "token must be a string: the OWNER_API_TOKEN.");
-  return token;
+  return { token };
 }
+
+const WRONG_CODE_NEXT_ACTION = "Ask for a new code with POST /api/owner/code (it works once, for 10 minutes), or sign in with the access code.";
 
 /**
  * POST /api/owner/session → sets the fd_owner cookie.
- * - JSON (OwnerSessionRequest) → 200 OwnerSessionResponse; bad body → 400 invalid_request; wrong token,
- *   or OWNER_API_TOKEN not set → 401 unauthorized.
+ * - JSON (OwnerSessionRequest: { token } or { code }) → 200 OwnerSessionResponse; bad body → 400
+ *   invalid_request; wrong token, a wrong, used or expired code, or OWNER_API_TOKEN not set → 401 unauthorized.
  * - Form post (`token` field) → 303 /console with the cookie; a wrong or missing token → 303
- *   /console/unlock?error=1.
+ *   /console/unlock?error=1. Form post with a `code` field → 303 /console, or → /console/unlock?error=code.
+ * A code is checked only when OWNER_API_TOKEN is set (the cookie holds it), so a code isn't used up for nothing.
  */
 export async function ownerSessionPost(request: Request, options: OwnerSessionOptions = {}): Promise<Response> {
   const configured = (options.getToken ?? envToken)();
@@ -105,13 +120,28 @@ export async function ownerSessionPost(request: Request, options: OwnerSessionOp
     return { expiresAtS, header: sessionCookie(request, configuredOwnerToken(configured), OWNER_SESSION_MAX_AGE_S) };
   };
 
+  /** Whether `code` is a good texted code (and use it up). Only when the cookie can be set. */
+  const codeWorks = async (code: string) =>
+    configuredOwnerToken(configured) !== "" && (await redeemOwnerCode((options.getDeps ?? getFrontDeskDeps)(), code));
+
   if (isFormPost(request)) {
-    let given: FormDataEntryValue | null = null;
+    let form: FormData | null = null;
     try {
-      given = (await request.formData()).get("token");
+      form = await request.formData();
     } catch {
       // A malformed form body is a wrong token.
     }
+    const code = form?.get("code");
+    if (typeof code === "string") {
+      try {
+        if (!(await codeWorks(code))) return seeOther(request, "/console/unlock?error=code");
+      } catch (err) {
+        console.error("[frontdesk/owner-session] checking a code failed", err);
+        return seeOther(request, "/console/unlock?error=code");
+      }
+      return seeOther(request, "/console", { "set-cookie": cookie().header });
+    }
+    const given = form?.get("token");
     if (typeof given !== "string" || !ownerTokenMatches(given, configured)) return seeOther(request, "/console/unlock?error=1");
     return seeOther(request, "/console", { "set-cookie": cookie().header });
   }
@@ -120,13 +150,21 @@ export async function ownerSessionPost(request: Request, options: OwnerSessionOp
     const failure = ownerUnauthorized("Owner access isn't set up on this deployment.", NOT_SET_UP_NEXT_ACTION);
     return json(failure.body, failure.status, failure.headers);
   }
-  let given: string;
+  let given: Credential;
   try {
-    given = readToken(await request.text());
+    given = readCredential(await request.text());
+    if ("code" in given) {
+      if (!(await codeWorks(given.code))) {
+        const failure = ownerUnauthorized("Wrong or expired code, or it was already used.", WRONG_CODE_NEXT_ACTION);
+        return json(failure.body, failure.status, failure.headers);
+      }
+      const { expiresAtS, header } = cookie();
+      return json({ signedIn: true, expiresAt: rfc3339(expiresAtS) }, 200, { "set-cookie": header });
+    }
   } catch (err) {
     return errorResponse(err);
   }
-  if (!ownerTokenMatches(given, configured)) {
+  if (!ownerTokenMatches(given.token, configured)) {
     const failure = ownerUnauthorized("Wrong owner token.", 'Check the deployment\'s OWNER_API_TOKEN, then send it again as { "token": "…" }.');
     return json(failure.body, failure.status, failure.headers);
   }
