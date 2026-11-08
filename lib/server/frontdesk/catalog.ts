@@ -66,6 +66,8 @@ export class DepositExceedsPriceError extends Error {
 }
 
 export interface ShopCatalog {
+  /** Every shop, sorted by slug. The nightly tidy-up (nightly.ts) goes through them. */
+  listShops(): Promise<Shop[]>;
   /** The shop, or null if no shop has this slug. */
   getShop(slug: string): Promise<Shop | null>;
   /** The shop's services in display order. Empty if the shop doesn't exist. */

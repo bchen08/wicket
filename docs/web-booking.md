@@ -100,7 +100,7 @@ curl -s -X POST http://localhost:3000/api/shops/harts/book -H "Content-Type: app
     "end": "2026-11-14T15:00:00-05:00",
     "display": "Sat 14 Nov, 2:30 pm EST",
     "status": "awaiting_approval",
-    "customer": { "displayName": "Maya", "approved": false, "verified": false },
+    "customer": { "displayName": "Maya", "approved": false },
     "agent": { "name": "Maya's assistant" },
     "depositCents": 1000,
     "createdAt": "2026-11-10T11:00:00-05:00",

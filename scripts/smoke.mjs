@@ -17,7 +17,8 @@
 //    the deposit not_collected where it says "off"; cancel it → the slot is free again. Then the web booking
 //    API: a JSON book gets a link, a form post at that held start is sent back with ?error=slot_taken, the
 //    JSON booking is declined, and a form post lands on /approve/<token>. Every booking it makes is declined
-//    or cancelled at the end, even after a failure.
+//    or cancelled at the end, even after a failure. Last, the nightly tidy-up: GET /api/jobs/nightly answers
+//    its four counts, and /api/status shows that run as lastNightlyRun.
 //    Its MCP requests and web bookings say they come from "front-desk-smoke", so the bookings show who
 //    made them.
 //
@@ -274,6 +275,25 @@ function describeStatus(s) {
   ].join(" · ");
 }
 
+/** The four counts of a nightly tidy-up run (NightlyRun). */
+const NIGHTLY_COUNTS = ["expired", "completed", "depositsReleased", "failures"];
+
+/** A NightlyRun as evidence: "ran 2026-11-11T08:00:04Z: expired 0, completed 1, depositsReleased 1, failures 0". */
+function describeNightly(run) {
+  return `ran ${run.ranAt}: ${NIGHTLY_COUNTS.map((k) => `${k} ${run[k]}`).join(", ")}`;
+}
+
+/** Whether `run` looks like a NightlyRun: an RFC 3339 ranAt and four whole counts, none negative. */
+function isNightlyRun(run) {
+  return (
+    run !== null &&
+    typeof run === "object" &&
+    typeof run.ranAt === "string" &&
+    !Number.isNaN(Date.parse(run.ranAt)) &&
+    NIGHTLY_COUNTS.every((k) => Number.isInteger(run[k]) && run[k] >= 0)
+  );
+}
+
 // ---- Checks ----
 
 class CheckFailed extends Error {}
@@ -501,6 +521,10 @@ export async function runSmoke({
     ["W4", "Decline the web booking → cancelled"],
     ["W5", "Web book (form post) → 303 to /approve/<token>"],
   ];
+  const nightly = [
+    ["23", "GET /api/jobs/nightly → 200 with its four counts"],
+    ["23", "/api/status shows that run as lastNightlyRun"],
+  ];
   /** Bookings this run made: { id, token, done, approved } (done: declined or cancelled). */
   const made = [];
 
@@ -509,7 +533,7 @@ export async function runSmoke({
       status.environment === "production"
         ? "production: never written to"
         : `writes not allowed here (shop "${status.database?.shopName}")`;
-    for (const [item, title] of [...loop, ...webLoop]) rows.push({ item, title, result: "SKIPPED", evidence: why });
+    for (const [item, title] of [...loop, ...webLoop, ...nightly]) rows.push({ item, title, result: "SKIPPED", evidence: why });
   } else {
     const ctx = {};
     const needs = (key) => {
@@ -814,6 +838,27 @@ export async function runSmoke({
         return `${made.length} made, ${made.length} declined or cancelled: none left behind`;
       });
     }
+
+    // The nightly tidy-up writes (it expires, completes and records its run), so it runs only here too. Its
+    // counts depend on what's in the database, so only their shape is checked.
+    let nightlyRun;
+    await check(...nightly[0], async () => {
+      const res = await client.request("/api/jobs/nightly");
+      expect(res.status === 200 && isNightlyRun(res.json), `GET /api/jobs/nightly: ${http(res)}`);
+      nightlyRun = res.json;
+      return describeNightly(nightlyRun);
+    });
+    await check(...nightly[1], async () => {
+      if (!nightlyRun) throw new CheckFailed("not run: GET /api/jobs/nightly failed");
+      const res = await client.request("/api/status");
+      const last = res.json?.lastNightlyRun;
+      // Another run may have finished since (a second smoke run at once): the newest is this one or later.
+      expect(
+        isNightlyRun(last) && Date.parse(last.ranAt) >= Date.parse(nightlyRun.ranAt),
+        `lastNightlyRun: ${snippet(JSON.stringify(last ?? null))}`,
+      );
+      return describeNightly(last);
+    });
   }
 
   // ---- Report ----

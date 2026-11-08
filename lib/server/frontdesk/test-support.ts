@@ -78,12 +78,9 @@ export async function approveAsCustomer(deps: FrontDeskDeps, booking: Booking, p
   return (await approveBooking(deps, approvalToken(booking), phone === null ? {} : { phone })).booking;
 }
 
-/**
- * A Booking.customer as the API returns it. `verified` is the deprecated copy of `approved`, kept for one
- * release; this is the one place tests spell it.
- */
+/** A Booking.customer as the API returns it. */
 export function customerOf(displayName: string, approved: boolean, phone?: string): Booking["customer"] {
-  return { displayName, approved, verified: approved, ...(phone ? { phone } : {}) };
+  return { displayName, approved, ...(phone ? { phone } : {}) };
 }
 
 /** A notifier that remembers what it was told: it routes every alert to the log channel and keeps it here. */

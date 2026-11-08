@@ -9,6 +9,7 @@ Front Desk stores shops, services, staff hours, booking rules, blocked time, boo
 | [`supabase/migrations/0003_consent.sql`](../supabase/migrations/0003_consent.sql) | Ring 1b: holds awaiting approval (`approve_by`, the mandate, the person's phone) and approval requests (one per booking, with the link's token) |
 | [`supabase/migrations/0004_alerts.sql`](../supabase/migrations/0004_alerts.sql) | Owner alerts: `policies.owner_email` and the `alerts` table (one row per alert sent, logged or failed). Drops the unused `idempotency_keys`. |
 | [`supabase/migrations/0005_deposits.sql`](../supabase/migrations/0005_deposits.sql) | Deposits through Stripe Checkout: the Checkout Session, its URL, the PaymentIntent, `pay_by`, `deposit_state` and the last refused capture or release on `bookings`. See [deposits.md](deposits.md#database-0005_depositssql). |
+| [`supabase/migrations/0006_nightly.sql`](../supabase/migrations/0006_nightly.sql) | The nightly tidy-up's log: the `nightly_runs` table (one row per run, with its counts), which `/api/status` shows as `lastNightlyRun`. See [nightly.md](nightly.md#database-0006_nightlysql). |
 | [`supabase/seed.sql`](../supabase/seed.sql) | Demo data: Hart's Barbers, its 3 services, staff member Dana, Tue–Sat hours, and Hart's policies. No bookings or blocked times. Needs 0002. Safe to run more than once. |
 
 ## Schema in one minute
@@ -160,6 +161,16 @@ What 0004 does to existing data:
 - It drops `idempotency_keys`. Nothing deployed reads or writes it since the MVP reset.
 
 The code already deployed tolerates it: it never reads `owner_email` or `alerts`. If the new code is deployed before the integration has applied 0004, reading a shop's policies fails, so most Front Desk calls fail with `internal` until it has; `/api/status` names what's missing.
+
+### The nightly tidy-up: applying 0006
+
+`0006_nightly.sql` is applied like any other migration (never in the SQL editor). It adds one table, `nightly_runs`, with RLS on and no policies, and seeds nothing. See [nightly.md](nightly.md).
+
+1. **Preview database:** the Preview database workflow rebuilds it from the PR's branch, because the PR changes `supabase/`. Check `/api/status` on the preview: `"schema": "current"` and `"lastNightlyRun": null` until something calls `/api/jobs/nightly`.
+2. **Production:** the GitHub integration applies 0006 when the PR merges. The first cron run (08:00 UTC) writes the first row.
+3. **Check** with `select version from supabase_migrations.schema_migrations;` (lists `0006`) and `select * from nightly_runs order by ran_at desc limit 1;`.
+
+It changes no existing data, and the code already deployed never reads `nightly_runs`. If the new code is deployed before the integration has applied 0006, `/api/status` says `outdated` (missing `nightly_runs`) and `lastNightlyRun: null`, and `/api/jobs/nightly` does its work but answers `internal` when it can't record the run.
 
 ### 2. Get the connection string: use the transaction pooler
 
@@ -318,13 +329,13 @@ The wiring lives in [`lib/server/frontdesk/deps.ts`](../lib/server/frontdesk/dep
 
 ## Running the Postgres tests
 
-`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql` to `0005_deposits.sql`) and the seed applied:
+`pnpm test` uses the in-memory store. To also run the tests against a real database, point `DATABASE_URL_TEST` at a **scratch** database with every migration (`0001_skeleton.sql` to `0006_nightly.sql`) and the seed applied:
 
 ```bash
 DATABASE_URL_TEST=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm test
 ```
 
-Four files use it:
+These files use it:
 
 | File | What it covers |
 |---|---|
@@ -332,6 +343,8 @@ Four files use it:
 | [`lib/server/frontdesk/postgres-store.test.ts`](../lib/server/frontdesk/postgres-store.test.ts) | The Postgres store itself: overlaps and races (`23P01`, `40P01`), the deposit snapshot and `booked` event, conditional transitions and their timestamps, busy time including blocked time, lazy expiry, approval answers, owner alerts, and the owner writes (policies with `owner_email`, services, hours, blocks). |
 | [`lib/server/frontdesk/flow-pg.test.ts`](../lib/server/frontdesk/flow-pg.test.ts) | The lifecycle flow through the service layer, the code the MCP tools and owner routes call: book (and the same slot again → slot_taken), approve, cancel (released, captured, none), cancel after the start, an owner no-show, and concurrent books and cancels. |
 | [`lib/server/consent/consent-pg.test.ts`](../lib/server/consent/consent-pg.test.ts) | The consent flow on Postgres: approve with and without a phone (the token and the phone stored as they are), decline, and lazy expiry (a stale hold never blocks a new booking; exactly one `expired` event under concurrency). |
+| [`lib/server/deposits/deposits-pg.test.ts`](../lib/server/deposits/deposits-pg.test.ts) | Deposits on Postgres (0005's columns) with a stubbed Stripe: approve, pay, capture, a refused release, an unpaid deposit expiring. |
+| [`lib/server/frontdesk/nightly-pg.test.ts`](../lib/server/frontdesk/nightly-pg.test.ts) | The nightly tidy-up on Postgres for a throwaway shop only (`tidyShop`): a lapsed hold and an unpaid deposit expired, a past booking completed with its deposit released, a future one left alone, a second run changing nothing; `listBookings` by status; `nightly_runs` written and read. |
 
 They only touch rows of their own and delete them afterwards: bookings in 2099 (their approvals and events cascade), and a throwaway shop for the lifecycle, consent and owner-write tests. Hart's seeded rows are read, never changed. Without `DATABASE_URL_TEST` they're skipped, and the test output says so.
 

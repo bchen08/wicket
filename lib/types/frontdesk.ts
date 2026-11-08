@@ -3,8 +3,10 @@
 // Money is always an integer number of cents. Instants are RFC 3339 strings with an offset.
 
 import type { BookingDeposit, DepositsMode } from "./deposits";
+import type { NightlyRun } from "./nightly";
 
 export type { BookingDeposit, DepositsMode, DepositState } from "./deposits";
+export type { NightlyCounts, NightlyRun, NightlyRunResponse } from "./nightly";
 // The web booking API's shapes (plain HTTP booking for agents without MCP, and the booking page).
 export type * from "./web-booking";
 
@@ -243,7 +245,7 @@ export type DepositEffect =
 /**
  * Who did something to a booking. `customer` is the person approving or declining through the
  * approval link. `system` is for automatic changes (a hold that lapsed, a deposit paid or not paid in
- * time, a deposit Stripe refused to move).
+ * time, a deposit Stripe refused to move, a past appointment the nightly tidy-up marked completed).
  */
 export type BookingActor = "agent" | "owner" | "customer" | "system";
 
@@ -318,8 +320,6 @@ export type Booking = {
     displayName: string;
     /** true once the person tapped Approve on the approval link. */
     approved: boolean;
-    /** @deprecated use approved; removed once the console reads approved (v0). */
-    verified: boolean;
     /** The phone number the person gave when approving, E.164, e.g. "+14015550123". Absent if they gave none. Not checked. */
     phone?: string;
   };
@@ -681,6 +681,12 @@ export type StatusResponse = {
    * still logged), else `log`. Neither is a problem.
    */
   alerts: AlertChannel;
+  /**
+   * The nightly tidy-up's newest run (GET /api/jobs/nightly, by Vercel Cron at 08:00 UTC): when it ran and
+   * what it did. null when it has never run against this database, or it can't be read (the database is
+   * unreachable, or 0006 isn't applied: then `database.missing` names nightly_runs). Never a problem.
+   */
+  lastNightlyRun: NightlyRun | null;
   /** One sentence each, saying what to fix and where. Empty when ready. */
   problems: string[];
 };

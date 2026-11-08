@@ -1,8 +1,8 @@
-import type { StatusResponse } from "../../types/frontdesk";
+import type { NightlyRun, StatusResponse } from "../../types/frontdesk";
 import { configuredStripeKey, getFrontDeskDeps } from "./deps";
 import { NO_STORE } from "./http";
 import { configuredOwnerToken } from "./owner-auth";
-import { getPostgresClient } from "./postgres-store";
+import { createPostgresStore, getPostgresClient } from "./postgres-store";
 import { missingFromSchema, REQUIRED_TABLES, type PresentColumn } from "./schema";
 
 // GET /api/status: the deployment reports its own state, so a verifier on any machine can tell "the
@@ -28,6 +28,8 @@ export interface DatabaseProbe {
   columns(tables: readonly string[]): Promise<PresentColumn[]>;
   /** The name of the shop with this slug, or null when there is none. */
   shopName(slug: string): Promise<string | null>;
+  /** The nightly tidy-up's newest run (nightly_runs), or null if it has never run. */
+  lastNightlyRun(): Promise<NightlyRun | null>;
 }
 
 /** A DatabaseProbe over Postgres, on the same shared client the stores use. */
@@ -46,6 +48,7 @@ export function postgresProbe(url: string): DatabaseProbe {
       const rows = await sql<{ name: string }[]>`select name from shops where slug = ${slug}`;
       return rows[0]?.name ?? null;
     },
+    lastNightlyRun: () => createPostgresStore(url).lastNightlyRun(),
   };
 }
 
@@ -54,6 +57,8 @@ export type StatusOptions = {
   probe?: (url: string) => DatabaseProbe;
   /** In-memory mode's shop lookup. Default: the in-memory catalog (getFrontDeskDeps). */
   memoryShopName?: (slug: string) => Promise<string | null>;
+  /** In-memory mode's newest nightly run. Default: the in-memory store (getFrontDeskDeps). */
+  memoryLastNightlyRun?: () => Promise<NightlyRun | null>;
   /** Per query. Default STATUS_DB_TIMEOUT_MS. */
   timeoutMs?: number;
 };
@@ -240,6 +245,25 @@ async function inspectDatabase(
   };
 }
 
+/**
+ * The nightly tidy-up's newest run, or null: it never ran here, or it can't be read (the database didn't
+ * answer, or 0006 isn't applied, which `database.missing` already says). Never a problem.
+ */
+async function readLastNightlyRun(env: Env, database: DatabaseStatus, options: StatusOptions): Promise<NightlyRun | null> {
+  if (!database.reachable || database.missing.some((m) => m === "nightly_runs" || m.startsWith("nightly_runs."))) return null;
+  const url = env.DATABASE_URL?.trim();
+  try {
+    if (database.mode === "memory" || !url) {
+      const read = options.memoryLastNightlyRun ?? (() => getFrontDeskDeps().store.lastNightlyRun());
+      return await read();
+    }
+    return await withTimeout((options.probe ?? postgresProbe)(url).lastNightlyRun(), options.timeoutMs ?? STATUS_DB_TIMEOUT_MS);
+  } catch (err) {
+    console.error(`[frontdesk/status] reading the last nightly run failed: ${describeError(err, url)}`);
+    return null;
+  }
+}
+
 /** Whether deposits are collected: STRIPE_SECRET_KEY is set (its value is never shown). */
 export function depositsMode(env: Env): StatusResponse["deposits"] {
   return configuredStripeKey(env.STRIPE_SECRET_KEY) === "" ? "off" : "stripe_test";
@@ -267,6 +291,7 @@ export async function getStatus(env: Env, origin: string, options: StatusOptions
     deposits: depositsMode(env),
     approvalLinks: { origin },
     alerts: toAlertChannel(env.RESEND_API_KEY),
+    lastNightlyRun: await readLastNightlyRun(env, database, options),
     problems,
   };
 }
@@ -288,6 +313,7 @@ export async function statusResponse(request: Request, env: Env, options: Status
       deposits: depositsMode(env),
       approvalLinks: { origin },
       alerts: toAlertChannel(env.RESEND_API_KEY),
+      lastNightlyRun: null,
       problems: [`The status check itself failed (${describeError(err, env.DATABASE_URL)}): see this deployment's function logs in Vercel.`],
     };
   }
