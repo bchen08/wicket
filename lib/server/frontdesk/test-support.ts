@@ -5,6 +5,7 @@ import { approveBooking } from "../consent/approvals";
 import { newApprovalToken } from "../consent/crypto";
 import type { DepositPayments } from "../deposits/payments";
 import type { Notifier, OwnerAlert } from "../notify/notifier";
+import type { TextProvider, TextSender } from "../notify/text-sender";
 import type { NewBooking } from "./booking-store";
 import type { NewBlock, ShopCatalog } from "./catalog";
 import { createMemoryStore, type InitialBooking } from "./memory-store";
@@ -105,6 +106,31 @@ export function failingNotifier(message: string, recipient = "dana@example.com")
   };
 }
 
+/** A text sender that sends nothing and remembers every text: [to, body]. A stand-in for Photon or Twilio. */
+export function recordingTexter(provider: TextProvider = "twilio"): TextSender & { sent: { to: string; body: string }[] } {
+  const sent: { to: string; body: string }[] = [];
+  return {
+    provider,
+    sent,
+    async send(to, body) {
+      sent.push({ to, body });
+    },
+  };
+}
+
+/** A text sender whose every send fails with `message` (and remembers what it was asked to send). */
+export function failingTexter(message: string): TextSender & { tried: { to: string; body: string }[] } {
+  const tried: { to: string; body: string }[] = [];
+  return {
+    provider: "twilio",
+    tried,
+    async send(to, body) {
+      tried.push({ to, body });
+      throw new Error(message);
+    },
+  };
+}
+
 /** What a recording notifier was told, as [kind, booking id, booking status] for each alert. */
 export function alertSummary(notifier: Notifier): [string, string, string][] {
   return (notifier as ReturnType<typeof recordingNotifier>).alerts.map((a) => [a.kind, a.booking.id, a.booking.status]);
@@ -128,7 +154,7 @@ export function withCatalog(
  * Deps backed by a fresh in-memory store and a fixed clock. `policies` is merged over Hart's seeded
  * policies; `initialBookings` and `initialBlocks` exist before the first call. Approval links point at
  * `baseUrl` (default TEST_BASE_URL). Deposits are off unless `payments` is given (see stubPayments in
- * lib/server/deposits/stub-payments.ts).
+ * lib/server/deposits/stub-payments.ts). Texting is off unless `texter` is given (see recordingTexter).
  */
 export function memoryDeps(
   options: {
@@ -139,6 +165,7 @@ export function memoryDeps(
     initialBlocks?: NewBlock[];
     baseUrl?: string;
     payments?: DepositPayments | null;
+    texter?: TextSender | null;
   } = {},
 ): FrontDeskDeps {
   const clock = options.clock ?? fixedClock(NOW);
@@ -154,6 +181,7 @@ export function memoryDeps(
     store,
     notifier: options.notifier ?? recordingNotifier(),
     payments: options.payments ?? null,
+    texter: options.texter ?? null,
     baseUrl: options.baseUrl ?? TEST_BASE_URL,
   };
 }

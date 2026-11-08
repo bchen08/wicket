@@ -4,8 +4,9 @@ import type { ApiError } from "../../types/frontdesk";
 // request proves it holds the secret in one of two ways:
 // - the header `Authorization: Bearer <token>` (curl, scripts); or
 // - the fd_owner cookie, which POST /api/owner/session sets to the token (see owner-session.ts). It is
-//   HttpOnly, so the console's page code never reads it.
-// TODO(ring-2): owner sign-in by texted code replaces the token and this cookie.
+//   HttpOnly, so the console's page code never reads it. A code texted to the owner (owner-code.ts, where
+//   texting is on) gets the same cookie.
+// TODO(ring-2): per-owner sign-in replaces the shared token.
 //
 // An unset or empty OWNER_API_TOKEN matches nothing: an empty token must not match an empty header.
 

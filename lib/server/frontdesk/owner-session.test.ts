@@ -187,7 +187,8 @@ describe("POST /api/owner/session (form post from /console/unlock)", () => {
   it.each([
     ["a wrong token", { token: "wrong" }],
     ["an empty token", { token: "" }],
-    ["no token field", { code: TOKEN }],
+    // (A `code` field is a texted code: see texting.test.ts.)
+    ["no token field", { password: TOKEN }],
   ])("with %s: 303 → /console/unlock?error=1 and no cookie", async (_name, form) => {
     const res = await formSignIn(form);
     expect(res.status).toBe(303);

@@ -375,8 +375,9 @@ describe("getBooking", () => {
 describe("getPolicies", () => {
   it("returns Hart's seeded policies, without the owner's email (agents never see it)", async () => {
     const result = await getPolicies(memoryDeps({ policies: { ownerEmail: "dana@example.com" } }), "harts");
-    const { ownerEmail, ...rules } = SEED.policies.harts;
+    const { ownerEmail, ownerMobile, ...rules } = SEED.policies.harts;
     expect(ownerEmail).toBeNull();
+    expect(ownerMobile).toBeNull();
     expect(result).toEqual({
       shop: { slug: "harts", name: "Hart's Barbers", timezone: "America/New_York" },
       policies: rules,
