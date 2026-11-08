@@ -1,16 +1,24 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { ConfigurationError, createFrontDeskDeps } from "./deps";
+import { ConfigurationError, createFrontDeskDeps, LOCAL_BASE_URL } from "./deps";
 import { closePostgresClients } from "./postgres-store";
 
 afterAll(async () => {
   await closePostgresClients();
 });
 
+/** What a Vercel deployment provides on its own. */
+const VERCEL_ENV_VARS = { VERCEL: "1", VERCEL_URL: "emergent-abc123.vercel.app" };
+
 describe("createFrontDeskDeps", () => {
   it("uses Postgres when DATABASE_URL is set (without connecting yet)", async () => {
     const warn = vi.fn();
-    const deps = createFrontDeskDeps({ DATABASE_URL: "postgres://user:pass@127.0.0.1:6543/postgres", VERCEL: "1" }, warn);
+    const deps = createFrontDeskDeps(
+      { DATABASE_URL: "postgres://user:pass@127.0.0.1:6543/postgres", ...VERCEL_ENV_VARS },
+      warn,
+    );
     expect(deps.catalog).toBe(deps.store);
+    // Routes set baseUrl to their request's origin; PUBLIC_BASE_URL and VERCEL_URL aren't read.
+    expect(deps.baseUrl).toBe("http://localhost:3000");
     expect(warn).not.toHaveBeenCalled();
   });
 
@@ -20,6 +28,8 @@ describe("createFrontDeskDeps", () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toMatch(/DATABASE_URL is not set/);
     expect(await deps.catalog.getShop("harts")).toMatchObject({ name: "Hart's Barbers" });
+    expect(deps.baseUrl).toBe(LOCAL_BASE_URL);
+    expect(LOCAL_BASE_URL).toBe("http://localhost:3000");
   });
 
   it("treats a blank DATABASE_URL as unset", () => {
@@ -30,8 +40,14 @@ describe("createFrontDeskDeps", () => {
 
   it("refuses to serve fake data on Vercel: throws a configuration error", () => {
     const warn = vi.fn();
-    expect(() => createFrontDeskDeps({ VERCEL: "1" }, warn)).toThrow(ConfigurationError);
-    expect(() => createFrontDeskDeps({ VERCEL: "1" }, warn)).toThrow(/DATABASE_URL is not set.*6543/);
+    const env = { ...VERCEL_ENV_VARS };
+    expect(() => createFrontDeskDeps(env, warn)).toThrow(ConfigurationError);
+    expect(() => createFrontDeskDeps(env, warn)).toThrow(/DATABASE_URL is not set.*6543/);
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("ignores PUBLIC_BASE_URL: approval links use the request's origin", () => {
+    const deps = createFrontDeskDeps({ PUBLIC_BASE_URL: "https://frontdesk.example.com" }, vi.fn());
+    expect(deps.baseUrl).toBe("http://localhost:3000");
   });
 });

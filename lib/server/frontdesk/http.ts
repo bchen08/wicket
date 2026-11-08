@@ -10,7 +10,7 @@ import type {
   ServiceResponse,
   ServicesResponse,
 } from "../../types/frontdesk";
-import type { LifecycleAction } from "../engine/lifecycle";
+import type { ManageAction } from "../engine/lifecycle";
 import { FrontDeskError, toApiError } from "./errors";
 import {
   createShopBlock,
@@ -25,8 +25,8 @@ import {
   updateShopPolicies,
   updateShopService,
 } from "./owner";
-import { checkOwnerAuth } from "./owner-auth";
-import { listServices, listShopBookings, type FrontDeskDeps } from "./service";
+import { checkOwnerAuth, UNLOCK_NEXT_ACTION } from "./owner-auth";
+import { listServices, listShopBookings, withRequestOrigin, type FrontDeskDeps } from "./service";
 
 // The HTTP side of the /api/shops/* routes: run a use case, return JSON or the ApiError envelope.
 // Route files stay thin (await connection(), read params, call one of these), and tests drive these
@@ -41,15 +41,23 @@ export const STATUS: Record<ApiErrorCode, number> = {
   slot_taken: 409,
   paused: 409,
   not_cancellable: 409,
-  idempotency_conflict: 409,
   outside_hours: 422,
   too_soon: 422,
   too_far: 422,
+  outside_mandate: 422,
+  approval_closed: 409,
+  approval_expired: 410,
   internal: 500,
 };
 
 // Live data that may include customer names: never cache it anywhere.
-const NO_STORE = { "cache-control": "no-store" };
+export const NO_STORE = { "cache-control": "no-store" };
+
+/** Whether the request is a plain HTML form post (the approval page, the console's unlock page). */
+export function isFormPost(request: Request): boolean {
+  const type = (request.headers.get("content-type") ?? "").toLowerCase();
+  return type.startsWith("application/x-www-form-urlencoded") || type.startsWith("multipart/form-data");
+}
 
 /** Any thrown value as an ApiError response with a matching status. Unexpected errors are logged. */
 export function errorResponse(err: unknown): Response {
@@ -58,7 +66,8 @@ export function errorResponse(err: unknown): Response {
   return Response.json(body, { status: STATUS[body.error.code], headers: NO_STORE });
 }
 
-async function respond<T>(run: () => Promise<T>, status = 200): Promise<Response> {
+/** Run a use case and answer JSON (`status` on success), or the ApiError envelope. */
+export async function respond<T>(run: () => Promise<T>, status = 200): Promise<Response> {
   try {
     return Response.json(await run(), { status, headers: NO_STORE });
   } catch (err) {
@@ -71,13 +80,8 @@ export function servicesResponse(getDeps: () => FrontDeskDeps, shopSlug: string)
   return respond<ServicesResponse>(() => listServices(getDeps(), shopSlug));
 }
 
-/** GET /api/shops/[shop]/bookings → BookingsResponse. */
-export function bookingsResponse(getDeps: () => FrontDeskDeps, shopSlug: string): Promise<Response> {
-  return respond<BookingsResponse>(() => listShopBookings(getDeps(), shopSlug));
-}
-
 // ---- Owner routes ----
-// Authorization: Bearer <OWNER_API_TOKEN>. TODO(ring-2): owner sign-in replaces the token.
+// Authorization: Bearer <OWNER_API_TOKEN>, or the fd_owner cookie. TODO(ring-2): owner sign-in replaces the token.
 
 /** Options for the owner handlers. Tests pass getToken; routes use the default. */
 export type OwnerOptions = {
@@ -88,9 +92,10 @@ export type OwnerOptions = {
 const envToken = () => process.env.OWNER_API_TOKEN;
 
 /**
- * Check the owner token, then run `run` with deps and answer JSON (`status` on success).
- * A 401 or 503 from checkOwnerAuth is returned as it is, before getDeps is called, so a request
- * without the token never touches the database.
+ * Check owner auth, then run `run` with deps (baseUrl set to this request's origin) and answer JSON
+ * (`status` on success). A 401 from checkOwnerAuth is returned as it is, before getDeps is called, so a
+ * request without the token never touches the database. `unauthorizedNextAction` replaces the 401's
+ * next_action for a wrong or missing token.
  */
 async function ownerRespond<T>(
   getDeps: () => FrontDeskDeps,
@@ -98,17 +103,31 @@ async function ownerRespond<T>(
   options: OwnerOptions | undefined,
   run: (deps: FrontDeskDeps) => Promise<T>,
   status = 200,
+  unauthorizedNextAction?: string,
 ): Promise<Response> {
-  const auth = checkOwnerAuth(request, (options?.getToken ?? envToken)());
+  const auth = checkOwnerAuth(request, (options?.getToken ?? envToken)(), unauthorizedNextAction);
   if (!auth.ok) return Response.json(auth.body, { status: auth.status, headers: { ...NO_STORE, ...auth.headers } });
-  return respond(() => run(getDeps()), status);
+  return respond(() => run(withRequestOrigin(getDeps(), request)), status);
+}
+
+/**
+ * GET /api/shops/[shop]/bookings → BookingsResponse. An owner route: it shows customers' phone numbers.
+ * Its 401 says to unlock the console, which forwards the browser's fd_owner cookie.
+ */
+export function bookingsResponse(
+  getDeps: () => FrontDeskDeps,
+  request: Request,
+  shopSlug: string,
+  options?: OwnerOptions,
+): Promise<Response> {
+  return ownerRespond<BookingsResponse>(getDeps, request, options, (deps) => listShopBookings(deps, shopSlug), 200, UNLOCK_NEXT_ACTION);
 }
 
 /**
  * The request's JSON body. An empty or malformed body is invalid_request (field "body"). Call it
- * inside ownerRespond's `run`, so the error becomes a 400 envelope.
+ * inside respond's `run`, so the error becomes a 400 envelope.
  */
-async function readJson(request: Request): Promise<unknown> {
+export async function readJson(request: Request): Promise<unknown> {
   const text = await request.text();
   const fail = (message: string) =>
     new FrontDeskError("invalid_request", message, "Send a JSON object as the request body, with Content-Type: application/json.", {
@@ -243,7 +262,7 @@ export function bookingActionPost(
   request: Request,
   shopSlug: string,
   bookingId: string,
-  action: LifecycleAction,
+  action: ManageAction,
   options?: OwnerOptions,
 ): Promise<Response> {
   return ownerRespond<OwnerBookingActionResponse>(getDeps, request, options, (deps) =>

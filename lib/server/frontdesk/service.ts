@@ -14,12 +14,14 @@ import type {
   GetBookingResult,
   GetPoliciesResult,
   ListServicesResult,
+  Mandate,
   Policies,
   Service,
   Shop,
   Slot,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
+import { newApprovalToken } from "../consent/crypto";
 import {
   bookingBounds,
   checkStart,
@@ -31,26 +33,44 @@ import {
   type StartCheck,
   type StartCheckInput,
 } from "../engine/availability";
-import { decide, type LifecycleAction, type LifecycleActor } from "../engine/lifecycle";
+import { decide, type LifecycleAction, type ManageAction } from "../engine/lifecycle";
 import type { Notifier } from "../notify/notifier";
 import { SlotTakenError, type BookingStore } from "./booking-store";
 import type { BusyInterval, ShopCatalog } from "./catalog";
 import { FrontDeskError } from "./errors";
-import { parseIdempotencyKey, requestHash } from "./idempotency";
-import { normalizeUuid } from "./idempotency-errors";
 import { DEFAULT_POLICIES } from "./policies";
 import { parseRfc3339, toRfc3339 } from "./time";
 
 // Transport-agnostic use cases behind the MCP tools and the UI routes. They take their
 // dependencies as arguments so tests can pass a fixed clock and the in-memory store.
-// Production wiring lives in deps.ts.
+// Production wiring lives in deps.ts. The approval page's use cases are in lib/server/consent/approvals.ts.
 
 export type FrontDeskDeps = {
   catalog: ShopCatalog;
   clock: Clock;
   store: BookingStore;
   notifier: Notifier;
+  /**
+   * The origin approval links point at, without a trailing slash, e.g. "https://emergent.vercel.app".
+   * Each route sets it to the origin of the request it's serving (withRequestOrigin), so links work on
+   * previews and in production with no setting. createFrontDeskDeps starts it at http://localhost:3000.
+   */
+  baseUrl: string;
 };
+
+/** `deps` with baseUrl set to the origin of `request`, so the bookings it returns link to where the caller is. */
+export function withRequestOrigin(deps: FrontDeskDeps, request: Request): FrontDeskDeps {
+  return { ...deps, baseUrl: new URL(request.url).origin };
+}
+
+/**
+ * The booking as it leaves the server: its approval link (a path, from the store) gets deps.baseUrl in
+ * front. Every use case that returns a booking passes it through here.
+ */
+export function withApprovalOrigin(deps: Pick<FrontDeskDeps, "baseUrl">, booking: Booking): Booking {
+  if (!booking.approval || !booking.approval.url.startsWith("/")) return booking;
+  return { ...booking, approval: { ...booking.approval, url: `${deps.baseUrl}${booking.approval.url}` } };
+}
 
 const MIN_MS = 60_000;
 const HOUR_MS = 60 * MIN_MS;
@@ -90,24 +110,31 @@ export function bookingNotFound(bookingId: string): FrontDeskError {
   );
 }
 
-/** The booking if it exists and belongs to `shopSlug`; otherwise booking_not_found. */
+/**
+ * The booking if it exists and belongs to `shopSlug`; otherwise booking_not_found. Reading it expires
+ * its hold first if that lapsed (store.refreshBooking), so a caller never sees a stale hold.
+ */
 export async function requireBooking(deps: FrontDeskDeps, shopSlug: string, bookingId: string): Promise<Booking> {
-  const booking = await deps.store.getBooking(bookingId);
+  const booking = await deps.store.refreshBooking(bookingId, deps.clock.now());
   if (!booking || booking.shopSlug !== shopSlug) throw bookingNotFound(bookingId);
   return booking;
 }
 
-const EVENT_FOR: Record<LifecycleAction, BookingEventType> = {
+export const EVENT_FOR: Record<LifecycleAction, BookingEventType> = {
   cancel: "cancelled",
   complete: "completed",
   mark_no_show: "no_show",
+  approve: "approved",
+  decline: "declined",
+  expire: "expired",
 };
 
 /** How many times transitionBooking re-reads and re-decides after losing a race. */
 const MAX_TRANSITION_ATTEMPTS = 3;
 
 /**
- * Apply a lifecycle action to a booking: decide() against the shop's policies and the clock, then
+ * Apply an agent's or owner's lifecycle action (cancel, complete, mark_no_show) to a booking: expire a
+ * lapsed hold first (requireBooking), decide() against the shop's policies and the clock, then
  * store.transition() conditionally on the status it decided from, writing one event.
  * If another transition got there first (transition returns null), re-read the booking and decide
  * again, so the loser gets the right error (e.g. not_cancellable) instead of a stale success.
@@ -118,8 +145,8 @@ export async function transitionBooking(
   deps: FrontDeskDeps,
   shopSlug: string,
   bookingId: string,
-  action: LifecycleAction,
-  actor: LifecycleActor,
+  action: ManageAction,
+  actor: "agent" | "owner",
 ): Promise<BookingTransitionResult> {
   await requireShop(deps, shopSlug);
   const policies = await policiesFor(deps, shopSlug);
@@ -137,7 +164,9 @@ export async function transitionBooking(
         depositCollected: false,
       },
     });
-    if (updated) return { booking: updated, depositEffect: decision.depositEffect, depositCollected: false };
+    if (updated) {
+      return { booking: withApprovalOrigin(deps, updated), depositEffect: decision.depositEffect, depositCollected: false };
+    }
   }
   throw new Error(`Booking ${bookingId} kept changing status during ${action}; gave up after ${MAX_TRANSITION_ATTEMPTS} attempts.`);
 }
@@ -180,6 +209,11 @@ function shopPhone(policies: Policies): string | null {
 }
 
 // ---- Availability ----
+
+/** Busy time without holds that lapsed by `now`: a stale hold never blocks a new booking. */
+export function activeBusy(busy: BusyInterval[], now: Date): BusyInterval[] {
+  return busy.filter((b) => b.heldUntil === undefined || b.heldUntil.getTime() > now.getTime());
+}
 
 function parseInstant(field: "from" | "to", value: string): Date {
   const parsed = parseRfc3339(value);
@@ -322,7 +356,8 @@ export async function getAvailability(
     timezone: shop.timezone,
     durationMin: service.durationMin,
     staffHours,
-    busy,
+    // Read-only: a lapsed hold is skipped here and expired by the next write or read of it.
+    busy: activeBusy(busy, now),
     from,
     to,
     now,
@@ -342,14 +377,73 @@ export const UNKNOWN_AGENT = "unknown agent";
 /** How many nearby starts a slot_taken error offers in details.alternatives. */
 export const MAX_ALTERNATIVES = 3;
 
+/** The most a mandate cap may be, in cents ($1,000,000). */
+export const MAX_MANDATE_CAP_CENTS = 100_000_000;
+const MANDATE_FIELDS = ["priceCapCents", "depositCapCents", "window"] as const;
+const MANDATE_NEXT =
+  "Send mandate as { priceCapCents?, depositCapCents?, window?: { from, to } }: caps in whole US cents, " +
+  "the window as RFC 3339 date-times with offsets (from before to). Leave out any limit the person didn't set.";
+
+/**
+ * Check a raw `mandate` (any JSON) and narrow it to a Mandate, or null when absent, null or empty.
+ * A null field counts as absent. Unknown fields are refused rather than ignored, so a limit the
+ * person set is never silently dropped. Window strings are kept as given.
+ */
+export function parseMandate(raw: unknown): Mandate | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw invalidField("mandate", "mandate must be an object.", MANDATE_NEXT, raw);
+  }
+  const fields = raw as Record<string, unknown>;
+  const unknown = Object.keys(fields).find((k) => !(MANDATE_FIELDS as readonly string[]).includes(k));
+  if (unknown !== undefined) {
+    throw invalidField(`mandate.${unknown}`, `mandate has an unknown field "${unknown}".`, MANDATE_NEXT, fields[unknown]);
+  }
+  const mandate: Mandate = {};
+  for (const cap of ["priceCapCents", "depositCapCents"] as const) {
+    const value = fields[cap];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_MANDATE_CAP_CENTS) {
+      throw invalidField(
+        `mandate.${cap}`,
+        `mandate.${cap} must be a whole number of cents from 0 to ${MAX_MANDATE_CAP_CENTS}.`,
+        MANDATE_NEXT,
+        value,
+      );
+    }
+    mandate[cap] = value;
+  }
+  const window = fields.window;
+  if (window !== undefined && window !== null) {
+    const bad = (message: string, field = "mandate.window") => invalidField(field, message, MANDATE_NEXT, window);
+    if (typeof window !== "object" || Array.isArray(window)) throw bad("mandate.window must be an object { from, to }.");
+    const w = window as Record<string, unknown>;
+    const extra = Object.keys(w).find((k) => k !== "from" && k !== "to");
+    if (extra !== undefined) throw bad(`mandate.window has an unknown field "${extra}".`, `mandate.window.${extra}`);
+    for (const end of ["from", "to"] as const) {
+      if (typeof w[end] !== "string" || !parseRfc3339(w[end] as string)) {
+        throw bad(`mandate.window.${end} must be an RFC 3339 date-time with an offset.`, `mandate.window.${end}`);
+      }
+    }
+    const from = w.from as string;
+    const to = w.to as string;
+    if ((parseRfc3339(from) as Date).getTime() >= (parseRfc3339(to) as Date).getTime()) {
+      throw bad("mandate.window.from must be before mandate.window.to.", "mandate.window.to");
+    }
+    mandate.window = { from, to };
+  }
+  return Object.keys(mandate).length > 0 ? mandate : null;
+}
+
 /**
  * Check raw `book` tool arguments (any JSON) and narrow them to BookInput, in the same style as
  * parseGetAvailabilityArgs: missing fields and wrong JSON types become invalid_request errors.
- * customer_name is returned trimmed; idempotency_key is checked by parseIdempotencyKey.
+ * customer_name is returned trimmed; mandate is checked by parseMandate (omitted from the result when
+ * there is none).
  */
 export function parseBookArgs(raw: unknown): BookInput {
   const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  const { service_id, start, customer_name, idempotency_key } = args;
+  const { service_id, start, customer_name } = args;
 
   if (typeof service_id !== "string" || service_id.trim() === "") {
     throw invalidField(
@@ -385,44 +479,54 @@ export function parseBookArgs(raw: unknown): BookInput {
     );
   }
 
-  return { service_id, start, customer_name: name, idempotency_key: parseIdempotencyKey(idempotency_key) };
+  const mandate = parseMandate(args.mandate);
+  return {
+    service_id,
+    start,
+    customer_name: name,
+    ...(mandate ? { mandate } : {}),
+  };
 }
 
-/** What book() hands back: the contract's BookResult, plus the staff name for the text summary. */
-export type BookOutcome = BookResult & { staffName: string };
+/**
+ * What book() hands back: the contract's BookResult, plus the staff name and when the hold lapses in
+ * the shop's zone (e.g. "Tue 10 Nov, 11:10 am EST"), for the text summary.
+ */
+export type BookOutcome = BookResult & { staffName: string; holdDisplay?: string };
 
 /**
- * Book `input.start` for `input.service_id`, immediately and confirmed, at most once per
- * idempotency_key.
+ * Hold `input.start` for `input.service_id` until the person approves it. Returns the booking in
+ * awaiting_approval with booking.approval: the link to send the person, and when the hold lapses (10
+ * minutes). Calling it twice for the same time gets slot_taken the second time (the no_overlap
+ * constraint), so a retried call can't double-book; get_booking shows the hold and its link again.
  *
- * 1. Validate the input (invalid_request).
- * 2. Hash the normalized request (shop, service, start as an instant, trimmed name) and run the rest
- *    inside store.idempotent: the same key with the same request returns the first call's booking
- *    (replayed: true) without booking again; the same key with another request is
- *    idempotency_conflict. A call that fails isn't remembered, so it can be retried with the same key.
- * 3. Check the start against the shop's rules (engine checkStart): paused, too_soon
+ * 1. Validate the input (invalid_request), the mandate included.
+ * 2. Check the start against the shop's rules (engine checkStart): paused, too_soon
  *    (details.earliest), too_far (details.latest). These are decided before busy time is read, so a
- *    start far in the past or future never queries bookings. Then against hours, blocked time and
- *    bookings: outside_hours, or slot_taken (details.alternatives: up to 3 nearby free starts). The
- *    staff member comes from the check.
- * 4. Store it with the store the idempotent action receives (in Postgres, the key's transaction).
- *    If another booking got there first (SlotTakenError, i.e. the no_overlap constraint), read busy
- *    time again and, if another staff member is free at exactly this start, try once more with them.
- *    If that fails too, or nobody is free, fail with slot_taken; the database is the final word even
- *    when step 3 passed.
- * 5. Alert the owner, only for a new booking (not a replay). A failing notifier is logged and never
- *    fails the booking.
+ *    start far in the past or future never queries bookings.
+ * 3. decide() the "book" action: the person's mandate (outside_mandate, details.field) and the hold's
+ *    deadline (now + 10 minutes).
+ * 4. Lazy expiry: expire the shop's lapsed holds around the start, just before inserting, so a stale
+ *    hold never blocks this booking. Then check against hours, blocked time and bookings:
+ *    outside_hours, or slot_taken (details.alternatives: up to 3 nearby free starts). The staff
+ *    member comes from the check.
+ * 5. Store it with a new approval token. If another booking got there first (SlotTakenError, i.e. the
+ *    no_overlap constraint), read busy time again and, if another staff member is free at exactly this
+ *    start, try once more with them. If that fails too, or nobody is free, fail with slot_taken; the
+ *    database is the final word even when step 4 passed.
  *
- * TODO(ring-1c): deposits. book creates confirmed bookings; awaiting_deposit and collecting the
- * deposit come with Stripe. Booking.depositCents shows what the service requires; nothing is collected.
- * TODO(ring-1b): verified customer identity, consent and mandate. customer.verified is always false.
+ * The owner is alerted when the person approves (lib/server/consent/approvals.ts), not here.
+ *
+ * TODO(ring-1c): deposits. Approval confirms the booking; awaiting_deposit and collecting the deposit
+ * come with Stripe. Booking.depositCents shows what the service requires; nothing is collected.
+ * TODO(ring-2): require a mandate once agents sign in.
  */
 export async function book(
   deps: FrontDeskDeps,
   shopSlug: string,
   input: BookInput,
   agentName: string,
-): Promise<BookOutcome & { replayed: boolean }> {
+): Promise<BookOutcome> {
   const args = parseBookArgs(input);
   const start = parseRfc3339(args.start);
   if (!start) {
@@ -434,30 +538,13 @@ export async function book(
     );
   }
 
-  const scope = {
-    key: args.idempotency_key,
-    tool: "book" as const,
-    // The instant, not the string: the same time written with another offset is the same request.
-    requestHash: requestHash({
-      shop: shopSlug,
-      service_id: args.service_id,
-      start: start.toISOString(),
-      customer_name: args.customer_name,
-    }),
-  };
-  // The action reads and writes through the store it's given (in Postgres, the key's transaction).
-  const { result, replayed } = await deps.store.idempotent(scope, (tx) =>
-    bookOnce({ ...deps, catalog: tx, store: tx }, shopSlug, args, start, cleanAgentName(agentName)),
-  );
-
-  if (!replayed) await alertOwner(deps.notifier, result.booking);
-  return { ...result, replayed };
+  return bookOnce(deps, shopSlug, args, start, cleanAgentName(agentName));
 }
 
 /** checkStart's refusals that come from the shop's rules alone, before hours and busy time count. */
 const RULE_REFUSALS: ReadonlySet<RefusedStart["reason"]> = new Set(["paused", "too_soon", "too_far"]);
 
-/** Steps 3 and 4 of book(): check the start and store the booking. `deps.catalog` and `deps.store` are the idempotent action's store. */
+/** Steps 2 to 5 of book(): check the start and store the hold. */
 async function bookOnce(
   deps: FrontDeskDeps,
   shopSlug: string,
@@ -483,21 +570,23 @@ async function bookOnce(
     deps.catalog.getStaffHours(shopSlug),
   ]);
 
+  const now = deps.clock.now();
+  const end = new Date(start.getTime() + service.durationMin * MIN_MS);
   const rulesOnly: StartCheckInput = {
     timezone: shop.timezone,
     durationMin: service.durationMin,
     staffHours,
     busy: [],
-    now: deps.clock.now(),
+    now,
     depositCents: service.depositCents,
     rules: bookingRules(policies),
   };
   const refused = (check: RefusedStart, engine: StartCheckInput) =>
     startRefused(check, { shop, service, policies, requested: args.start, start, engine });
-  /** The engine input with busy time around `start`, read now. */
+  /** The engine input with busy time around `start`, read now, without lapsed holds. */
   const withBusy = async (): Promise<StartCheckInput> => ({
     ...rulesOnly,
-    busy: await busyAround(deps, shop, service, start),
+    busy: activeBusy(await deps.catalog.getBusyIntervals(shop.slug, busyRange(service, start)), now),
   });
 
   // The rules first, with no busy time: paused, too_soon and too_far don't depend on it, and a start
@@ -505,10 +594,24 @@ async function bookOnce(
   const byRules = checkStart(rulesOnly, start);
   if (!byRules.ok && RULE_REFUSALS.has(byRules.reason)) throw refused(byRules, rulesOnly);
 
+  // The person's mandate, and the hold's deadline.
+  const held = decide(
+    { priceCents: service.priceCents, depositCents: service.depositCents, start, end, mandate: args.mandate ?? null },
+    { type: "book", actor: "agent" },
+    now,
+  );
+  if (held instanceof FrontDeskError) throw held;
+
+  // Lazy expiry, just before the insert: a lapsed hold must not block this booking (the no_overlap
+  // constraint would still count it) nor hide an alternative. TODO(ring-2): a scheduled job too.
+  await deps.store.expireStaleHolds(shop.slug, busyRange(service, start), now);
+
   let engine = await withBusy();
   const check = checkStart(engine, start);
   if (!check.ok) throw refused(check, engine);
 
+  // The link's secret, stored as it is: every booking response while the hold is on carries the link.
+  const token = newApprovalToken();
   /** The stored booking, or null if another booking holds that staff member's time (SlotTakenError). */
   const create = async (staffId: string): Promise<Booking | null> => {
     try {
@@ -517,10 +620,13 @@ async function bookOnce(
         serviceId: service.id,
         staffId,
         start,
-        end: new Date(start.getTime() + service.durationMin * MIN_MS),
+        end,
         customerName: args.customer_name,
         agentName,
         depositCents: service.depositCents,
+        approveBy: held.approveBy,
+        approvalToken: token,
+        mandate: args.mandate ?? null,
       });
     } catch (err) {
       if (err instanceof SlotTakenError) return null;
@@ -544,22 +650,26 @@ async function bookOnce(
 
   const staffId = booking.staffId;
   const staffName = staffHours.find((s) => s.staffId === staffId)?.staffName ?? staffId;
-  return { booking, staffName };
+  const holdDisplay = formatDisplay(DateTime.fromJSDate(held.approveBy, { zone: shop.timezone }));
+  return { booking: withApprovalOrigin(deps, booking), staffName, holdDisplay };
 }
 
 /**
- * Busy time that can matter for a booking at `start` or for an alternative near it: every slot
+ * The time that can matter for a booking at `start` or for an alternative near it: every slot
  * nearbySlots considers starts within 24 hours of `start` and runs up to the service's duration.
  */
-function busyAround(deps: FrontDeskDeps, shop: Shop, service: Service, start: Date): Promise<BusyInterval[]> {
-  return deps.catalog.getBusyIntervals(shop.slug, {
+function busyRange(service: Service, start: Date) {
+  return {
     start: new Date(start.getTime() - DAY_MS),
     end: new Date(start.getTime() + service.durationMin * MIN_MS + DAY_MS),
-  });
+  };
 }
 
-/** Tell the owner about a new booking. It's already stored, so a failure is only logged. */
-async function alertOwner(notifier: Notifier, booking: Booking): Promise<void> {
+/**
+ * Tell the owner about a booking the person just approved. It's already stored, so a failure is only
+ * logged. Called by the approve use case (lib/server/consent/approvals.ts), once per booking.
+ */
+export async function alertOwner(notifier: Notifier, booking: Booking): Promise<void> {
   try {
     await notifier.alertOwner(booking);
   } catch (err) {
@@ -690,54 +800,49 @@ export function parseGetBookingArgs(raw: unknown): GetBookingInput {
   return { booking_id: parseBookingId(args.booking_id) };
 }
 
+/** What getBooking() hands back: the contract's GetBookingResult, plus whether the person declined (for the text). */
+export type GetBookingOutcome = GetBookingResult & { declined: boolean };
+
 /**
- * One booking at the shop. An unknown, malformed or other shop's id is booking_not_found.
- * TODO(ring-1b): anyone holding a booking id can read or cancel it until customer consent ships.
+ * One booking at the shop, after lazy expiry (a lapsed hold reads as expired). An unknown, malformed
+ * or other shop's id is booking_not_found. While the hold is on it includes booking.approval, the same
+ * link book returned.
+ * TODO(ring-2): get_booking and cancel still trust anyone holding the booking id; agent identity fixes this.
  */
 export async function getBooking(
   deps: FrontDeskDeps,
   shopSlug: string,
   input: GetBookingInput,
-): Promise<GetBookingResult> {
+): Promise<GetBookingOutcome> {
   const { booking_id } = parseGetBookingArgs(input);
   await requireShop(deps, shopSlug);
-  return { booking: await requireBooking(deps, shopSlug, booking_id) };
+  const booking = await requireBooking(deps, shopSlug, booking_id);
+  const declined =
+    booking.status === "cancelled" && (await deps.store.listEvents(booking.id)).some((e) => e.type === "declined");
+  return { booking: withApprovalOrigin(deps, booking), declined };
 }
 
 /** Check raw `cancel` arguments (any JSON) and narrow them to CancelInput. booking_id is returned trimmed. */
 export function parseCancelArgs(raw: unknown): CancelInput {
   const args = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  return {
-    booking_id: parseBookingId(args.booking_id),
-    idempotency_key: parseIdempotencyKey(args.idempotency_key),
-  };
+  return { booking_id: parseBookingId(args.booking_id) };
 }
 
 /**
- * An agent cancels a booking, under the shop's policy (decide(): cancelled at least
- * cancelWindowHours ahead → deposit released; later but before the start → captured; after the start
- * or from a final status → not_cancellable). At most once per idempotency_key: the same key for the
- * same booking returns the first result (replayed: true) without a second event; the same key for
- * another booking is idempotency_conflict. A call that fails isn't remembered.
- * TODO(ring-1b): anyone holding a booking id can read or cancel it until customer consent ships.
+ * An agent cancels a booking, under the shop's policy (decide(): a hold awaiting approval → cancelled
+ * any time; confirmed at least cancelWindowHours ahead → deposit released; later but before the start
+ * → captured; after the start or from a final status, a lapsed hold included → not_cancellable). A
+ * second cancel of the same booking is not_cancellable (it's already cancelled), so a retry is harmless.
+ * TODO(ring-2): get_booking and cancel still trust anyone holding the booking id; agent identity fixes this.
  * TODO(ring-1c): alert the owner when an agent cancels (the Notifier only knows new bookings).
  */
 export async function cancelBooking(
   deps: FrontDeskDeps,
   shopSlug: string,
   input: CancelInput,
-): Promise<CancelResult & { replayed: boolean }> {
+): Promise<CancelResult> {
   const args = parseCancelArgs(input);
-  const scope = {
-    key: args.idempotency_key,
-    tool: "cancel" as const,
-    // A UUID in either case is the same booking, so the same request.
-    requestHash: requestHash({ shop: shopSlug, booking_id: normalizeUuid(args.booking_id) ?? args.booking_id }),
-  };
-  const { result, replayed } = await deps.store.idempotent(scope, (tx) =>
-    transitionBooking({ ...deps, catalog: tx, store: tx }, shopSlug, args.booking_id, "cancel", "agent"),
-  );
-  return { ...result, replayed };
+  return transitionBooking(deps, shopSlug, args.booking_id, "cancel", "agent");
 }
 
 // ---- Bookings list (UI) ----
@@ -747,16 +852,19 @@ export const BOOKINGS_PAST_DAYS = 7;
 export const BOOKINGS_FUTURE_DAYS = 30;
 
 /**
- * The shop and its bookings of any status from 7 days ago to 30 days ahead, sorted by start.
- *
- * TODO(ring-2): owner sign-in. Until then anyone with the URL can read customer names.
+ * The shop and its bookings of any status from 7 days ago to 30 days ahead, sorted by start. Lapsed
+ * holds in that range are expired first (lazy expiry), so the list never shows a stale hold. A booking
+ * awaiting approval includes its approval link, for the owner to copy. An owner route (it shows
+ * customers' phone numbers): the HTTP layer checks owner auth first.
  */
 export async function listShopBookings(deps: FrontDeskDeps, shopSlug: string): Promise<BookingsResponse> {
   const shop = await requireShop(deps, shopSlug);
-  const now = deps.clock.now().getTime();
-  const bookings = await deps.store.listBookings(shopSlug, {
-    start: new Date(now - BOOKINGS_PAST_DAYS * DAY_MS),
-    end: new Date(now + BOOKINGS_FUTURE_DAYS * DAY_MS),
-  });
-  return { shop, bookings };
+  const now = deps.clock.now();
+  const range = {
+    start: new Date(now.getTime() - BOOKINGS_PAST_DAYS * DAY_MS),
+    end: new Date(now.getTime() + BOOKINGS_FUTURE_DAYS * DAY_MS),
+  };
+  await deps.store.expireStaleHolds(shopSlug, range, now);
+  const bookings = await deps.store.listBookings(shopSlug, range);
+  return { shop, bookings: bookings.map((b) => withApprovalOrigin(deps, b)) };
 }

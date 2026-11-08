@@ -16,11 +16,19 @@ import type {
   UpdateServiceRequest,
   WeeklyHours,
 } from "../../types/frontdesk";
-import type { LifecycleAction } from "../engine/lifecycle";
+import type { ManageAction } from "../engine/lifecycle";
 import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
 import { FrontDeskError } from "./errors";
 import { POLICY_LIMITS } from "./policies";
-import { NUL, policiesFor, requireBooking, requireShop, transitionBooking, type FrontDeskDeps } from "./service";
+import {
+  NUL,
+  policiesFor,
+  requireBooking,
+  requireShop,
+  transitionBooking,
+  withApprovalOrigin,
+  type FrontDeskDeps,
+} from "./service";
 import { parseRfc3339 } from "./time";
 
 // Owner use cases behind the /api/shops/[shop]/* owner routes (policies, hours, blocks, services,
@@ -573,7 +581,7 @@ export function ownerBookingAction(
   deps: FrontDeskDeps,
   shopSlug: string,
   bookingId: string,
-  action: LifecycleAction,
+  action: ManageAction,
 ): Promise<OwnerBookingActionResponse> {
   return transitionBooking(deps, shopSlug, bookingId, action, "owner");
 }
@@ -586,5 +594,5 @@ export async function getBookingDetail(
 ): Promise<BookingDetailResponse> {
   await requireShop(deps, shopSlug);
   const booking = await requireBooking(deps, shopSlug, bookingId);
-  return { booking, events: await deps.store.listEvents(booking.id) };
+  return { booking: withApprovalOrigin(deps, booking), events: await deps.store.listEvents(booking.id) };
 }

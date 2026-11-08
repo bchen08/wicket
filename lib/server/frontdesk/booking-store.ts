@@ -5,9 +5,11 @@ import type {
   BookingEvent,
   BookingEventType,
   BookingStatus,
+  Mandate,
 } from "../../types/frontdesk";
+import { approvalPath } from "../consent/crypto";
 import { formatDisplay } from "../engine/availability";
-import type { ShopCatalog, TimeRange } from "./catalog";
+import type { TimeRange } from "./catalog";
 import { toRfc3339 } from "./time";
 
 // Data access for bookings. Implementations: postgres-store.ts and memory-store.ts.
@@ -25,7 +27,48 @@ export type NewBooking = {
   agentName: string;
   /** The service's deposit at booking time, in cents. Stored on the booking so later price changes don't rewrite it. */
   depositCents: number;
+  /** When the hold lapses (decide()'s approveBy). */
+  approveBy: Date;
+  /** The approval link's token (newApprovalToken), stored as it is so every booking response can carry the link. */
+  approvalToken: string;
+  /** The person's limits as validated by book, or null. */
+  mandate: Mandate | null;
 };
+
+// ---- Ring 1b: consent records ----
+
+/** An approval request (one per booking), found by its token. */
+export type ApprovalRecord = {
+  bookingId: string;
+  /** null until the person approves or declines. */
+  decision: "approved" | "declined" | null;
+  /** When the hold lapses (bookings.approve_by). */
+  approveBy: Date;
+  /** The mandate stored on the booking, or null. */
+  mandate: Mandate | null;
+};
+
+/** What answerApproval writes. */
+export type ApprovalAnswer = {
+  bookingId: string;
+  decision: "approved" | "declined";
+  /** decide()'s next status for the answer. */
+  nextStatus: BookingStatus;
+  /** Front Desk's clock. The booking must still be awaiting_approval with approve_by > now. */
+  now: Date;
+  /** The event to write (actor "customer"). */
+  event: NewBookingEvent;
+  /** approved only: the phone number the person gave (E.164), stored on the booking. null: none given. */
+  phone?: string | null;
+};
+
+export type AnswerApprovalResult =
+  | { ok: true; booking: Booking }
+  /**
+   * Nothing was written: the approval was already decided, or the booking is no longer
+   * awaiting_approval, or its hold lapsed.
+   */
+  | { ok: false; reason: "not_pending" };
 
 /** The event a transition writes. The store stamps `at` (Postgres now(), the memory store's clock). */
 export type NewBookingEvent = {
@@ -34,40 +77,34 @@ export type NewBookingEvent = {
   data: Record<string, unknown>;
 };
 
-/** The write tools that take an idempotency key. Keys are scoped per tool. */
-export type IdempotentTool = "book" | "cancel";
-
-export type IdempotencyScope = {
-  /** The caller's idempotency_key, already validated (8–128 visible ASCII characters). */
-  key: string;
-  tool: IdempotentTool;
-  /** sha256 hex of the normalized arguments (see lib/server/frontdesk/idempotency.ts). */
-  requestHash: string;
-};
-
-/** How long a key is remembered. After this it may be reused. TODO(ring-2): a job that deletes old keys. */
-export const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
-
-/**
- * What an idempotent action works with: the bookings AND the shop catalog, both bound to the
- * idempotency transaction in Postgres. The action must read through it (not deps.catalog): reads on
- * the root client would each need a second pooled connection while the transaction holds one, so
- * as many concurrent writes as the pool has connections could wait on each other forever.
- */
-export type IdempotentStore = BookingStore & ShopCatalog;
-
 export interface BookingStore {
   /**
-   * Store a confirmed booking and its "booked" event (actor "agent", data { status: "confirmed",
-   * agentName }) in the same transaction.
-   * Throws SlotTakenError if the staff member already has an awaiting_deposit or confirmed booking
-   * that overlaps [start, end). In Postgres that's the `no_overlap` exclusion constraint (SQLSTATE 23P01).
+   * Store a booking awaiting approval (status awaiting_approval, approve_by, mandate), its approval
+   * request (approvals: booking_id, token) and its "booked" event (actor "agent", data
+   * { status: "awaiting_approval", agentName, mandate? }) in the same transaction.
+   * Throws SlotTakenError if the staff member already has an awaiting_approval, awaiting_deposit or
+   * confirmed booking that overlaps [start, end), lapsed holds included: expire them first
+   * (expireStaleHolds). In Postgres that's the `no_overlap` exclusion constraint (SQLSTATE 23P01).
    */
   createBooking(input: NewBooking): Promise<Booking>;
   /** Bookings of any status whose [start, end) overlaps `range`, sorted by start. */
   listBookings(shopSlug: string, range: TimeRange): Promise<Booking[]>;
-  /** One booking by id, or null. Any string is accepted: a malformed id is simply not found. */
+  /** One booking by id, or null. Any string is accepted: a malformed id is simply not found. Doesn't expire anything. */
   getBooking(id: string): Promise<Booking | null>;
+  /**
+   * Lazy expiry for one booking, then read it, atomically (Postgres: one statement): if it is
+   * awaiting_approval with approve_by <= now, it becomes expired with an "expired" event (actor
+   * "system", data { from, to, depositEffect, depositCollected: false }). Returns the booking as it is
+   * afterwards, or null (any string is accepted, like getBooking). The same rule as decide()'s expire row.
+   * TODO(ring-2): a scheduled job expires holds too.
+   */
+  refreshBooking(id: string, now: Date): Promise<Booking | null>;
+  /**
+   * Lazy expiry for a time range: every awaiting_approval booking of the shop overlapping `range` with
+   * approve_by <= now becomes expired, each with an "expired" event, in one statement. Returns how
+   * many expired. book calls it just before inserting, so a lapsed hold never blocks a new booking.
+   */
+  expireStaleHolds(shopSlug: string, range: TimeRange, now: Date): Promise<number>;
   /**
    * Atomically move a booking from `expectedStatus` to `nextStatus` and write `event`, in one
    * transaction, only if its status is still `expectedStatus` (Postgres: UPDATE … WHERE status =
@@ -75,7 +112,8 @@ export interface BookingStore {
    * transition won) or the booking doesn't exist. Of two concurrent transitions from the same
    * status, exactly one gets a booking back.
    * Also stamps the status's timestamp with the event's time: cancelled → cancelled_at and
-   * cancelled_by (= event.actor, "agent" or "owner"), completed → completed_at, no_show → no_show_at.
+   * cancelled_by (= event.actor: "agent", "owner" or "customer"), completed → completed_at,
+   * no_show → no_show_at.
    */
   transition(
     id: string,
@@ -85,24 +123,17 @@ export interface BookingStore {
   ): Promise<Booking | null>;
   /** A booking's events, oldest first (by at, then id). Empty if there are none. */
   listEvents(bookingId: string): Promise<BookingEvent[]>;
+  // ---- Ring 1b: consent (approvals) ----
+
+  /** The approval request with this token, or null. Doesn't expire anything. */
+  findApproval(token: string): Promise<ApprovalRecord | null>;
   /**
-   * Run `action` at most once per (scope.key, scope.tool) within IDEMPOTENCY_TTL_MS.
-   * - New key (or one older than the TTL): runs `action(store)`. If it resolves, its result is saved
-   *   with requestHash and returned with replayed: false. If it throws, nothing is saved and the
-   *   error propagates, so a retry runs the action again.
-   * - Same key, same requestHash: returns a JSON copy of the saved result with replayed: true, without
-   *   running `action`.
-   * - Same key, different requestHash: throws FrontDeskError("idempotency_conflict").
-   * Concurrent calls with the same key are serialized: the second waits for the first to finish,
-   * then replays (or, if the first threw, runs). `T` must survive a JSON round trip.
-   * Postgres: one transaction; `action` gets a store (bookings and catalog) bound to it, so the
-   * action's writes commit or roll back together with the key, and its reads use the connection the
-   * transaction already holds (see IdempotentStore).
+   * The person's answer, in one transaction: move the booking from awaiting_approval to nextStatus only
+   * if approve_by > now (approved stores `phone` as customer_phone; cancelled stamps cancelled_at and
+   * cancelled_by "customer"); write `event`; and mark the approval decided (decision, decided_at = now)
+   * only if it wasn't. Anything that doesn't match rolls everything back.
    */
-  idempotent<T>(
-    scope: IdempotencyScope,
-    action: (store: IdempotentStore) => Promise<T>,
-  ): Promise<{ result: T; replayed: boolean }>;
+  answerApproval(input: ApprovalAnswer): Promise<AnswerApprovalResult>;
 }
 
 /** The staff member is already booked for part of that time. Another agent got there first. */
@@ -114,10 +145,20 @@ export class SlotTakenError extends Error {
 }
 
 /** Statuses that hold time on the calendar (the no_overlap constraint and busy time). */
-export const ACTIVE_STATUSES: readonly BookingStatus[] = ["awaiting_deposit", "confirmed"];
+export const ACTIVE_STATUSES: readonly BookingStatus[] = ["awaiting_approval", "awaiting_deposit", "confirmed"];
 
 /** Final statuses: nothing changes a booking after it reaches one. */
 export const FINAL_STATUSES: readonly BookingStatus[] = ["cancelled", "expired", "completed", "no_show"];
+
+/** The deposit effect of a hold expiring (decide()'s expire row), as both stores' lazy expiry records it. */
+export function expiredEventData(depositCents: number): Record<string, unknown> {
+  return {
+    from: "awaiting_approval",
+    to: "expired",
+    depositEffect: depositCents > 0 ? "released" : "none",
+    depositCollected: false,
+  };
+}
 
 /** A stored booking plus the shop and service details a Booking shows. Both stores map through this. */
 export type BookingRecord = {
@@ -133,11 +174,28 @@ export type BookingRecord = {
   customerName: string;
   agentName: string;
   createdAt: Date;
+  /** true once the person tapped Approve on the approval link (approvals.decision = approved). */
+  customerApproved: boolean;
+  /** The phone number the person gave when approving (E.164), or null. */
+  customerPhone: string | null;
+  /** The approval link's token (approvals.token), or null for a booking without an approval request. */
+  approvalToken: string | null;
+  /** When the hold lapses (bookings.approve_by), or null. */
+  approveBy: Date | null;
   /** The shop's IANA zone; times are shown in it. */
   timezone: string;
 };
 
+/**
+ * The Booking for a stored record. While it is awaiting_approval it carries `approval`, whose url is only
+ * the path ("/approve/<token>"): the store doesn't know the request's origin. The service layer puts it
+ * in front (withApprovalOrigin in service.ts) before a booking leaves the server.
+ */
 export function toBooking(r: BookingRecord): Booking {
+  const approval =
+    r.status === "awaiting_approval" && r.approvalToken && r.approveBy
+      ? { approval: { url: approvalPath(r.approvalToken), expiresAt: toRfc3339(r.approveBy, r.timezone) } }
+      : {};
   return {
     id: r.id,
     shopSlug: r.shopSlug,
@@ -148,10 +206,16 @@ export function toBooking(r: BookingRecord): Booking {
     end: toRfc3339(r.end, r.timezone),
     display: formatDisplay(DateTime.fromJSDate(r.start, { zone: r.timezone })),
     status: r.status,
-    customer: { displayName: r.customerName, verified: false },
+    customer: {
+      displayName: r.customerName,
+      approved: r.customerApproved,
+      verified: r.customerApproved,
+      ...(r.customerPhone ? { phone: r.customerPhone } : {}),
+    },
     agent: { name: r.agentName },
     depositCents: r.depositCents,
     createdAt: toRfc3339(r.createdAt, r.timezone),
+    ...approval,
   };
 }
 
@@ -180,4 +244,15 @@ export function toBookingEvent(r: EventRecord): BookingEvent {
 /** Sort by start, then id, so equal starts (two staff members) come back in a stable order. */
 export function byStart(a: { start: Date; id: string }, b: { start: Date; id: string }): number {
   return a.start.getTime() - b.start.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+/** A canonical (hyphenated) UUID, in either case. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The id lowercased if it's a canonical UUID, else null. Both stores look booking and block ids up
+ * through this, so a malformed id is simply not found (Postgres would otherwise raise 22P02).
+ */
+export function normalizeUuid(id: string): string | null {
+  return UUID.test(id) ? id.toLowerCase() : null;
 }

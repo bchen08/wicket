@@ -11,9 +11,12 @@ import {
   parseCancelArgs,
   parseGetAvailabilityArgs,
   parseGetBookingArgs,
+  withApprovalOrigin,
+  withRequestOrigin,
   type FrontDeskDeps,
 } from "./service";
-import { EXAMPLE_BOOKINGS, memoryDeps, SAT, withCatalog } from "./test-support";
+import type { Booking } from "../../types/frontdesk";
+import { customerOf, EXAMPLE_BOOKINGS, memoryDeps, SAT, withCatalog } from "./test-support";
 
 // "Now" is Monday 9 Nov 2026, noon in New York (Hart's is closed on Mondays), so the coming Saturday
 // is 14 Nov, 5 days ahead. The store holds the two example bookings on that Saturday: 10:00–10:45 and
@@ -348,19 +351,16 @@ describe("getAvailability under the shop's rules", () => {
 describe("tool argument parsing", () => {
   const book = { service_id: "haircut", start: "2026-11-14T14:30:00-05:00", customer_name: " Maya " };
 
-  it("parseBookArgs trims the name and requires an idempotency_key", () => {
-    expect(parseBookArgs({ ...book, idempotency_key: "abcd-1234" })).toEqual({
-      ...book,
-      customer_name: "Maya",
-      idempotency_key: "abcd-1234",
-    });
-    expect(() => parseBookArgs(book)).toThrow(FrontDeskError);
+  it("parseBookArgs trims the name, and drops arguments it doesn't know (e.g. an old client's retry key)", () => {
+    expect(parseBookArgs(book)).toEqual({ ...book, customer_name: "Maya" });
+    expect(parseBookArgs({ ...book, retry_key: "abcd-1234" })).toEqual({ ...book, customer_name: "Maya" });
+    expect(() => parseBookArgs({ ...book, customer_name: "  " })).toThrow(FrontDeskError);
   });
 
   it("parseBookArgs refuses a customer_name containing NUL (Postgres text can't hold U+0000)", () => {
     let caught: unknown;
     try {
-      parseBookArgs({ ...book, customer_name: "Ma\u0000ya", idempotency_key: "abcd-1234" });
+      parseBookArgs({ ...book, customer_name: "Ma\u0000ya" });
     } catch (err) {
       caught = err;
     }
@@ -369,16 +369,13 @@ describe("tool argument parsing", () => {
     expect((caught as FrontDeskError).details).toEqual({ field: "customer_name", value: "Ma\u0000ya" });
   });
 
-  it("parseGetBookingArgs and parseCancelArgs require a booking_id; cancel also an idempotency_key", () => {
+  it("parseGetBookingArgs and parseCancelArgs require a booking_id, and nothing else", () => {
     expect(parseGetBookingArgs({ booking_id: " abc " })).toEqual({ booking_id: "abc" });
-    expect(parseCancelArgs({ booking_id: "abc", idempotency_key: "abcd-1234" })).toEqual({
-      booking_id: "abc",
-      idempotency_key: "abcd-1234",
-    });
+    expect(parseCancelArgs({ booking_id: "abc" })).toEqual({ booking_id: "abc" });
+    expect(parseCancelArgs({ booking_id: "abc", retry_key: "abcd-1234" })).toEqual({ booking_id: "abc" });
     for (const [parse, raw, field] of [
       [parseGetBookingArgs, {}, "booking_id"],
-      [parseCancelArgs, { idempotency_key: "abcd-1234" }, "booking_id"],
-      [parseCancelArgs, { booking_id: "abc" }, "idempotency_key"],
+      [parseCancelArgs, { retry_key: "abcd-1234" }, "booking_id"],
     ] as const) {
       let caught: unknown;
       try {
@@ -404,5 +401,39 @@ describe("minutesInWords", () => {
     [10_080, "7 days"],
   ])("%i minutes is %s", (minutes, words) => {
     expect(minutesInWords(minutes)).toBe(words);
+  });
+});
+
+describe("approval links: the request's origin", () => {
+  it("withRequestOrigin sets deps.baseUrl to the request's origin, path and query dropped", () => {
+    const request = new Request("https://emergent-git-x.vercel.app/api/mcp?x=1");
+    expect(withRequestOrigin(deps, request).baseUrl).toBe("https://emergent-git-x.vercel.app");
+    expect(withRequestOrigin(deps, new Request("http://localhost:4000/api/mcp")).baseUrl).toBe("http://localhost:4000");
+    expect(deps.baseUrl).toBe("http://localhost:3000"); // the shared deps are left alone
+  });
+
+  it("withApprovalOrigin puts baseUrl in front of a stored link's path, and leaves other bookings alone", () => {
+    const base: Booking = {
+      id: "b",
+      shopSlug: "harts",
+      serviceId: "haircut",
+      serviceName: "Haircut",
+      staffId: "dana",
+      start: "2026-11-14T10:00:00-05:00",
+      end: "2026-11-14T10:30:00-05:00",
+      display: "Sat 14 Nov, 10:00 am EST",
+      status: "awaiting_approval",
+      customer: customerOf("Maya", false),
+      agent: { name: "Claude" },
+      depositCents: 0,
+      createdAt: "2026-11-09T12:00:00-05:00",
+    };
+    const held = { ...base, approval: { url: "/approve/tok", expiresAt: "2026-11-09T12:10:00-05:00" } };
+    const out = withApprovalOrigin({ baseUrl: "https://emergent.example" }, held);
+    expect(out.approval).toEqual({ url: "https://emergent.example/approve/tok", expiresAt: "2026-11-09T12:10:00-05:00" });
+    expect(held.approval.url).toBe("/approve/tok"); // not mutated
+    // Already absolute: unchanged (applying it twice is harmless).
+    expect(withApprovalOrigin({ baseUrl: "https://other.example" }, out)).toEqual(out);
+    expect(withApprovalOrigin({ baseUrl: "https://emergent.example" }, base)).toBe(base);
   });
 });

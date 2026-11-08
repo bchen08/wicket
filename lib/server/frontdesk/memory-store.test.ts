@@ -1,25 +1,20 @@
 import { describe, expect, it } from "vitest";
 import type { BookingStatus, Policies } from "../../types/frontdesk";
 import type { Clock } from "../clock";
-import {
-  IDEMPOTENCY_TTL_MS,
-  SlotTakenError,
-  type BookingStore,
-  type IdempotencyScope,
-  type NewBooking,
-  type NewBookingEvent,
-} from "./booking-store";
+import { SlotTakenError, type ApprovalAnswer, type NewBooking, type NewBookingEvent } from "./booking-store";
 import { DepositExceedsPriceError, DuplicateServiceError } from "./catalog";
-import { FrontDeskError } from "./errors";
 import { createMemoryStore, SEED, type InitialBooking } from "./memory-store";
 import { DEFAULT_POLICIES } from "./policies";
-import { NOW } from "./test-support";
+import { customerOf, holdFields, NOW, PHONE_E164 } from "./test-support";
 
 // The in-memory ShopCatalog + BookingStore. postgres-store.test.ts checks the same behaviours
 // against Postgres. "Now" is Mon 9 Nov 2026, noon in New York; the bookings are on Sat 14 Nov.
 
 const at = (hhmm: string) => new Date(`2026-11-14T${hhmm}:00-05:00`);
 const SATURDAY = { start: at("00:00"), end: new Date("2026-11-15T00:00:00-05:00") };
+
+/** NOW + 10 minutes: the hold deadline createBooking gets by default. */
+const HOLD_UNTIL = new Date(NOW.getTime() + 10 * 60_000);
 
 const newBooking = (start: Date, end: Date, extra: Partial<NewBooking> = {}): NewBooking => ({
   shopSlug: "harts",
@@ -30,10 +25,11 @@ const newBooking = (start: Date, end: Date, extra: Partial<NewBooking> = {}): Ne
   customerName: "Memory Test",
   agentName: "vitest",
   depositCents: 1000,
+  ...holdFields(HOLD_UNTIL),
   ...extra,
 });
 
-/** A preloaded haircut with dana; its deposit defaults to the service's. */
+/** A preloaded haircut with dana; its deposit defaults to the service's. A hold gets HOLD_UNTIL. */
 const initial = (start: Date, end: Date, status: BookingStatus): InitialBooking => ({
   shopSlug: "harts",
   serviceId: "haircut",
@@ -43,12 +39,13 @@ const initial = (start: Date, end: Date, status: BookingStatus): InitialBooking 
   customerName: "Memory Test",
   agentName: "vitest",
   status,
+  ...(status === "awaiting_approval" ? { approveBy: HOLD_UNTIL } : {}),
 });
 
 const cancelEvent = (actor: NewBookingEvent["actor"] = "agent"): NewBookingEvent => ({
   actor,
   type: "cancelled",
-  data: { from: "confirmed", to: "cancelled", depositEffect: "released", depositCollected: false },
+  data: { from: "awaiting_approval", to: "cancelled", depositEffect: "released", depositCollected: false },
 });
 
 /** A clock tests can move. */
@@ -61,15 +58,6 @@ function mutableClock(start: Date = NOW): Clock & { advance(ms: number): void } 
     },
   };
 }
-
-const scope = (key: string, requestHash = "hash-a", tool: IdempotencyScope["tool"] = "book"): IdempotencyScope => ({
-  key,
-  tool,
-  requestHash,
-});
-
-/** Lets other pending promises run, so a test can interleave concurrent calls. */
-const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 describe("seed", () => {
   it("has Hart's policies, as in supabase/seed.sql", async () => {
@@ -107,8 +95,16 @@ describe("seed", () => {
 });
 
 describe("getBusyIntervals", () => {
-  it("returns awaiting_deposit and confirmed bookings and blocked times, sorted by start", async () => {
-    const statuses: BookingStatus[] = ["awaiting_deposit", "confirmed", "cancelled", "expired", "completed", "no_show"];
+  it("returns awaiting_approval, awaiting_deposit and confirmed bookings and blocked times, sorted by start", async () => {
+    const statuses: BookingStatus[] = [
+      "awaiting_deposit",
+      "confirmed",
+      "cancelled",
+      "expired",
+      "completed",
+      "no_show",
+      "awaiting_approval",
+    ];
     const store = createMemoryStore({
       // One booking per status, an hour apart from 9:00.
       initialBookings: statuses.map((status, i) => {
@@ -122,9 +118,12 @@ describe("getBusyIntervals", () => {
       ["booking", at("09:00").getTime(), at("09:30").getTime()], // awaiting_deposit
       ["block", at("09:30").getTime(), at("10:00").getTime()],
       ["booking", at("10:00").getTime(), at("10:30").getTime()], // confirmed
+      ["booking", at("15:00").getTime(), at("15:30").getTime()], // awaiting_approval
     ]);
     expect(busy.every((b) => b.staffId === "dana")).toBe(true);
     expect(busy[1].reason).toMatch(/^block /);
+    // Only the hold carries a deadline.
+    expect(busy.map((b) => b.heldUntil)).toEqual([undefined, undefined, undefined, HOLD_UNTIL]);
     expect(await store.getBusyIntervals("nope", SATURDAY)).toEqual([]);
   });
 
@@ -136,16 +135,21 @@ describe("getBusyIntervals", () => {
 });
 
 describe("createBooking", () => {
-  it("stores a confirmed booking with its deposit snapshot and writes a booked event", async () => {
+  it("stores a held booking with its deposit snapshot, its approval request, and writes a booked event", async () => {
     const store = createMemoryStore({ clock: mutableClock() });
-    const booking = await store.createBooking(newBooking(at("10:00"), at("10:30"), { depositCents: 777 }));
+    const fields = newBooking(at("10:00"), at("10:30"), { depositCents: 777 });
+    const booking = await store.createBooking(fields);
     expect(booking).toMatchObject({
-      status: "confirmed",
+      status: "awaiting_approval",
       serviceName: "Haircut",
       depositCents: 777,
       start: "2026-11-14T10:00:00-05:00",
       createdAt: "2026-11-09T12:00:00-05:00",
+      customer: customerOf("Memory Test", false),
     });
+    expect(booking.customer).not.toHaveProperty("phone");
+    // The store knows the token but not the request's origin: the link is a path until the service layer adds it.
+    expect(booking.approval).toEqual({ url: `/approve/${fields.approvalToken}`, expiresAt: "2026-11-09T12:10:00-05:00" });
 
     const events = await store.listEvents(booking.id);
     expect(events).toEqual([
@@ -155,30 +159,79 @@ describe("createBooking", () => {
         at: "2026-11-09T12:00:00-05:00",
         actor: "agent",
         type: "booked",
-        data: { status: "confirmed", agentName: "vitest" },
+        data: { status: "awaiting_approval", agentName: "vitest" },
       },
     ]);
+
+    const rows = store.consentRows();
+    expect(rows.bookings).toEqual([{ id: booking.id, approveBy: HOLD_UNTIL, customerPhone: null, mandate: null }]);
+    expect(rows.approvals).toEqual([
+      { bookingId: booking.id, token: fields.approvalToken, createdAt: NOW, decidedAt: null, decision: null },
+    ]);
+    expect(await store.findApproval(fields.approvalToken)).toEqual({
+      bookingId: booking.id,
+      decision: null,
+      approveBy: HOLD_UNTIL,
+      mandate: null,
+    });
 
     // A later price change doesn't rewrite the booking's deposit.
     await store.updateService("harts", "haircut", { depositCents: 2000 });
     expect((await store.getBooking(booking.id))?.depositCents).toBe(777);
   });
 
-  it("refuses an overlap with an awaiting_deposit or confirmed booking, not with a final one", async () => {
+  it("stores the mandate on the booking and in the booked event", async () => {
+    const store = createMemoryStore();
+    const mandate = { priceCapCents: 5000, window: { from: "2026-11-14T09:00:00-05:00", to: "2026-11-14T12:00:00-05:00" } };
+    const fields = newBooking(at("10:00"), at("10:30"), { mandate });
+    const booking = await store.createBooking(fields);
+    expect(store.consentRows().bookings[0].mandate).toEqual(mandate);
+    expect((await store.listEvents(booking.id))[0].data).toEqual({ status: "awaiting_approval", agentName: "vitest", mandate });
+    expect((await store.findApproval(fields.approvalToken))?.mandate).toEqual(mandate);
+  });
+
+  it("refuses an overlap with an awaiting_approval, awaiting_deposit or confirmed booking, not with a final one", async () => {
     const store = createMemoryStore({
       initialBookings: [
         initial(at("10:00"), at("10:30"), "awaiting_deposit"),
         initial(at("11:00"), at("11:30"), "confirmed"),
         initial(at("13:00"), at("13:30"), "cancelled"),
         initial(at("14:00"), at("14:30"), "no_show"),
+        initial(at("15:00"), at("15:30"), "awaiting_approval"),
+        initial(at("16:00"), at("16:30"), "expired"),
       ],
     });
+    const held = { status: "awaiting_approval" };
     await expect(store.createBooking(newBooking(at("10:15"), at("10:45")))).rejects.toBeInstanceOf(SlotTakenError);
     await expect(store.createBooking(newBooking(at("11:15"), at("11:45")))).rejects.toBeInstanceOf(SlotTakenError);
-    await expect(store.createBooking(newBooking(at("13:00"), at("13:30")))).resolves.toMatchObject({ status: "confirmed" });
-    await expect(store.createBooking(newBooking(at("14:00"), at("14:30")))).resolves.toMatchObject({ status: "confirmed" });
+    await expect(store.createBooking(newBooking(at("15:15"), at("15:45")))).rejects.toBeInstanceOf(SlotTakenError);
+    await expect(store.createBooking(newBooking(at("13:00"), at("13:30")))).resolves.toMatchObject(held);
+    await expect(store.createBooking(newBooking(at("14:00"), at("14:30")))).resolves.toMatchObject(held);
+    await expect(store.createBooking(newBooking(at("16:00"), at("16:30")))).resolves.toMatchObject(held);
     // Back to back is fine (half-open).
-    await expect(store.createBooking(newBooking(at("10:30"), at("11:00")))).resolves.toMatchObject({ status: "confirmed" });
+    await expect(store.createBooking(newBooking(at("10:30"), at("11:00")))).resolves.toMatchObject(held);
+  });
+
+  it("refuses an overlap with a lapsed hold nobody expired yet (like the no_overlap constraint)", async () => {
+    const clock = mutableClock();
+    const store = createMemoryStore({ clock });
+    await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    clock.advance(11 * 60_000); // past HOLD_UNTIL
+    await expect(store.createBooking(newBooking(at("10:00"), at("10:30")))).rejects.toBeInstanceOf(SlotTakenError);
+    expect(await store.expireStaleHolds("harts", SATURDAY, clock.now())).toBe(1);
+    await expect(store.createBooking(newBooking(at("10:00"), at("10:30")))).resolves.toMatchObject({ status: "awaiting_approval" });
+  });
+
+  it("refuses a hold without a deadline and a reused token", async () => {
+    const store = createMemoryStore();
+    const fields = newBooking(at("10:00"), at("10:30"));
+    await store.createBooking(fields);
+    await expect(
+      store.createBooking(newBooking(at("11:00"), at("11:30"), { approvalToken: fields.approvalToken })),
+    ).rejects.toThrow(/unique/);
+    expect(() =>
+      createMemoryStore({ initialBookings: [{ ...initial(at("10:00"), at("10:30"), "awaiting_approval"), approveBy: undefined }] }),
+    ).toThrow(/approveBy/);
   });
 });
 
@@ -201,8 +254,8 @@ describe("transition", () => {
     const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
     clock.advance(60 * 60_000); // 1 pm
 
-    const cancelled = await store.transition(booking.id, "confirmed", "cancelled", cancelEvent("owner"));
-    expect(cancelled).toEqual({ ...booking, status: "cancelled" });
+    const cancelled = await store.transition(booking.id, "awaiting_approval", "cancelled", cancelEvent("owner"));
+    expect(cancelled).toEqual({ ...booking, approval: undefined, status: "cancelled" });
     expect(store.lifecycleStamps(booking.id)).toEqual({
       cancelledAt: new Date("2026-11-09T13:00:00-05:00"),
       cancelledBy: "owner",
@@ -228,8 +281,9 @@ describe("transition", () => {
     const a = await store.createBooking(newBooking(at("10:00"), at("10:30")));
     const b = await store.createBooking(newBooking(at("11:00"), at("11:30")));
     clock.advance(5 * 24 * 60 * 60_000); // Sat 14 Nov, noon
-    await store.transition(a.id, "confirmed", "completed", { actor: "owner", type: "completed", data: {} });
-    await store.transition(b.id, "confirmed", "no_show", { actor: "owner", type: "no_show", data: {} });
+    // The store doesn't judge the lifecycle (decide() does): it moves whatever it's told to.
+    await store.transition(a.id, "awaiting_approval", "completed", { actor: "owner", type: "completed", data: {} });
+    await store.transition(b.id, "awaiting_approval", "no_show", { actor: "owner", type: "no_show", data: {} });
     expect(store.lifecycleStamps(a.id)).toEqual({ cancelledAt: null, cancelledBy: null, completedAt: clock.now(), noShowAt: null });
     expect(store.lifecycleStamps(b.id)).toEqual({ cancelledAt: null, cancelledBy: null, completedAt: null, noShowAt: clock.now() });
   });
@@ -238,7 +292,7 @@ describe("transition", () => {
     const store = createMemoryStore();
     const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
     expect(await store.transition(booking.id, "awaiting_deposit", "cancelled", cancelEvent())).toBeNull();
-    expect((await store.getBooking(booking.id))?.status).toBe("confirmed");
+    expect((await store.getBooking(booking.id))?.status).toBe("awaiting_approval");
     expect(await store.listEvents(booking.id)).toHaveLength(1);
     expect(store.lifecycleStamps(booking.id)?.cancelledAt).toBeNull();
   });
@@ -253,8 +307,8 @@ describe("transition", () => {
     const store = createMemoryStore();
     const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
     const results = await Promise.all([
-      store.transition(booking.id, "confirmed", "cancelled", cancelEvent()),
-      store.transition(booking.id, "confirmed", "no_show", { actor: "owner", type: "no_show", data: {} }),
+      store.transition(booking.id, "awaiting_approval", "cancelled", cancelEvent()),
+      store.transition(booking.id, "awaiting_approval", "no_show", { actor: "owner", type: "no_show", data: {} }),
     ]);
     expect(results.filter((r) => r !== null)).toHaveLength(1);
     expect((await store.listEvents(booking.id)).map((e) => e.type)).toEqual(["booked", "cancelled"]);
@@ -273,148 +327,7 @@ describe("listEvents", () => {
     const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
     const [first] = await store.listEvents(booking.id);
     first.data.status = "changed";
-    expect((await store.listEvents(booking.id))[0].data.status).toBe("confirmed");
-  });
-});
-
-describe("idempotent", () => {
-  /** An action that books 10:00 and counts its runs. */
-  function counted() {
-    const counter = {
-      runs: 0,
-      action: async (s: BookingStore) => {
-        counter.runs++;
-        return { booking: await s.createBooking(newBooking(at("10:00"), at("10:30"))) };
-      },
-    };
-    return counter;
-  }
-
-  it("runs the action once and replays a copy of its result for the same key and arguments", async () => {
-    const store = createMemoryStore();
-    const c = counted();
-    const first = await store.idempotent(scope("key-00001"), c.action);
-    expect(first.replayed).toBe(false);
-
-    const second = await store.idempotent(scope("key-00001"), c.action);
-    expect(second).toEqual({ result: first.result, replayed: true });
-    expect(second.result).not.toBe(first.result);
-    expect(c.runs).toBe(1);
-    expect(await store.listBookings("harts", SATURDAY)).toHaveLength(1);
-    expect(await store.listEvents(first.result.booking.id)).toHaveLength(1);
-
-    // Mutating a replay doesn't change the saved response.
-    second.result.booking.status = "cancelled";
-    expect((await store.idempotent(scope("key-00001"), c.action)).result.booking.status).toBe("confirmed");
-  });
-
-  it("throws idempotency_conflict for the same key with different arguments, without running the action", async () => {
-    const store = createMemoryStore();
-    const c = counted();
-    await store.idempotent(scope("key-00002", "hash-a"), c.action);
-    const err = await store.idempotent(scope("key-00002", "hash-b"), c.action).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(FrontDeskError);
-    expect(err).toMatchObject({
-      code: "idempotency_conflict",
-      message: "This idempotency_key was already used with different arguments.",
-      nextAction: "Use a new idempotency_key (a fresh UUID) for a different request.",
-      details: { idempotency_key: "key-00002", tool: "book" },
-    });
-    expect(c.runs).toBe(1);
-  });
-
-  it("scopes keys per tool", async () => {
-    const store = createMemoryStore();
-    let runs = 0;
-    const action = async () => ++runs;
-    await store.idempotent(scope("key-00003", "hash-a", "book"), action);
-    const other = await store.idempotent(scope("key-00003", "hash-b", "cancel"), action);
-    expect(other).toEqual({ result: 2, replayed: false });
-  });
-
-  it("saves nothing when the action throws, so the next call runs it", async () => {
-    const store = createMemoryStore();
-    await expect(
-      store.idempotent(scope("key-00004", "hash-a"), async () => {
-        throw new Error("boom");
-      }),
-    ).rejects.toThrow("boom");
-    // Even different arguments are fine: nothing was saved.
-    const next = await store.idempotent(scope("key-00004", "hash-b"), async () => "ran");
-    expect(next).toEqual({ result: "ran", replayed: false });
-  });
-
-  it("forgets a key after IDEMPOTENCY_TTL_MS (24 hours) by the store clock", async () => {
-    const clock = mutableClock();
-    const store = createMemoryStore({ clock });
-    let runs = 0;
-    const action = async () => ++runs;
-    await store.idempotent(scope("key-00005"), action);
-
-    clock.advance(IDEMPOTENCY_TTL_MS); // exactly 24 h: still remembered
-    expect(await store.idempotent(scope("key-00005"), action)).toEqual({ result: 1, replayed: true });
-    await expect(store.idempotent(scope("key-00005", "hash-b"), action)).rejects.toMatchObject({
-      code: "idempotency_conflict",
-    });
-
-    clock.advance(1); // past 24 h: the key may be reused, even with other arguments
-    expect(await store.idempotent(scope("key-00005", "hash-b"), action)).toEqual({ result: 2, replayed: false });
-    expect(await store.idempotent(scope("key-00005", "hash-b"), action)).toEqual({ result: 2, replayed: true });
-  });
-
-  it("serializes concurrent calls with the same key: the action runs once and both get its result", async () => {
-    const store = createMemoryStore();
-    const c = counted();
-    const slow = async (s: BookingStore) => {
-      await tick();
-      return c.action(s);
-    };
-    const [a, b] = await Promise.all([
-      store.idempotent(scope("key-00006"), slow),
-      store.idempotent(scope("key-00006"), slow),
-    ]);
-    expect(c.runs).toBe(1);
-    expect(a.result).toEqual(b.result);
-    expect([a.replayed, b.replayed].sort()).toEqual([false, true]);
-    expect(await store.listBookings("harts", SATURDAY)).toHaveLength(1);
-  });
-
-  it("runs a waiting call's action when the in-flight one throws", async () => {
-    const store = createMemoryStore();
-    let runs = 0;
-    const first = store.idempotent(scope("key-00007"), async () => {
-      runs++;
-      await tick();
-      throw new Error("first failed");
-    });
-    const second = store.idempotent(scope("key-00007"), async () => {
-      runs++;
-      return "second ran";
-    });
-    await expect(first).rejects.toThrow("first failed");
-    expect(await second).toEqual({ result: "second ran", replayed: false });
-    expect(runs).toBe(2);
-  });
-
-  it("gives the action a store whose writes are visible, but whose idempotent() can't nest", async () => {
-    const store = createMemoryStore();
-    const { result } = await store.idempotent(scope("key-00008"), async (s) => {
-      const booking = await s.createBooking(newBooking(at("10:00"), at("10:30")));
-      await expect(s.idempotent(scope("key-00009"), async () => 1)).rejects.toThrow(/can't be nested/);
-      return booking;
-    });
-    expect(await store.getBooking(result.id)).toEqual(result);
-  });
-
-  it("keeps an action's writes when it throws afterwards (no rollback in memory)", async () => {
-    const store = createMemoryStore();
-    await expect(
-      store.idempotent(scope("key-00010"), async (s) => {
-        await s.createBooking(newBooking(at("10:00"), at("10:30")));
-        throw new Error("after the write");
-      }),
-    ).rejects.toThrow("after the write");
-    expect(await store.listBookings("harts", SATURDAY)).toHaveLength(1);
+    expect((await store.listEvents(booking.id))[0].data.status).toBe("awaiting_approval");
   });
 });
 
@@ -579,5 +492,193 @@ describe("owner writes", () => {
     expect(await store.deleteBlock("harts", afternoon!.id)).toEqual(afternoon);
     expect(await store.deleteBlock("harts", afternoon!.id)).toBeNull();
     expect(await store.listBlocks("harts", SATURDAY)).toEqual([morning]);
+  });
+});
+
+// ---- Ring 1b: lazy expiry and consent ----
+
+describe("lazy expiry", () => {
+  it("refreshBooking expires a lapsed hold once, with one expired event by the system", async () => {
+    const clock = mutableClock();
+    const store = createMemoryStore({ clock });
+    const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+
+    // Before the deadline: unchanged, no event.
+    expect(await store.refreshBooking(booking.id, new Date(HOLD_UNTIL.getTime() - 1))).toEqual(booking);
+    expect(await store.listEvents(booking.id)).toHaveLength(1);
+
+    // At the deadline: expired.
+    clock.advance(10 * 60_000);
+    expect(await store.refreshBooking(booking.id.toUpperCase(), HOLD_UNTIL)).toEqual({ ...booking, approval: undefined, status: "expired" });
+    expect(await store.refreshBooking(booking.id, HOLD_UNTIL)).toEqual({ ...booking, approval: undefined, status: "expired" });
+    const events = await store.listEvents(booking.id);
+    expect(events.map((e) => [e.type, e.actor])).toEqual([
+      ["booked", "agent"],
+      ["expired", "system"],
+    ]);
+    expect(events[1].data).toEqual({ from: "awaiting_approval", to: "expired", depositEffect: "released", depositCollected: false });
+    expect(await store.getBusyIntervals("harts", SATURDAY)).toEqual([]);
+  });
+
+  it("refreshBooking leaves other statuses alone and returns null for unknown or malformed ids", async () => {
+    const store = createMemoryStore({ initialBookings: [initial(at("10:00"), at("10:30"), "confirmed")] });
+    const [confirmed] = await store.listBookings("harts", SATURDAY);
+    expect(await store.refreshBooking(confirmed.id, new Date("2030-01-01T00:00:00Z"))).toEqual(confirmed);
+    expect(await store.listEvents(confirmed.id)).toEqual([]);
+    expect(await store.refreshBooking(crypto.randomUUID(), NOW)).toBeNull();
+    expect(await store.refreshBooking("nope", NOW)).toBeNull();
+  });
+
+  it("an expired event for a booking without a deposit says depositEffect none", async () => {
+    const store = createMemoryStore();
+    const booking = await store.createBooking(newBooking(at("10:00"), at("10:15"), { serviceId: "beard-trim", depositCents: 0 }));
+    await store.refreshBooking(booking.id, HOLD_UNTIL);
+    expect((await store.listEvents(booking.id))[1].data).toMatchObject({ depositEffect: "none" });
+  });
+
+  it("expireStaleHolds expires only the shop's lapsed holds overlapping the range", async () => {
+    const store = createMemoryStore();
+    const later = new Date(HOLD_UNTIL.getTime() + 60 * 60_000);
+    const lapsed = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    const live = await store.createBooking(newBooking(at("11:00"), at("11:30"), { approveBy: later }));
+    const outside = await store.createBooking(
+      newBooking(new Date("2026-11-17T10:00:00-05:00"), new Date("2026-11-17T10:30:00-05:00")),
+    );
+
+    expect(await store.expireStaleHolds("nope", SATURDAY, HOLD_UNTIL)).toBe(0);
+    expect(await store.expireStaleHolds("harts", SATURDAY, HOLD_UNTIL)).toBe(1);
+    expect(await store.expireStaleHolds("harts", SATURDAY, HOLD_UNTIL)).toBe(0); // a second pass expires nothing more: one event per hold
+    expect((await store.getBooking(lapsed.id))?.status).toBe("expired");
+    expect((await store.getBooking(live.id))?.status).toBe("awaiting_approval");
+    expect((await store.getBooking(outside.id))?.status).toBe("awaiting_approval");
+    expect((await store.listEvents(lapsed.id)).map((e) => e.type)).toEqual(["booked", "expired"]);
+  });
+
+  it("getBusyIntervals still returns a lapsed hold, with its deadline, until something expires it", async () => {
+    const store = createMemoryStore();
+    await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    const busy = await store.getBusyIntervals("harts", SATURDAY);
+    expect(busy).toHaveLength(1);
+    expect(busy[0].heldUntil).toEqual(HOLD_UNTIL);
+    expect(busy[0].heldUntil).not.toBe(HOLD_UNTIL); // a copy
+  });
+});
+
+describe("transition: actors", () => {
+  it("stamps cancelled_by customer, and refuses a cancel by the system", async () => {
+    const store = createMemoryStore();
+    const a = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    const b = await store.createBooking(newBooking(at("11:00"), at("11:30")));
+    await store.transition(a.id, "awaiting_approval", "cancelled", cancelEvent("customer"));
+    expect(store.lifecycleStamps(a.id)?.cancelledBy).toBe("customer");
+    await expect(store.transition(b.id, "awaiting_approval", "cancelled", cancelEvent("system"))).rejects.toThrow();
+    expect((await store.getBooking(b.id))?.status).toBe("awaiting_approval");
+  });
+});
+
+describe("consent: answerApproval", () => {
+  const PHONE = "+14015550123";
+
+  const approved = (bookingId: string, now = NOW, phone: string | null = PHONE): ApprovalAnswer => ({
+    bookingId,
+    decision: "approved",
+    nextStatus: "confirmed",
+    now,
+    phone,
+    event: {
+      actor: "customer",
+      type: "approved",
+      data: { from: "awaiting_approval", to: "confirmed", depositEffect: "none", depositCollected: false },
+    },
+  });
+
+  it("approves with a phone: confirmed, approved, customer.phone from the stored E.164 number, approval decided", async () => {
+    const store = createMemoryStore({ clock: mutableClock() });
+    const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    const result = await store.answerApproval(approved(booking.id));
+    expect(result).toEqual({
+      ok: true,
+      booking: { ...booking, approval: undefined, status: "confirmed", customer: customerOf("Memory Test", true, PHONE_E164) },
+    });
+    const rows = store.consentRows();
+    expect(rows.bookings[0].customerPhone).toBe(PHONE);
+    expect(rows.approvals[0]).toMatchObject({ decision: "approved", decidedAt: NOW });
+    expect((await store.listEvents(booking.id)).map((e) => [e.type, e.actor])).toEqual([
+      ["booked", "agent"],
+      ["approved", "customer"],
+    ]);
+    expect(await store.getBooking(booking.id)).toEqual(result.ok && result.booking);
+  });
+
+  it("approves without a phone: approved, no customer.phone, nothing stored", async () => {
+    const store = createMemoryStore({ clock: mutableClock() });
+    const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    const result = await store.answerApproval(approved(booking.id, NOW, null));
+    expect(result).toEqual({
+      ok: true,
+      booking: { ...booking, approval: undefined, status: "confirmed", customer: customerOf("Memory Test", true) },
+    });
+    expect(store.consentRows().bookings[0].customerPhone).toBeNull();
+  });
+
+  it("refuses a phone that isn't E.164 (the customer_phone check) and changes nothing", async () => {
+    const store = createMemoryStore({ clock: mutableClock() });
+    const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    await expect(store.answerApproval(approved(booking.id, NOW, "4015550123"))).rejects.toThrow(/E\.164/);
+    expect((await store.getBooking(booking.id))?.status).toBe("awaiting_approval");
+    expect(store.consentRows().approvals[0].decision).toBeNull();
+  });
+
+  it("is not_pending once decided; nothing changes", async () => {
+    const store = createMemoryStore({ clock: mutableClock() });
+    const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    await store.answerApproval(approved(booking.id));
+    const before = store.consentRows();
+    expect(await store.answerApproval(approved(booking.id, NOW, "+14015550199"))).toEqual({ ok: false, reason: "not_pending" });
+    expect(
+      await store.answerApproval({
+        bookingId: booking.id,
+        decision: "declined",
+        nextStatus: "cancelled",
+        now: NOW,
+        event: { actor: "customer", type: "declined", data: {} },
+      }),
+    ).toEqual({ ok: false, reason: "not_pending" });
+    expect(store.consentRows()).toEqual(before);
+    expect(await store.listEvents(booking.id)).toHaveLength(2);
+  });
+
+  it("is not_pending once the hold's deadline has passed, and writes nothing", async () => {
+    const store = createMemoryStore({ clock: mutableClock() });
+    const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    expect(await store.answerApproval(approved(booking.id, HOLD_UNTIL))).toEqual({ ok: false, reason: "not_pending" });
+    expect((await store.getBooking(booking.id))?.status).toBe("awaiting_approval");
+    expect(store.consentRows().bookings[0].customerPhone).toBeNull();
+    expect(store.consentRows().approvals[0].decision).toBeNull();
+  });
+
+  it("is not_pending for an unknown or malformed booking id, or one without an approval request", async () => {
+    const store = createMemoryStore({ clock: mutableClock(), initialBookings: [initial(at("12:30"), at("13:00"), "confirmed")] });
+    const [preloaded] = await store.listBookings("harts", SATURDAY);
+    for (const id of [crypto.randomUUID(), "not-a-uuid", preloaded.id]) {
+      expect(await store.answerApproval(approved(id))).toEqual({ ok: false, reason: "not_pending" });
+    }
+  });
+
+  it("declines: cancelled by the customer, approval decided, no phone stored", async () => {
+    const store = createMemoryStore({ clock: mutableClock() });
+    const booking = await store.createBooking(newBooking(at("10:00"), at("10:30")));
+    const result = await store.answerApproval({
+      bookingId: booking.id,
+      decision: "declined",
+      nextStatus: "cancelled",
+      now: NOW,
+      phone: PHONE,
+      event: { actor: "customer", type: "declined", data: { from: "awaiting_approval", to: "cancelled" } },
+    });
+    expect(result).toEqual({ ok: true, booking: { ...booking, approval: undefined, status: "cancelled" } });
+    expect(store.lifecycleStamps(booking.id)).toMatchObject({ cancelledBy: "customer", cancelledAt: NOW });
+    expect(store.consentRows()).toMatchObject({ approvals: [{ decision: "declined" }], bookings: [{ customerPhone: null }] });
+    expect(await store.getBusyIntervals("harts", SATURDAY)).toEqual([]);
   });
 });

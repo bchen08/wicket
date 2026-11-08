@@ -31,7 +31,7 @@ Vercel deploys main to production automatically ─▶ run SMOKE.md on productio
 
 ## What you do after an agent pushes
 
-Nothing, until the PR is green and verified. Pushing never changes the live site.
+Nothing, until the PR is green and the verifier says READY. Pushing never changes the live site.
 The only action that ships is a human clicking **Squash and merge** on a PR into `main`.
 
 ## Do not use v0's own Publish/Deploy button

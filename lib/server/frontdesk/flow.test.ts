@@ -1,21 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ApiError,
+  ApprovalView,
+  ApproveResponse,
+  Booking,
   BookingDetailResponse,
+  BookingsResponse,
   BookResult,
   CancelResult,
+  DeclineResponse,
   GetAvailabilityResult,
+  GetBookingResult,
   GetPoliciesResult,
   OwnerBookingActionResponse,
   PoliciesResponse,
   Slot,
 } from "../../types/frontdesk";
 import type { Clock } from "../clock";
-import { bookingActionPost, bookingDetailGet, policiesGet, policiesPut, type OwnerOptions } from "./http";
+import { approvalApprovePost, approvalDeclinePost, approvalGet } from "../consent/http";
+import { bookingActionPost, bookingDetailGet, bookingsResponse, policiesGet, policiesPut, type OwnerOptions } from "./http";
 import { createFrontDeskMcpHandler } from "./mcp";
+import { NOT_SET_UP_NEXT_ACTION, UNLOCK_NEXT_ACTION } from "./owner-auth";
 import { SEED } from "./memory-store";
 import type { FrontDeskDeps } from "./service";
-import { memoryDeps } from "./test-support";
+import { approvalToken, customerOf, memoryDeps, PHONE_E164, recordingNotifier } from "./test-support";
 
 // Issue #8's "Done when" list, end to end: the real MCP handler (what /api/mcp mounts) and the real
 // owner HTTP handlers (what the /api/shops/* route files call) over ONE deps object, the way
@@ -111,16 +119,13 @@ async function fails(name: string, args: Record<string, unknown>): Promise<ApiEr
   return (JSON.parse(result.content[0].text) as ApiError).error;
 }
 
-const key = () => crypto.randomUUID();
-
 const availability = async (window: { from: string; to: string }, serviceId = "haircut") =>
   ok<GetAvailabilityResult>("get_availability", { service_id: serviceId, ...window, limit: 50 });
 
-const bookArgs = (start: string, idempotencyKey = key(), customer = "E2E Maya") => ({
+const bookArgs = (start: string, customer = "E2E Maya") => ({
   service_id: "haircut",
   start,
   customer_name: customer,
-  idempotency_key: idempotencyKey,
 });
 
 // ---- Owner routes ----
@@ -129,7 +134,8 @@ function ownerRequest(method: string, path: string, body?: unknown, auth: string
   const headers: Record<string, string> = {};
   if (auth !== null) headers.authorization = auth;
   if (body !== undefined) headers["content-type"] = "application/json";
-  return new Request(`http://localhost/api/shops/harts${path}`, {
+  // The same origin as the MCP door's links (deps.baseUrl), so the owner sees the same approval link.
+  return new Request(`http://localhost:3000/api/shops/harts${path}`, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -153,6 +159,28 @@ const markNoShow = (id: string) =>
   json<OwnerBookingActionResponse>(
     bookingActionPost(getDeps, ownerRequest("POST", `/bookings/${id}/no-show`), "harts", id, "mark_no_show", OWNER),
   );
+
+// ---- The approval page's API (Ring 1b) ----
+
+/** A POST from the approval page. No Origin header is needed. */
+function pageRequest(path: string, body?: unknown): Request {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["content-type"] = "application/json";
+  return new Request(`http://localhost:3000/api/approvals${path}`, {
+    method: "POST",
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+const approvalView = (token: string) => json<ApprovalView>(approvalGet(getDeps, token));
+const approveWith = (token: string, body?: unknown, status = 200) =>
+  json<ApproveResponse>(approvalApprovePost(getDeps, pageRequest(`/${token}/approve`, body), token), status);
+
+/** The person approves `booking` (book's result) on the page, giving their phone number. */
+async function approveOnPage(booking: Booking, phone = PHONE_E164): Promise<Booking> {
+  return (await approveWith(approvalToken(booking), { phone })).booking;
+}
 
 const local = (slot: Slot) => slot.start.slice(11, 16);
 const ms = (iso: string) => Date.parse(iso);
@@ -210,43 +238,49 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect(err.details?.earliest).toBe("2026-11-10T12:30:00-05:00");
   });
 
-  it("3. MCP book with an idempotency key, and replaying it returns the same booking", async () => {
+  it("3. MCP book places one hold; booking the same time again is slot_taken (no double booking on a retry)", async () => {
     const args = bookArgs(THU_1000);
     const first = await ok<BookResult>("book", args);
-    expect(first.data.booking).toMatchObject({ start: THU_1000, status: "confirmed", serviceId: "haircut" });
+    // Ring 1b: a hold awaiting the person's approval, with the link to send them.
+    expect(first.data.booking).toMatchObject({
+      start: THU_1000,
+      status: "awaiting_approval",
+      serviceId: "haircut",
+      approval: { url: expect.stringMatching(/^http:\/\/localhost:3000\/approve\//), expiresAt: "2026-11-10T10:30:00-05:00" },
+    });
 
-    const replay = await ok<BookResult>("book", args);
-    expect(replay.data.booking).toEqual(first.data.booking);
-    expect(replay.text).toMatch(/replayed/);
+    const again = await fails("book", args);
+    expect(again.code).toBe("slot_taken");
 
     const stored = await deps.store.listBookings("harts", { start: new Date(THURSDAY.from), end: new Date(THURSDAY.to) });
     expect(stored.map((b) => b.id)).toEqual([first.data.booking.id]);
 
     const detail = await bookingDetail(first.data.booking.id);
-    expect(detail.booking).toEqual(first.data.booking);
+    expect(detail.booking).toEqual(first.data.booking); // the same link, for the owner to copy
     expect(detail.events.map((e) => [e.type, e.actor])).toEqual([["booked", "agent"]]);
-
-    // The same key with other arguments is refused.
-    const conflict = await fails("book", { ...args, customer_name: "E2E Someone Else" });
-    expect(conflict.code).toBe("idempotency_conflict");
+    expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
   });
 
   it("4. MCP cancel more than 24 hours ahead → cancelled, depositEffect released, and the slot is offered again", async () => {
     const { data } = await ok<BookResult>("book", bookArgs(THU_1000));
     expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).not.toContain(THU_1000);
+    const approved = await approveOnPage(data.booking);
+    expect(approved.status).toBe("confirmed");
 
     // 10:20 Tue → 10:00 Thu is 47 h 40 min ahead.
-    const cancelArgs = { booking_id: data.booking.id, idempotency_key: key() };
+    const cancelArgs = { booking_id: data.booking.id };
     const cancelled = await ok<CancelResult>("cancel", cancelArgs);
     expect(cancelled.data).toEqual({
-      booking: { ...data.booking, status: "cancelled" },
+      booking: { ...approved, status: "cancelled" },
       depositEffect: "released",
       depositCollected: false,
     });
     expect(cancelled.text).toMatch(/released/);
 
-    // A retry with the same key replays; get_booking agrees.
-    expect((await ok<CancelResult>("cancel", cancelArgs)).data).toEqual(cancelled.data);
+    // A retry can't cancel twice: it's not_cancellable now. get_booking agrees.
+    const retry = await fails("cancel", cancelArgs);
+    expect(retry.code).toBe("not_cancellable");
+    expect(retry.details).toMatchObject({ status: "cancelled" });
     expect((await ok<{ booking: { status: string } }>("get_booking", { booking_id: data.booking.id })).data.booking.status).toBe(
       "cancelled",
     );
@@ -272,54 +306,69 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     const resumed = await putPolicies({ paused: false });
     expect(resumed.policies.paused).toBe(false);
     expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).toContain(THU_1000);
-    expect((await ok<BookResult>("book", bookArgs(THU_1000))).data.booking.status).toBe("confirmed");
+    expect((await ok<BookResult>("book", bookArgs(THU_1000))).data.booking.status).toBe("awaiting_approval");
   });
 
   it("6. with the owner token, marking a past booking no_show → depositEffect captured", async () => {
     const { data } = await ok<BookResult>("book", bookArgs(TUE_1300));
+    const approved = await approveOnPage(data.booking);
     clock.set("2026-11-10T14:00:00-05:00");
 
     const result = await markNoShow(data.booking.id);
     expect(result).toEqual({
-      booking: { ...data.booking, status: "no_show" },
+      booking: { ...approved, status: "no_show" },
       depositEffect: "captured",
       depositCollected: false,
     });
   });
 
   it("7. GET /api/shops/harts/bookings/[id] shows the events for each step", async () => {
-    // book → cancel (agent, > 24 h ahead)
-    const a = (await ok<BookResult>("book", bookArgs(THU_1000, key(), "E2E Cancel"))).data.booking;
-    await ok<CancelResult>("cancel", { booking_id: a.id, idempotency_key: key() });
+    // book → approve (the person) → cancel (agent, > 24 h ahead)
+    const a = (await ok<BookResult>("book", bookArgs(THU_1000, "E2E Cancel"))).data.booking;
+    await approveOnPage(a);
+    await ok<CancelResult>("cancel", { booking_id: a.id });
     const cancelled = await bookingDetail(a.id);
     expect(cancelled.booking.status).toBe("cancelled");
     expect(cancelled.events.map((e) => [e.type, e.actor])).toEqual([
       ["booked", "agent"],
+      ["approved", "customer"],
       ["cancelled", "agent"],
     ]);
-    expect(cancelled.events[0].data).toMatchObject({ status: "confirmed" });
-    expect(cancelled.events[1].data).toEqual({ from: "confirmed", to: "cancelled", depositEffect: "released", depositCollected: false });
+    expect(cancelled.events[0].data).toEqual({ status: "awaiting_approval", agentName: "unknown agent" });
+    expect(cancelled.events[1].data).toEqual({
+      from: "awaiting_approval",
+      to: "confirmed",
+      depositEffect: "none",
+      depositCollected: false,
+    });
+    expect(cancelled.events[2].data).toEqual({ from: "confirmed", to: "cancelled", depositEffect: "released", depositCollected: false });
 
-    // book → (after the start) owner no-show
-    const b = (await ok<BookResult>("book", bookArgs(TUE_1300, key(), "E2E No-show"))).data.booking;
+    // book → approve → (after the start) owner no-show
+    const b = (await ok<BookResult>("book", bookArgs(TUE_1300, "E2E No-show"))).data.booking;
+    await approveOnPage(b);
     clock.set("2026-11-10T14:00:00-05:00");
     await markNoShow(b.id);
     const noShow = await bookingDetail(b.id);
     expect(noShow.booking.status).toBe("no_show");
     expect(noShow.events.map((e) => [e.type, e.actor])).toEqual([
       ["booked", "agent"],
+      ["approved", "customer"],
       ["no_show", "owner"],
     ]);
-    expect(noShow.events[1].data).toEqual({ from: "confirmed", to: "no_show", depositEffect: "captured", depositCollected: false });
+    expect(noShow.events[2].data).toEqual({ from: "confirmed", to: "no_show", depositEffect: "captured", depositCollected: false });
 
     // Oldest first, stamped with the store's clock.
-    expect(noShow.events.map((e) => e.at)).toEqual(["2026-11-10T10:20:00-05:00", "2026-11-10T14:00:00-05:00"]);
+    expect(noShow.events.map((e) => e.at)).toEqual([
+      "2026-11-10T10:20:00-05:00",
+      "2026-11-10T10:20:00-05:00",
+      "2026-11-10T14:00:00-05:00",
+    ]);
     for (const { events } of [cancelled, noShow]) {
       expect(events.every((e, i) => i === 0 || ms(events[i - 1].at) <= ms(e.at))).toBe(true);
     }
   });
 
-  it("8. owner routes answer 401 without the token and 503 when OWNER_API_TOKEN is unset", async () => {
+  it("8. owner routes answer 401 without the token, and when OWNER_API_TOKEN is unset", async () => {
     const noToken = await policiesGet(getDeps, ownerRequest("GET", "/policies", undefined, null), "harts", OWNER);
     expect(noToken.status).toBe(401);
     expect(noToken.headers.get("www-authenticate")).toMatch(/^Bearer /);
@@ -335,15 +384,150 @@ describe("Done when (issue #8), through the MCP and owner handlers over shared d
     expect((await ok<GetPoliciesResult>("get_policies")).data.policies.paused).toBe(false);
 
     const unset = await policiesGet(getDeps, ownerRequest("GET", "/policies"), "harts", { getToken: () => undefined });
-    expect(unset.status).toBe(503);
+    expect(unset.status).toBe(401);
     const body = (await unset.json()) as ApiError;
-    expect(body.error.message).toMatch(/OWNER_API_TOKEN/);
+    expect(body.error).toMatchObject({ code: "unauthorized", next_action: NOT_SET_UP_NEXT_ACTION });
     expect(JSON.stringify(body)).not.toContain(TOKEN);
+
+    // The bookings list (what the console reads) says to unlock.
+    const locked = await bookingsResponse(getDeps, ownerRequest("GET", "/bookings", undefined, null), "harts", OWNER);
+    expect(locked.status).toBe(401);
+    expect(((await locked.json()) as ApiError).error.next_action).toBe(UNLOCK_NEXT_ACTION);
 
     // The default reads process.env.OWNER_API_TOKEN, like the route files.
     vi.stubEnv("OWNER_API_TOKEN", undefined);
-    expect((await policiesGet(getDeps, ownerRequest("GET", "/policies"), "harts")).status).toBe(503);
+    expect((await policiesGet(getDeps, ownerRequest("GET", "/policies"), "harts")).status).toBe(401);
     vi.stubEnv("OWNER_API_TOKEN", TOKEN);
     expect((await policiesGet(getDeps, ownerRequest("GET", "/policies"), "harts")).status).toBe(200);
+  });
+});
+
+// Issue #15's "Done when" list for Ring 1b, end to end over the same shared deps: the MCP book tool, the
+// approval page's API (what /approve/[token] calls), MCP get_booking and the owner's bookings list.
+// Opening the link and approving is the consent (no phone code until Ring 1c). "Now" is Tue 10 Nov 2026,
+// 10:20 in New York; the hold lasts until 10:30.
+describe("Done when (issue #15): consent, through MCP, the approval API and the owner routes over shared deps", () => {
+  const bookingsList = () => json<BookingsResponse>(bookingsResponse(getDeps, ownerRequest("GET", "/bookings"), "harts", OWNER));
+
+  it("book → link → approve (with a phone) → get_booking confirmed and approved → the owner's list shows the customer", async () => {
+    const { data, text } = await ok<BookResult>("book", bookArgs(THU_1000, "Maya Lopez"));
+    const booking = data.booking;
+    expect(booking.status).toBe("awaiting_approval");
+    expect(text).toContain(`Send Maya Lopez this link to approve: ${booking.approval!.url}. Then call get_booking to check the status.`);
+    const token = approvalToken(booking);
+
+    // The page loads: pending, with the shop's rules.
+    const view = await approvalView(token);
+    expect(view).toMatchObject({
+      status: "pending",
+      shop: { slug: "harts", name: "Hart's Barbers" },
+      serviceName: "Haircut",
+      start: THU_1000,
+      priceCents: 3500,
+      depositCents: 1000,
+      policies: { cancelWindowHours: 24, depositRule: SEED.policies.harts.depositRule },
+      agentName: "unknown agent",
+      customerName: "Maya Lopez",
+      expiresAt: "2026-11-10T10:30:00-05:00",
+    });
+    expect(view).not.toHaveProperty("codeSentTo");
+
+    // While it's pending, get_booking and the owner's list carry the same link book returned.
+    const pending = await ok<GetBookingResult>("get_booking", { booking_id: booking.id });
+    expect(pending.data.booking.approval).toEqual(booking.approval);
+    expect(pending.text).toContain(`Waiting for Maya Lopez to approve with this link: ${booking.approval!.url}`);
+    expect((await bookingsList()).bookings.find((b) => b.id === booking.id)?.approval).toEqual(booking.approval);
+
+    // The person approves on the page, typing their number with separators.
+    const approved = await approveWith(token, { phone: "+1 (401) 555-0123" });
+    expect(approved.booking).toMatchObject({
+      id: booking.id,
+      status: "confirmed",
+      customer: customerOf("Maya Lopez", true, PHONE_E164),
+    });
+    expect(approved.booking).not.toHaveProperty("approval");
+    expect((await approvalView(token)).status).toBe("approved");
+
+    const fetched = await ok<GetBookingResult>("get_booking", { booking_id: booking.id });
+    expect(fetched.data.booking).toEqual(approved.booking);
+    expect(fetched.text).toContain("Maya Lopez approved it. It is confirmed.");
+
+    const list = await bookingsList();
+    expect(list.bookings.find((b) => b.id === booking.id)).toEqual(approved.booking);
+    expect(JSON.stringify(list)).not.toContain(token);
+    expect((await bookingDetail(booking.id)).events.map((e) => [e.type, e.actor])).toEqual([
+      ["booked", "agent"],
+      ["approved", "customer"],
+    ]);
+    // The owner hears about it exactly once, when it was approved.
+    const alerts = (deps.notifier as ReturnType<typeof recordingNotifier>).alerts;
+    expect(alerts.map((b) => [b.id, b.status])).toEqual([[booking.id, "confirmed"]]);
+  });
+
+  it("a second agent booking the same slot while it's on hold gets slot_taken", async () => {
+    await ok<BookResult>("book", bookArgs(THU_1000, "First Agent's Person"));
+    const err = await fails("book", bookArgs(THU_1000, "Second Agent's Person"));
+    expect(err.code).toBe("slot_taken");
+    expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).not.toContain(THU_1000);
+  });
+
+  it("after 10 minutes the hold is expired: the slot is offered and bookable again, and the link is closed", async () => {
+    const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
+    const token = approvalToken(held);
+    clock.set("2026-11-10T10:30:00-05:00");
+
+    expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).toContain(THU_1000);
+    const again = await ok<BookResult>("book", bookArgs(THU_1000, "E2E Next"));
+    expect(again.data.booking).toMatchObject({ start: THU_1000, status: "awaiting_approval" });
+
+    expect((await ok<GetBookingResult>("get_booking", { booking_id: held.id })).data.booking.status).toBe("expired");
+    expect((await approvalView(token)).status).toBe("expired");
+    const err = await approveWith(token, { phone: PHONE_E164 }, 410) as unknown as ApiError;
+    expect(err.error.code).toBe("approval_expired");
+    expect(err.error.next_action).toBe("Ask your agent to book again.");
+    expect((await bookingDetail(held.id)).events.map((e) => [e.type, e.actor])).toEqual([
+      ["booked", "agent"],
+      ["expired", "system"],
+    ]);
+  });
+
+  it("declining on the page cancels the booking and frees the slot", async () => {
+    const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
+    const token = approvalToken(held);
+    const declined = await json<DeclineResponse>(approvalDeclinePost(getDeps, pageRequest(`/${token}/decline`), token));
+    expect(declined.booking).toMatchObject({ id: held.id, status: "cancelled", customer: { approved: false } });
+    expect((await availability(THURSDAY)).data.slots.map((s) => s.start)).toContain(THU_1000);
+    expect((await approvalView(token)).status).toBe("declined");
+    expect((deps.notifier as ReturnType<typeof recordingNotifier>).alerts).toEqual([]);
+  });
+
+  it("approving with no body (no phone): confirmed and approved, no customer.phone", async () => {
+    const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
+    const approved = await approveWith(approvalToken(held));
+    expect(approved.booking).toMatchObject({ id: held.id, status: "confirmed", customer: { approved: true } });
+    expect(approved.booking.customer).not.toHaveProperty("phone");
+    const fetched = await ok<GetBookingResult>("get_booking", { booking_id: held.id });
+    expect(fetched.text).toContain("E2E Maya approved it. It is confirmed.");
+  });
+
+  it("the approval POSTs need no Origin header: any origin (or none) works", async () => {
+    for (const origin of [null, "https://elsewhere.example"]) {
+      const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
+      const token = approvalToken(held);
+      const request = new Request(`http://localhost:3000/api/approvals/${token}/decline`, {
+        method: "POST",
+        headers: origin ? { origin } : {},
+      });
+      const declined = await json<DeclineResponse>(approvalDeclinePost(getDeps, request, token));
+      expect(declined.booking.status, `decline from ${origin}`).toBe("cancelled");
+    }
+    const held = (await ok<BookResult>("book", bookArgs(THU_1000))).data.booking;
+    const token = approvalToken(held);
+    const request = new Request(`http://localhost:3000/api/approvals/${token}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://elsewhere.example" },
+      body: JSON.stringify({}),
+    });
+    expect((await json<ApproveResponse>(approvalApprovePost(getDeps, request, token))).booking.status).toBe("confirmed");
   });
 });

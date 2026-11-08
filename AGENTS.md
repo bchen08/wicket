@@ -12,6 +12,24 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 Read this whole file before writing code. These rules apply to every agent (Claude Code, v0) and every human.
 
+## MVP rule
+
+This overrides any earlier issue, prompt, comment or doc. We're building an MVP: features, not security.
+
+**Keep-list.** This is the only security we build:
+- owner routes behind `OWNER_API_TOKEN` (Bearer) or the `fd_owner` session cookie;
+- database credentials only on the server;
+- one line per new table: `alter table … enable row level security;` (no policies);
+- input validation that stops crashes (e.g. Postgres can't store NUL) or gives agents a clear error.
+
+**Don't build** (and remove when you find them): rate limits, attempt counters, lockouts; CSRF or Origin checks; hashing, HMAC or peppering stored data (phone numbers, tokens, codes); idempotency keys; verification codes without a working sender; secrets or env vars a feature doesn't need to run; extra config checks (minimum lengths, format rules), constant-time tricks, defense in depth.
+
+**Every step must work in production.** If a step needs a channel that doesn't exist yet, use the simplest stand-in that works and leave a `TODO(ring-N)`.
+
+Every agent prompt and issue includes this line:
+
+> MVP: build no security features beyond the keep-list. If you think one is needed, add a line under 'Security not built' in the PR description instead of building it.
+
 ## Project
 
 - Next.js 16 (App Router), React 19, TypeScript (strict), Tailwind CSS v4, pnpm.

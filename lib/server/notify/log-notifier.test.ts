@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Booking } from "../../types/frontdesk";
+import { customerOf } from "../frontdesk/test-support";
 import { createLogNotifier, firstName } from "./log-notifier";
 
 const booking: Booking = {
@@ -12,20 +13,20 @@ const booking: Booking = {
   end: "2026-11-14T15:00:00-05:00",
   display: "Sat 14 Nov, 2:30 pm EST",
   status: "confirmed",
-  customer: { displayName: "Maya Lopez-Hart", verified: false },
+  customer: customerOf("Maya Lopez-Hart", false),
   agent: { name: "claude-ai" },
   depositCents: 1000,
   createdAt: "2026-11-07T12:00:00-05:00",
 };
 
 describe("log notifier", () => {
-  it("writes one booking.created JSON line with the customer's first name only", async () => {
+  it("writes one booking.confirmed JSON line with the customer's first name only", async () => {
     const lines: string[] = [];
     await createLogNotifier((line) => lines.push(line)).alertOwner(booking);
 
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0])).toEqual({
-      event: "booking.created",
+      event: "booking.confirmed",
       id: booking.id,
       shop: "harts",
       service: "haircut",
