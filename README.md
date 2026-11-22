@@ -1,8 +1,8 @@
-# Front Desk
+# Wicket
 
 **A booking desk that AI agents can talk to.**
 
-Front Desk gives a small business a front desk that AI agents can use: Claude, ChatGPT, or someone's personal assistant. An agent connects over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP), or over plain HTTP. It can ask the business what it offers, what its rules are, and when it's free, then book or cancel an appointment. **No booking is final until a real person approves it.**
+Wicket gives a small business a front desk that AI agents can use: Claude, ChatGPT, or someone's personal assistant. An agent connects over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP), or over plain HTTP. It can ask the business what it offers, what its rules are, and when it's free, then book or cancel an appointment. **No booking is final until a real person approves it.**
 
 The demo shop is **Hart's Barbers** (`harts`), a barbershop in New York.
 
@@ -13,19 +13,19 @@ The demo shop is **Hart's Barbers** (`harts`), a barbershop in New York.
 ```
 AI agent ──MCP──▶ /api/mcp ─────────────┐
 Agent or browser ──▶ /api/shops/harts ──┤
-Person ──▶ /signin, /approve/<link> ────┼──▶ Front Desk engine ──▶ Postgres (Supabase)
+Person ──▶ /signin, /approve/<link> ────┼──▶ Wicket engine ──▶ Postgres (Supabase)
 Owner ──▶ /console ─────────────────────┘    (hours, rules, lifecycle)
                                                  │
                                     Stripe (deposits) · Resend (email) · Photon or Twilio (texts)
 ```
 
 1. **The agent asks.** Seven MCP tools: `list_services`, `get_policies`, `get_availability`, `book`, `get_booking`, `cancel` and `list_my_bookings`. Agents without MCP use the [web booking API](docs/web-booking.md), and find both through `/.well-known/front-desk.json` and the shop's `agents.md`.
-2. **The agent books, and the slot is held.** `book` holds the time for 10 minutes and returns an approval link. Given the person's mobile number, Front Desk can text them the link.
+2. **The agent books, and the slot is held.** `book` holds the time for 10 minutes and returns an approval link. Given the person's mobile number, Wicket can text them the link.
 3. **A person approves.** They open the link on their phone and tap **Approve** or **Decline**. If the service takes a deposit, Approve leads to Stripe Checkout and the booking is confirmed once the card hold succeeds. If nobody answers in time, the hold lapses and the slot opens up again.
 4. **The owner sees it.** At `/console`, the owner sees every booking and every agent that booked, and gets an alert (email, text or log line) when a booking is confirmed or cancelled.
 5. **Every night, it tidies up.** Past appointments are marked completed (and their deposit hold released), and lapsed holds and unpaid deposits are closed.
 
-**People can sign in once.** Connected to Claude or ChatGPT, Front Desk asks the person to sign in at `/signin` with their name and mobile number. Their agent then books as them, without retyping the name, and can list and cancel their bookings. Agents that don't sign in keep working as before. See [connector-signin.md](docs/connector-signin.md).
+**People can sign in once.** Connected to Claude or ChatGPT, Wicket asks the person to sign in at `/signin` with their name and mobile number. Their agent then books as them, without retyping the name, and can list and cancel their bookings. Agents that don't sign in keep working as before. See [connector-signin.md](docs/connector-signin.md).
 
 **Agents can prove who they are.** An agent that speaks [PAP 0.4](https://github.com/personal-agent-protocol/personal-agent-protocol) signs its requests, and its bookings show it as **confirmed**. Everyone else is labelled unconfirmed. See [agent-identity.md](docs/agent-identity.md).
 
@@ -71,14 +71,14 @@ pnpm dev
 
 Open http://localhost:3000. The MCP endpoint is http://localhost:3000/api/mcp.
 
-**No database needed to start.** Without `DATABASE_URL`, Front Desk uses an in-memory copy of the seed data and logs one warning. Bookings disappear when the server restarts. To use a real Postgres database, or to open the owner console, put these in `.env.local`, which git ignores:
+**No database needed to start.** Without `DATABASE_URL`, Wicket uses an in-memory copy of the seed data and logs one warning. Bookings disappear when the server restarts. To use a real Postgres database, or to open the owner console, put these in `.env.local`, which git ignores:
 
 ```bash
 DATABASE_URL=postgres://...      # Supabase transaction pooler, port 6543
 OWNER_API_TOKEN=...              # the shop's access code for /console/unlock and the owner API
 ```
 
-**Every other feature is off until you set its variables**, and Front Desk works without them. `/api/status` shows which are on.
+**Every other feature is off until you set its variables**, and Wicket works without them. `/api/status` shows which are on.
 
 | Variable | Turns on |
 |---|---|
@@ -103,7 +103,7 @@ pnpm build
 
 ## What's next
 
-Front Desk is built in rings, each one a working product. Rings 0, 1 and 2 are live: agents book with a person's approval, deposits, owner alerts, texting, connector sign-in, agent identity, the nightly tidy-up and the owner console. Still to come:
+Wicket is built in rings, each one a working product. Rings 0, 1 and 2 are live: agents book with a person's approval, deposits, owner alerts, texting, connector sign-in, agent identity, the nightly tidy-up and the owner console. Still to come:
 
 - Verify the phone number at sign-in with a texted code.
 - Let agents choose which shop to book, and give each shop its own owner sign-in instead of one shared access code.
